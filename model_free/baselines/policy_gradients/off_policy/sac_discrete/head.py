@@ -1,4 +1,3 @@
-# head.py
 from __future__ import annotations
 
 from typing import Any, Dict, Sequence, Union
@@ -8,67 +7,127 @@ import torch.nn as nn
 
 from model_free.common.networks.policy_networks import DiscretePolicyNetwork
 from model_free.common.networks.q_networks import DoubleQNetwork
-from model_free.common.utils.ray_utils import PolicyFactorySpec, make_entrypoint, resolve_activation_fn
 from model_free.common.policies.base_head import OffPolicyDiscreteActorCriticHead
-
+from model_free.common.utils.ray_utils import (
+    PolicyFactorySpec,
+    _make_entrypoint,
+    _resolve_activation_fn,
+)
 
 # =============================================================================
 # Ray worker factory (MUST be module-level for your entrypoint resolver)
 # =============================================================================
 def build_discrete_sac_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build a Discrete SAC head on CPU.
+   Build a Discrete SAC head on a Ray rollout worker (CPU-only).
 
-    Why this exists
-    ---------------
-    In your Ray setup, workers reconstruct the policy from a (entrypoint, kwargs)
-    spec. The entrypoint must be a module-level function so it can be resolved by
-    import path (pickle-safe).
+    Ray reconstructs policies in remote worker processes from a serialized
+    (entrypoint, kwargs) specification. The entrypoint must be a module-level
+    function so Ray can import it by dotted path.
 
-    Behavior
-    --------
-    - Forces `device="cpu"` for workers. (Typical: inference/rollout on CPU.)
-    - Resolves `activation_fn` from a JSON-safe representation (e.g., "ReLU")
-      into an actual torch activation class/function via `resolve_activation_fn`.
-    - Returns a head with `training=False` to ensure deterministic eval-mode
-      behavior for rollout collection.
+    Parameters
+    ----------
+    **kwargs : Any
+        Keyword arguments used to construct :class:`SACDiscreteHead`.
+        These usually come from a JSON/pickle payload (e.g., ``PolicyFactorySpec``).
+
+        Common keys include:
+        - ``obs_dim`` : int
+        - ``n_actions`` : int
+        - ``actor_hidden_sizes`` : Sequence[int]
+        - ``critic_hidden_sizes`` : Sequence[int]
+        - ``activation_fn`` : str or callable
+        - ``dueling_mode`` : bool
+        - ``init_type`` : str
+        - ``gain`` : float
+        - ``bias`` : float
+        - ``device`` : str or torch.device (ignored/overridden on workers)
+
+    Returns
+    -------
+    nn.Module
+        A fully constructed :class:`SACDiscreteHead` placed on CPU, with
+        eval-like behavior enabled via ``set_training(False)``.
+
+    Notes
+    -----
+    - Workers typically run inference/rollouts only, so forcing CPU avoids
+      accidental GPU allocation and contention.
+    - ``activation_fn`` may be serialized as a string; it is resolved here to
+      a torch activation class (e.g., ``"relu" -> nn.ReLU``).
     """
-    kwargs = dict(kwargs)
-    kwargs["device"] = "cpu"
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    cfg = dict(kwargs)
 
-    head = SACDiscreteHead(**kwargs).to("cpu")
+    # Force CPU on worker side (rollout/inference).
+    cfg["device"] = "cpu"
+
+    # Resolve activation identifier (string/name) into nn.Module class.
+    cfg["activation_fn"] = _resolve_activation_fn(cfg.get("activation_fn", None))
+
+    head = SACDiscreteHead(**cfg).to("cpu")
     head.set_training(False)
     return head
 
 
+# =============================================================================
+# SACDiscreteHead
+# =============================================================================
 class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
     """
-    Discrete SAC Head (Actor + Twin Critic + Target Twin Critic)
+   Discrete Soft Actor-Critic head.
 
-    High-level role
-    ---------------
-    This "head" owns the neural networks used by Discrete SAC:
-      - Actor: categorical policy π(a|s) over `n_actions`
-      - Critic: twin Q-networks Q1(s,·), Q2(s,·) producing (B, n_actions)
-      - Target critic: Polyak/EMA copy of the critic used for stable targets
+    This head encapsulates all neural modules required by a discrete-action SAC
+    variant:
 
-    OffPolicyAlgorithm contract (duck-typed)
-    ----------------------------------------
-    Expected attributes/methods used by your OffPolicyAlgorithm/Core:
-      - device: torch.device
-      - set_training(training): toggles train/eval mode appropriately
-      - act(obs, deterministic=False) -> action tensor shaped (B,) or (B,1)
-      - q_values(obs) -> (q1, q2), each of shape (B, n_actions)
-      - q_values_target(obs) -> (q1t, q2t), each of shape (B, n_actions)
-      - hard_update_target(), soft_update_target(tau)  (via BaseHead utilities)
-      - save(path), load(path)
-      - get_ray_policy_factory_spec()
+    - **Actor**: categorical policy :math:`\\pi(a\\mid s)` over ``n_actions``.
+    - **Critic**: twin Q networks :math:`Q_1(s, \\cdot), Q_2(s, \\cdot)` producing
+      action-value vectors of shape ``(B, n_actions)``.
+    - **Target critic**: a lagged (Polyak/EMA) copy of the twin critics used to
+      construct stable bootstrap targets in the core update.
+
+    Parameters
+    ----------
+    obs_dim : int
+        Observation vector dimension.
+    n_actions : int
+        Number of discrete actions.
+    actor_hidden_sizes : Sequence[int], default=(256, 256)
+        Hidden layer sizes for the actor MLP.
+    critic_hidden_sizes : Sequence[int], default=(256, 256)
+        Hidden layer sizes for the critic MLP(s).
+    activation_fn : Any, default=nn.ReLU
+        Activation function class (e.g., ``nn.ReLU``). If you serialize this as a
+        string, use :func:`model_free.common.utils.ray_utils._resolve_activation_fn`
+        on reconstruction.
+    dueling_mode : bool, default=False
+        Whether the critic network uses a dueling architecture (if supported by
+        your ``DoubleQNetwork`` implementation).
+    init_type : str, default="orthogonal"
+        Initialization scheme passed through to network modules.
+    gain : float, default=1.0
+        Initialization gain multiplier passed through to network modules.
+    bias : float, default=0.0
+        Initialization bias constant passed through to network modules.
+    device : Union[str, torch.device], default="cpu"
+        Device where the online networks are allocated.
+
+    Attributes
+    ----------
+    actor : nn.Module
+        Discrete policy network producing logits/probabilities over actions.
+    critic : nn.Module
+        Twin Q network that outputs (q1, q2) each shaped ``(B, n_actions)``.
+    critic_target : nn.Module
+        Frozen target copy of ``critic`` updated only via hard/soft updates.
 
     Notes
     -----
-    - This file only defines networks + persistence + Ray factory spec.
-      The actual SAC update logic (entropy, Bellman targets, etc.) belongs in Core.
+    - This head focuses on wiring networks, checkpoint I/O, and Ray policy factory
+      integration. The SAC update rules (entropy temperature, Bellman targets,
+      actor/critic losses) belong in the corresponding *core* module.
+    - Target parameters are frozen (``requires_grad=False``) to prevent optimizers
+      from accidentally updating them. They are still updated by explicit Polyak
+      or hard-copy utilities.
     """
 
     def __init__(
@@ -76,29 +135,23 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
         *,
         obs_dim: int,
         n_actions: int,
-        # Actor and critic can use different MLP widths by design.
         actor_hidden_sizes: Sequence[int] = (256, 256),
         critic_hidden_sizes: Sequence[int] = (256, 256),
         activation_fn: Any = nn.ReLU,
-        # Critic option: dueling architecture for Q(s,a)
         dueling_mode: bool = False,
-        # Initialization knobs (kept consistent with your other heads)
         init_type: str = "orthogonal",
         gain: float = 1.0,
         bias: float = 0.0,
         device: Union[str, th.device] = "cpu",
     ) -> None:
-        # BaseHead typically provides:
-        # - self.device (torch.device)
-        # - hard_update / soft_update utilities
-        # - freeze_target utility (sets requires_grad=False)
         super().__init__(device=device)
 
-        # Basic problem dimensions
+        # -----------------------------
+        # Problem dimensions / config
+        # -----------------------------
         self.obs_dim = int(obs_dim)
         self.n_actions = int(n_actions)
 
-        # Store config (useful for logging / checkpoint kwargs)
         self.actor_hidden_sizes = tuple(int(x) for x in actor_hidden_sizes)
         self.critic_hidden_sizes = tuple(int(x) for x in critic_hidden_sizes)
         self.activation_fn = activation_fn
@@ -108,12 +161,9 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
         self.gain = float(gain)
         self.bias = float(bias)
 
-        # ---------------------------------------------------------------------
+        # -----------------------------
         # Actor: categorical policy π(a|s)
-        # ---------------------------------------------------------------------
-        # DiscretePolicyNetwork is expected to expose something like:
-        # - forward(obs) -> logits or probs
-        # - act(obs, deterministic=False) -> sampled/argmax actions
+        # -----------------------------
         self.actor = DiscretePolicyNetwork(
             obs_dim=self.obs_dim,
             n_actions=self.n_actions,
@@ -124,14 +174,11 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
             bias=self.bias,
         ).to(self.device)
 
-        # ---------------------------------------------------------------------
-        # Critic: twin Q networks producing Q(s,·) for all actions
-        # ---------------------------------------------------------------------
-        # Important: for discrete SAC, critics typically take state only and output
-        # (B, n_actions), i.e. Q(s,a) for all a in one forward.
-        #
-        # In your codebase, DoubleQNetwork is expected to output (q1, q2) each
-        # shaped (B, n_actions).
+        # -----------------------------
+        # Critic: twin Q(s,·) heads
+        # -----------------------------
+        # For discrete SAC, critics typically map state -> Q-values over all actions:
+        #   q1, q2 = critic(s) where each is (B, n_actions)
         self.critic = DoubleQNetwork(
             state_dim=self.obs_dim,
             action_dim=self.n_actions,
@@ -143,9 +190,9 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
             bias=self.bias,
         ).to(self.device)
 
-        # ---------------------------------------------------------------------
-        # Target critic: EMA/Polyak copy used for stable bootstrap targets
-        # ---------------------------------------------------------------------
+        # -----------------------------
+        # Target critic: frozen copy
+        # -----------------------------
         self.critic_target = DoubleQNetwork(
             state_dim=self.obs_dim,
             action_dim=self.n_actions,
@@ -157,8 +204,7 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
             bias=self.bias,
         ).to(self.device)
 
-        # Initialize target weights = online weights, then freeze target params
-        # (core/head will still update them via hard/soft update utilities).
+        # Initialize target weights from online critic and freeze target params.
         self.hard_update(self.critic_target, self.critic)
         self.freeze_target(self.critic_target)
 
@@ -167,17 +213,21 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export constructor kwargs in a JSON-safe format.
+       Export constructor kwargs in a JSON-safe representation.
 
-        Purpose
+        Returns
         -------
-        - Used by save/load to store config alongside weights.
-        - Used by Ray policy factory spec, so workers can reconstruct the head.
+        Dict[str, Any]
+            JSON-serializable constructor arguments sufficient to reconstruct the
+            head architecture. This is used for:
+            - checkpoints (store config alongside weights)
+            - Ray worker reconstruction (kwargs payload for PolicyFactorySpec)
 
-        Note
-        ----
-        activation_fn is exported as a name string and later resolved with
-        `resolve_activation_fn` in the worker factory.
+        Notes
+        -----
+        - ``activation_fn`` is exported as a stable string name using the base-head
+          helper ``_activation_to_name`` and resolved on load/worker construction.
+        - ``device`` is stored as a string. Ray workers override device to CPU.
         """
         return {
             "obs_dim": int(self.obs_dim),
@@ -194,14 +244,24 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
 
     def save(self, path: str) -> None:
         """
-        Save model weights + config to a single .pt checkpoint.
+       Save head weights and minimal configuration to a ``.pt`` checkpoint.
 
-        Filesystem behavior
-        -------------------
-        If `path` does not end with ".pt", it is appended automatically.
+        Parameters
+        ----------
+        path : str
+            Output checkpoint path. If it does not end with ``.pt``, the suffix is
+            appended automatically.
+
+        Notes
+        -----
+        The checkpoint payload is a ``dict`` containing:
+        - ``kwargs``: JSON-safe constructor args (for reconstruction/debugging)
+        - ``actor``: actor ``state_dict()``
+        - ``critic``: critic ``state_dict()``
+        - ``critic_target``: target critic ``state_dict()``
         """
         if not path.endswith(".pt"):
-            path = path + ".pt"
+            path = f"{path}.pt"
 
         payload: Dict[str, Any] = {
             "kwargs": self._export_kwargs_json_safe(),
@@ -213,33 +273,41 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
 
     def load(self, path: str) -> None:
         """
-        Load model weights from a .pt checkpoint created by `save()`.
+       Load head weights from a ``.pt`` checkpoint created by :meth:`save`.
 
-        Safety / compatibility
-        ----------------------
-        - Validates minimal expected keys exist.
-        - Restores target critic if available; otherwise reconstructs it from critic.
-        - Freezes target critic parameters after loading to keep optimizer clean.
+        Parameters
+        ----------
+        path : str
+            Path to checkpoint file. If it does not end with ``.pt``, the suffix is
+            appended automatically.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint payload does not match the expected format.
+
+        Notes
+        -----
+        - Weights are loaded onto ``self.device`` using ``map_location``.
+        - If ``critic_target`` weights are missing (older checkpoints), the target
+          critic is reconstructed by hard-copying from the online critic.
+        - The target critic is frozen after loading to prevent optimizer updates.
         """
         if not path.endswith(".pt"):
-            path = path + ".pt"
+            path = f"{path}.pt"
 
         ckpt = th.load(path, map_location=self.device)
         if not isinstance(ckpt, dict) or "actor" not in ckpt or "critic" not in ckpt:
-            raise ValueError(f"Unrecognized DiscreteSACHead checkpoint format at: {path}")
+            raise ValueError(f"Unrecognized SACDiscreteHead checkpoint format at: {path}")
 
-        # Restore online networks
         self.actor.load_state_dict(ckpt["actor"])
         self.critic.load_state_dict(ckpt["critic"])
 
-        # Restore or rebuild target
         if ckpt.get("critic_target", None) is not None:
             self.critic_target.load_state_dict(ckpt["critic_target"])
         else:
-            # Backward compatibility: if old checkpoints don't store target explicitly
             self.hard_update(self.critic_target, self.critic)
 
-        # Ensure target is non-trainable and in eval mode
         self.freeze_target(self.critic_target)
         self.critic_target.eval()
 
@@ -248,13 +316,22 @@ class SACDiscreteHead(OffPolicyDiscreteActorCriticHead):
     # =============================================================================
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Return a Ray-friendly factory spec to reconstruct this head on workers.
+       Return a Ray-serializable policy factory specification.
 
-        The returned spec includes:
-          - entrypoint: module-level function import path
-          - kwargs: JSON-safe hyperparameters needed to rebuild the head
+        Returns
+        -------
+        PolicyFactorySpec
+            A spec containing:
+            - ``entrypoint``: importable module-level factory function
+            - ``kwargs``: JSON-safe constructor arguments
+
+        Notes
+        -----
+        Ray workers reconstruct the head by importing the entrypoint and calling it
+        with the provided kwargs. On the worker side, the factory forces CPU and
+        resolves ``activation_fn`` if it was serialized as a string.
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_discrete_sac_head_worker_policy),
+            entrypoint=_make_entrypoint(build_discrete_sac_head_worker_policy),
             kwargs=self._export_kwargs_json_safe(),
         )

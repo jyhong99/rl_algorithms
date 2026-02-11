@@ -2,69 +2,97 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+import math
 import torch as th
 
-from model_free.common.policies.base_core import ActorCriticCore
-from model_free.common.utils.policy_utils import get_per_weights, quantile_huber_loss
 from model_free.common.optimizers.optimizer_builder import build_optimizer
 from model_free.common.optimizers.scheduler_builder import build_scheduler
-from model_free.common.utils.common_utils import to_scalar, to_column
+from model_free.common.policies.base_core import ActorCriticCore
+from model_free.common.utils.common_utils import _to_column, _to_scalar
+from model_free.common.utils.policy_utils import _get_per_weights, _quantile_huber_loss
 
 
 class TQCCore(ActorCriticCore):
     """
-    TQC Update Engine (TQCCore) built on ActorCriticCore infrastructure.
+    Truncated Quantile Critics (TQC) update engine.
 
-    What this core does
-    -------------------
-    Implements Truncated Quantile Critics (TQC):
-      - Critic learns a distribution over returns via quantiles Z(s,a)
-      - Target distribution is built from target critic quantiles at next state/action
-      - Truncation: drop the largest `top_quantiles_to_drop` quantiles after sorting
-        (reduces overestimation; core idea of TQC)
+    This core implements TQC (Kuznetsov et al.) on top of the shared
+    :class:`~model_free.common.policies.base_core.ActorCriticCore` infrastructure.
 
-    Head contract (duck-typed)
-    --------------------------
-    Required:
-      - head.actor: nn.Module
-      - head.critic: nn.Module              returns quantiles (B,C,N)
-      - head.critic_target: nn.Module       returns quantiles (B,C,N)
-      - head.device
-      - head.sample_action_and_logp(obs) -> (a, logp)  where logp is (B,1) preferred
+    High-level algorithm
+    --------------------
+    TQC extends SAC by learning a *distribution* over returns via a quantile critic
+    ensemble and computing targets from a **truncated** target distribution:
+
+    1) Sample next action from current policy:
+       :math:`a' \\sim \\pi(\\cdot\\mid s')`
+    2) Compute target quantiles:
+       :math:`Z_t(s',a') \\in \\mathbb{R}^{C\\times N}`
+    3) Flatten + sort all quantiles, then drop the largest ``top_quantiles_to_drop``:
+       :math:`\\tilde{Z}_t(s',a') \\in \\mathbb{R}^{K}` where :math:`K=C\\cdot N-\\text{drop}`
+    4) Build per-quantile Bellman backup with entropy term:
+       :math:`y = r + \\gamma(1-d)\\,(\\tilde{Z}_t(s',a') - \\alpha\\log\\pi(a'\\mid s'))`
+    5) Update critic by minimizing quantile regression loss (Huber quantile loss).
+    6) Update actor using a conservative scalar value derived from quantiles.
+    7) Optionally update temperature :math:`\\alpha` to match a target entropy.
+    8) Polyak update target critic at ``target_update_interval``.
+
+    Expected head interface (duck-typed)
+    ------------------------------------
+    Required attributes
+    - ``head.actor`` : torch.nn.Module
+        Stochastic squashed Gaussian policy (SAC-style).
+    - ``head.critic`` : torch.nn.Module
+        Quantile critic ensemble; forward returns quantiles shaped ``(B, C, N)``.
+    - ``head.critic_target`` : torch.nn.Module
+        Target critic with same signature as ``head.critic``.
+    - ``head.action_dim`` : int
+        Used to infer default ``target_entropy`` when not provided.
+
+    Required methods
+    - ``head.sample_action_and_logp(obs) -> (action, logp)``
+        ``action`` shaped ``(B, action_dim)`` and ``logp`` preferably ``(B, 1)``.
+    - ``head.quantiles(obs, action) -> torch.Tensor``
+        Returns ``(B, C, N)``.
+    - ``head.quantiles_target(obs, action) -> torch.Tensor``
+        Returns ``(B, C, N)`` without gradients.
+    - ``head.freeze_target(module)``
+        Sets target parameters ``requires_grad=False`` (and typically puts into eval mode).
 
     Notes
     -----
-    - Actor/Critic optimizers+schedulers + update_calls persistence are handled by ActorCriticCore.
-    - This core additionally owns:
-        * log_alpha (+ alpha optimizer/scheduler if auto_alpha=True)
-        * truncation setting, gamma/tau, target_entropy
+    - Actor/Critic optimizers, schedulers, AMP scaler, and update counters are managed
+      by :class:`ActorCriticCore`. This class additionally owns ``log_alpha`` and its
+      optimizer/scheduler when ``auto_alpha=True``.
+    - PER integration: per-sample weights are pulled via ``_get_per_weights`` and a
+      TD-error proxy is returned under ``"per/td_errors"`` for priority updates.
     """
 
     def __init__(
         self,
         *,
         head: Any,
-        # core hparams
+        # Core hyperparameters
         gamma: float = 0.99,
         tau: float = 0.005,
         target_update_interval: int = 1,
         top_quantiles_to_drop: int = 2,
-        # entropy / alpha
+        # Entropy temperature (SAC-style)
         auto_alpha: bool = True,
         alpha_init: float = 0.2,
         target_entropy: Optional[float] = None,
-        # optimizers (actor/critic handled by ActorCriticCore)
+        # Actor/Critic optimizers (handled by ActorCriticCore)
         actor_optim_name: str = "adamw",
         actor_lr: float = 3e-4,
         actor_weight_decay: float = 0.0,
         critic_optim_name: str = "adamw",
         critic_lr: float = 3e-4,
         critic_weight_decay: float = 0.0,
-        # alpha optim/sched (core-owned)
+        # Alpha optimizer (core-owned)
         alpha_optim_name: str = "adamw",
         alpha_lr: float = 3e-4,
         alpha_weight_decay: float = 0.0,
-        # schedulers
+        # Schedulers
         actor_sched_name: str = "none",
         critic_sched_name: str = "none",
         alpha_sched_name: str = "none",
@@ -75,40 +103,69 @@ class TQCCore(ActorCriticCore):
         step_size: int = 1000,
         sched_gamma: float = 0.99,
         milestones: Sequence[int] = (),
-        # grad / amp
+        # Gradient / AMP
         max_grad_norm: float = 0.0,
         use_amp: bool = False,
     ) -> None:
         """
         Parameters
         ----------
-        gamma : float
-            Discount factor.
-        tau : float
-            Polyak averaging coefficient for target updates.
-        target_update_interval : int
-            How often to update the target critic (in update calls).
-        top_quantiles_to_drop : int
-            Number of largest quantiles to drop after sorting flattened quantiles
-            from the target critic. Typical: 2~5 depending on C*N.
-        auto_alpha : bool
-            Whether to learn entropy temperature alpha (log-space parameterization).
-        alpha_init : float
-            Initial alpha value (temperature), used as exp(log_alpha_init).
-        target_entropy : Optional[float]
-            SAC-style entropy target. If None, defaults to -action_dim.
+        head : Any
+            Head instance satisfying the "Expected head interface" described in the
+            class docstring (TQCHead-like).
+        gamma : float, default=0.99
+            Discount factor :math:`\\gamma`.
+        tau : float, default=0.005
+            Polyak averaging factor for target critic updates.
+        target_update_interval : int, default=1
+            Target update frequency in **update calls**. If ``0``, disables target updates.
+        top_quantiles_to_drop : int, default=2
+            Number of **largest** quantiles to drop after sorting the flattened target
+            quantiles (TQC truncation). Must satisfy ``0 <= drop < C*N``.
+        auto_alpha : bool, default=True
+            If True, learn temperature :math:`\\alpha` by optimizing ``log_alpha``.
+        alpha_init : float, default=0.2
+            Initial temperature value. Internally stores ``log_alpha = log(alpha_init)``.
+        target_entropy : float or None, default=None
+            Target entropy for SAC-style temperature tuning. If None, defaults to
+            ``-action_dim`` (continuous SAC heuristic).
+        actor_optim_name, critic_optim_name : str
+            Optimizer identifiers passed to your optimizer builder for actor/critic.
+        actor_lr, critic_lr : float
+            Actor/critic learning rates.
+        actor_weight_decay, critic_weight_decay : float
+            Actor/critic weight decay.
+        alpha_optim_name : str
+            Optimizer identifier for ``log_alpha`` (only used when ``auto_alpha=True``).
+        alpha_lr : float
+            Learning rate for ``log_alpha``.
+        alpha_weight_decay : float
+            Weight decay for ``log_alpha`` (usually 0).
+        actor_sched_name, critic_sched_name, alpha_sched_name : str
+            Scheduler identifiers passed to your scheduler builder.
+        total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones
+            Scheduler configuration forwarded to your scheduler builder.
+        max_grad_norm : float, default=0.0
+            Global norm clipping threshold. ``0.0`` disables clipping.
+        use_amp : bool, default=False
+            If True, uses CUDA AMP autocast + GradScaler for mixed-precision training.
+
+        Raises
+        ------
+        ValueError
+            If any hyperparameter is outside an expected range.
         """
         super().__init__(
             head=head,
-            use_amp=use_amp,
-            # optim (ActorCriticCore builds actor_opt/critic_opt)
+            use_amp=bool(use_amp),
+            # Optimizers (ActorCriticCore builds actor_opt/critic_opt)
             actor_optim_name=str(actor_optim_name),
             actor_lr=float(actor_lr),
             actor_weight_decay=float(actor_weight_decay),
             critic_optim_name=str(critic_optim_name),
             critic_lr=float(critic_lr),
             critic_weight_decay=float(critic_weight_decay),
-            # sched (ActorCriticCore builds actor_sched/critic_sched)
+            # Schedulers (ActorCriticCore builds actor_sched/critic_sched)
             actor_sched_name=str(actor_sched_name),
             critic_sched_name=str(critic_sched_name),
             total_steps=int(total_steps),
@@ -120,34 +177,48 @@ class TQCCore(ActorCriticCore):
             milestones=tuple(int(m) for m in milestones),
         )
 
-        # ----- core hyperparameters -----
+        # -----------------------------
+        # Hyperparameters / validation
+        # -----------------------------
         self.gamma = float(gamma)
         self.tau = float(tau)
         self.target_update_interval = int(target_update_interval)
         self.top_quantiles_to_drop = int(top_quantiles_to_drop)
-
         self.auto_alpha = bool(auto_alpha)
         self.max_grad_norm = float(max_grad_norm)
 
-        # ----- target entropy default -----
-        # SAC heuristic: target_entropy = -|A|
+        if not (0.0 <= self.gamma < 1.0):
+            raise ValueError(f"gamma must be in [0,1), got {self.gamma}")
+        if not (0.0 < self.tau <= 1.0):
+            raise ValueError(f"tau must be in (0,1], got {self.tau}")
+        if self.target_update_interval < 0:
+            raise ValueError(f"target_update_interval must be >= 0, got {self.target_update_interval}")
+        if self.max_grad_norm < 0.0:
+            raise ValueError(f"max_grad_norm must be >= 0, got {self.max_grad_norm}")
+
+        # -----------------------------
+        # Target entropy default (SAC heuristic)
+        # -----------------------------
         if target_entropy is None:
             action_dim = int(getattr(self.head, "action_dim"))
             self.target_entropy = -float(action_dim)
         else:
             self.target_entropy = float(target_entropy)
 
-        # ----- alpha parameter (log-space) -----
-        # Use math.log for clarity; th.log(th.tensor(...)) also works but is indirect.
-        log_alpha_init = float(th.log(th.tensor(float(alpha_init))).item())
+        # -----------------------------
+        # Temperature parameter (log-space)
+        # -----------------------------
+        # Keep log(alpha) for numerical stability; alpha = exp(log_alpha).
+        log_alpha_init = float(math.log(float(alpha_init)))
         self.log_alpha = th.tensor(
             log_alpha_init,
             device=self.device,
-            requires_grad=bool(self.auto_alpha),
+            requires_grad=self.auto_alpha,
         )
 
-        # ----- alpha optimizer/scheduler (core-owned) -----
-        # ActorCriticCore does NOT manage alpha; we do it here.
+        # -----------------------------
+        # Alpha optimizer/scheduler (core-owned)
+        # -----------------------------
         self.alpha_opt = None
         self.alpha_sched = None
         if self.auto_alpha:
@@ -169,8 +240,7 @@ class TQCCore(ActorCriticCore):
                 milestones=tuple(int(m) for m in milestones),
             )
 
-        # Core owns freeze responsibility:
-        # target critic should be eval + requires_grad=False to avoid accidental grads.
+        # Ensure target critic does not receive gradients.
         self.head.freeze_target(self.head.critic_target)
 
     # =============================================================================
@@ -178,7 +248,14 @@ class TQCCore(ActorCriticCore):
     # =============================================================================
     @property
     def alpha(self) -> th.Tensor:
-        """Entropy temperature alpha = exp(log_alpha)."""
+        """
+        Entropy temperature :math:`\\alpha`.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar tensor computed as ``exp(log_alpha)``.
+        """
         return self.log_alpha.exp()
 
     # =============================================================================
@@ -187,127 +264,144 @@ class TQCCore(ActorCriticCore):
     @staticmethod
     def _truncate_quantiles(z: th.Tensor, top_drop: int) -> th.Tensor:
         """
-        Truncate the target quantile set by dropping the top `top_drop` quantiles.
+        Truncate a set of quantiles by dropping the largest values.
 
         Parameters
         ----------
         z : torch.Tensor
-            Quantiles with shape (B, C, N).
-              B=batch, C=ensemble size, N=quantiles per net
+            Quantiles with shape ``(B, C, N)``:
+            ``B`` = batch size, ``C`` = ensemble size, ``N`` = quantiles per critic.
         top_drop : int
-            Number of highest quantiles to drop after sorting.
+            Number of highest quantiles to drop after sorting. Must satisfy
+            ``0 <= top_drop < C*N``.
 
         Returns
         -------
-        z_trunc : torch.Tensor
-            Truncated and sorted quantiles with shape (B, K),
-            where K = C*N - top_drop.
+        torch.Tensor
+            Sorted, truncated quantiles with shape ``(B, K)``, where
+            ``K = C*N - top_drop``.
 
-        Implementation details
-        ----------------------
-        1) Flatten ensemble+quantiles: (B, C*N)
-        2) Sort ascending
-        3) Keep only the lowest K elements (drop the largest top_drop)
+        Raises
+        ------
+        ValueError
+            If ``z`` is not 3D or if ``top_drop`` is outside ``[0, C*N-1]``.
         """
         if z.ndim != 3:
             raise ValueError(f"Expected z to be (B,C,N), got {tuple(z.shape)}")
 
         b, c, n = z.shape
-        flat = z.reshape(b, c * n)              # (B, C*N)
-        flat_sorted, _ = th.sort(flat, dim=1)   # ascending sort by quantile value
+        flat = z.reshape(b, c * n)  # (B, C*N)
+        flat_sorted, _ = th.sort(flat, dim=1)
 
         drop = int(top_drop)
         if drop < 0 or drop >= c * n:
             raise ValueError(f"top_drop must be in [0, {c*n-1}], got {drop}")
 
-        if drop == 0:
-            return flat_sorted
-        return flat_sorted[:, : (c * n - drop)]  # keep lower quantiles only
+        return flat_sorted if drop == 0 else flat_sorted[:, : (c * n - drop)]
 
     # =============================================================================
     # Update
     # =============================================================================
     def update_from_batch(self, batch: Any) -> Dict[str, Any]:
         """
-        Perform one gradient update from a replay batch.
+        Run one TQC gradient update from a replay batch.
 
-        Batch contract
-        --------------
-        batch must provide (tensors):
-          - observations:      (B, obs_dim)
-          - actions:           (B, action_dim)
-          - rewards:           (B,) or (B,1)
-          - next_observations: (B, obs_dim)
-          - dones:             (B,) or (B,1)
-          - (optional) PER weights via get_per_weights(batch, ...)
+        Parameters
+        ----------
+        batch : Any
+            A batch object (typically from your replay buffer) providing:
+            ``observations``, ``actions``, ``rewards``, ``next_observations``, ``dones``,
+            and optionally PER importance weights (retrieved via ``_get_per_weights``).
+
+            Expected tensor shapes:
+            - observations:      ``(B, obs_dim)``
+            - actions:           ``(B, action_dim)``
+            - rewards:           ``(B,)`` or ``(B, 1)``
+            - next_observations: ``(B, obs_dim)``
+            - dones:             ``(B,)`` or ``(B, 1)``
 
         Returns
         -------
-        metrics : Dict[str, Any]
-            Scalar logs + PER td_errors vector.
-        """
-        self._bump()  # increments update_calls, handles AMP bookkeeping, etc.
+        Dict[str, Any]
+            Scalar metrics for logging plus PER feedback:
 
+            - ``loss/critic`` : float
+            - ``loss/actor`` : float
+            - ``loss/alpha`` : float
+            - ``alpha`` : float
+            - ``q/quantile_mean`` : float
+            - ``q/pi_min_mean`` : float
+            - ``logp_mean`` : float
+            - ``lr/actor`` : float
+            - ``lr/critic`` : float
+            - ``lr/alpha`` : float (if auto-alpha enabled)
+            - ``tqc/target_updated`` : float {0.0, 1.0}
+            - ``per/td_errors`` : np.ndarray of shape ``(B,)``
+        """
+        self._bump()
+
+        # -----------------------------
+        # Move batch to device and normalize shapes
+        # -----------------------------
         obs = batch.observations.to(self.device)
         act = batch.actions.to(self.device)
-        rew = to_column(batch.rewards.to(self.device))   # enforce (B,1)
+        rew = _to_column(batch.rewards.to(self.device))  # (B,1)
         nxt = batch.next_observations.to(self.device)
-        done = to_column(batch.dones.to(self.device))    # enforce (B,1)
+        done = _to_column(batch.dones.to(self.device))  # (B,1)
 
         B = int(obs.shape[0])
-        w = get_per_weights(batch, B, device=self.device)  # (B,1) or None
+        w = _get_per_weights(batch, B, device=self.device)  # (B,1) or None
 
         # ---------------------------------------------------------------------
-        # Target truncated distribution:
-        #   1) sample next action from current actor
-        #   2) get target critic quantiles Z_t(s', a')
-        #   3) truncate: drop top quantiles across ensemble
-        #   4) Bellman backup per kept quantile:
-        #        y = r + gamma(1-d) * ( z_trunc - alpha * logpi(a'|s') )
+        # Target truncated distribution (no grad)
         # ---------------------------------------------------------------------
         with th.no_grad():
             next_a, next_logp = self.head.sample_action_and_logp(nxt)
-            if next_logp.dim() == 1:
-                next_logp = next_logp.unsqueeze(1)  # enforce (B,1)
+            next_logp = _to_column(next_logp)  # robust (B,) -> (B,1)
 
             z_next = self.head.quantiles_target(nxt, next_a)  # (B,C,N)
             z_trunc = self._truncate_quantiles(z_next, self.top_quantiles_to_drop)  # (B,K)
 
-            # Bellman backup on each retained quantile (distributional target)
+            # Per-quantile Bellman backup with entropy regularization.
             target = rew + self.gamma * (1.0 - done) * (z_trunc - self.alpha * next_logp)  # (B,K)
 
-            # quantile_huber_loss commonly expects target shaped like current:
-            # current: (B,C,N), target: (B,C,K) (K may differ due to truncation)
-            target_quantiles = target.unsqueeze(1).expand(-1, z_next.shape[1], -1)  # (B,C,K)
+            # Expand to match loss helper expectation: (B,C,K)
+            target_quantiles = target.unsqueeze(1).expand(-1, z_next.shape[1], -1)
 
         # ---------------------------------------------------------------------
-        # Critic update: distributional regression via quantile Huber loss
+        # Critic update: quantile regression (Huber)
         # ---------------------------------------------------------------------
         def _critic_loss_and_td() -> Tuple[th.Tensor, th.Tensor]:
+            """
+            Compute critic loss and a TD-error proxy for PER.
+
+            Returns
+            -------
+            loss : torch.Tensor
+                Scalar critic loss.
+            td_abs : torch.Tensor
+                Per-sample error magnitude proxy with shape ``(B,)``.
+            """
             current = self.head.quantiles(obs, act)  # (B,C,N)
 
-            # quantile_huber_loss should:
-            # - compute loss across quantile pairs between current and target
-            # - optionally apply PER weights
-            loss, td_err = quantile_huber_loss(
+            loss, td_err = _quantile_huber_loss(
                 current_quantiles=current,
                 target_quantiles=target_quantiles,
-                cum_prob=None,               # your util may infer taus internally
-                weights=w,                   # (B,1) or None
+                cum_prob=None,  # helper may infer taus/quantile fractions internally
+                weights=w,
             )
 
-            # Build td_abs as PER feedback vector shape (B,).
-            # td_err format depends on your helper; handle typical cases robustly.
+            # Robust TD proxy extraction for PER.
             if isinstance(td_err, th.Tensor):
-                if td_err.dim() == 1:
+                if td_err.ndim == 1:
                     td_abs = td_err.detach()
-                elif td_err.dim() == 2 and td_err.shape[1] == 1:
+                elif td_err.ndim == 2 and td_err.shape[1] == 1:
                     td_abs = td_err.detach().squeeze(1)
                 else:
-                    td_abs = td_err.detach().mean(dim=tuple(range(1, td_err.dim())))
+                    td_abs = td_err.detach().mean(dim=tuple(range(1, td_err.ndim)))
             else:
-                # Fallback: proxy TD using conservative scalar Q estimates.
-                q_cur = current.mean(dim=-1).min(dim=1).values       # (B,)
+                # Fallback: compare conservative scalar summaries.
+                q_cur = current.mean(dim=-1).min(dim=1).values  # (B,)
                 q_tgt = target_quantiles.mean(dim=-1).min(dim=1).values  # (B,)
                 td_abs = (q_cur - q_tgt).abs().detach()
 
@@ -336,20 +430,27 @@ class TQCCore(ActorCriticCore):
             self.critic_sched.step()
 
         # ---------------------------------------------------------------------
-        # Actor update (SAC-style):
-        #   J_pi = E[ alpha * logpi(a|s) - Q(s,a) ]
-        # where Q(s,a) is formed conservatively from quantiles:
-        #   - mean over N quantiles per critic -> (B,C)
-        #   - min over C critics -> (B,1)
+        # Actor update (SAC-style) using conservative scalar Q proxy
         # ---------------------------------------------------------------------
         def _actor_loss() -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
-            new_a, logp = self.head.sample_action_and_logp(obs)
-            if logp.dim() == 1:
-                logp = logp.unsqueeze(1)  # (B,1)
+            """
+            Compute actor loss and diagnostics.
 
-            z = self.head.quantiles(obs, new_a)               # (B,C,N)
-            q_c = z.mean(dim=-1)                           # (B,C)  mean over quantiles
-            q_min = th.min(q_c, dim=1).values.unsqueeze(1) # (B,1)  conservative over ensemble
+            Returns
+            -------
+            loss : torch.Tensor
+                Scalar actor loss.
+            logp : torch.Tensor
+                Log-probabilities of sampled actions, shape ``(B,1)``.
+            q_min : torch.Tensor
+                Conservative scalar Q proxy, shape ``(B,1)``.
+            """
+            new_a, logp = self.head.sample_action_and_logp(obs)
+            logp = _to_column(logp)
+
+            z = self.head.quantiles(obs, new_a)  # (B,C,N)
+            q_c = z.mean(dim=-1)  # (B,C)
+            q_min = th.min(q_c, dim=1).values.unsqueeze(1)  # (B,1)
 
             loss = (self.alpha * logp - q_min).mean()
             return loss, logp, q_min
@@ -377,11 +478,7 @@ class TQCCore(ActorCriticCore):
             self.actor_sched.step()
 
         # ---------------------------------------------------------------------
-        # Alpha update (optional)
-        #
-        # You are following the SAC continuous convention:
-        #   alpha_loss = -E[ log_alpha * (logp + target_entropy) ]
-        # so that when entropy is above target, alpha decreases, and vice versa.
+        # Alpha update (optional, SAC-style)
         # ---------------------------------------------------------------------
         alpha_loss_val = 0.0
         if self.alpha_opt is not None:
@@ -389,13 +486,14 @@ class TQCCore(ActorCriticCore):
             self.alpha_opt.zero_grad(set_to_none=True)
             alpha_loss.backward()
             self.alpha_opt.step()
+
             if self.alpha_sched is not None:
                 self.alpha_sched.step()
-            alpha_loss_val = to_scalar(alpha_loss)
+
+            alpha_loss_val = float(_to_scalar(alpha_loss))
 
         # ---------------------------------------------------------------------
-        # Target critic update: critic_target <- critic
-        # (core helper handles hard/soft schedule + freezing)
+        # Target critic update
         # ---------------------------------------------------------------------
         self._maybe_update_target(
             target=getattr(self.head, "critic_target", None),
@@ -405,32 +503,32 @@ class TQCCore(ActorCriticCore):
         )
 
         # ---------------------------------------------------------------------
-        # Logging stats
+        # Metrics
         # ---------------------------------------------------------------------
         with th.no_grad():
             z_cur = self.head.critic(obs, act)  # (B,C,N)
-            q_mean = z_cur.mean()               # scalar (distribution mean proxy)
+            q_mean = z_cur.mean()
 
         out: Dict[str, Any] = {
-            "loss/critic": to_scalar(critic_loss),
-            "loss/actor": to_scalar(actor_loss),
+            "loss/critic": float(_to_scalar(critic_loss)),
+            "loss/actor": float(_to_scalar(actor_loss)),
             "loss/alpha": float(alpha_loss_val),
-            "alpha": to_scalar(self.alpha),
-            "q/quantile_mean": to_scalar(q_mean),
-            "q/pi_min_mean": to_scalar(q_pi.mean()),
-            "logp_mean": to_scalar(logp.mean()),
+            "alpha": float(_to_scalar(self.alpha)),
+            "q/quantile_mean": float(_to_scalar(q_mean)),
+            "q/pi_min_mean": float(_to_scalar(q_pi.mean())),
+            "logp_mean": float(_to_scalar(logp.mean())),
             "lr/actor": float(self.actor_opt.param_groups[0]["lr"]),
             "lr/critic": float(self.critic_opt.param_groups[0]["lr"]),
             "tqc/target_updated": float(
                 1.0
-                if (self.target_update_interval > 0 and self.update_calls % self.target_update_interval == 0)
+                if (self.target_update_interval > 0 and (self.update_calls % self.target_update_interval == 0))
                 else 0.0
             ),
-            # PER feedback vector: expected shape (B,)
             "per/td_errors": td_abs.detach().cpu().numpy(),
         }
         if self.alpha_opt is not None:
             out["lr/alpha"] = float(self.alpha_opt.param_groups[0]["lr"])
+
         return out
 
     # =============================================================================
@@ -438,20 +536,26 @@ class TQCCore(ActorCriticCore):
     # =============================================================================
     def state_dict(self) -> Dict[str, Any]:
         """
-        ActorCriticCore already saves:
-          - update_calls
-          - actor optimizer/scheduler state
-          - critic optimizer/scheduler state
+        Serialize core state (base + TQC additions).
 
-        We add:
-          - log_alpha
-          - alpha optimizer/scheduler (if enabled)
-          - core hyperparameters (useful for reproducibility/debug)
+        ActorCriticCore already serializes:
+        - update counter (update_calls)
+        - actor optimizer/scheduler state
+        - critic optimizer/scheduler state
+
+        This method additionally stores:
+        - temperature state (log_alpha + alpha opt/sched state)
+        - key hyperparameters for reproducibility/debugging
+
+        Returns
+        -------
+        Dict[str, Any]
+            Serializable state dictionary.
         """
         s = super().state_dict()
         s.update(
             {
-                "log_alpha": float(to_scalar(self.log_alpha)),
+                "log_alpha": float(_to_scalar(self.log_alpha)),
                 "alpha": self._save_opt_sched(self.alpha_opt, self.alpha_sched) if self.alpha_opt is not None else None,
                 "gamma": float(self.gamma),
                 "tau": float(self.tau),
@@ -466,10 +570,18 @@ class TQCCore(ActorCriticCore):
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
-        Restore core state:
-          - inherited actor/critic opt/sched + update_calls
-          - log_alpha
-          - alpha opt/sched (if enabled)
+        Restore core state (base + TQC additions).
+
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State dict produced by :meth:`state_dict`.
+
+        Notes
+        -----
+        - Optimizer/scheduler reconstruction is assumed to match constructor config.
+          This method restores optimizer/scheduler *state* but does not rebuild them.
+        - Target critic freezing is enforced in ``__init__`` and target update helper.
         """
         super().load_state_dict(state)
 

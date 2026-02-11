@@ -8,50 +8,61 @@ import torch.nn as nn
 
 from model_free.common.networks.policy_networks import DeterministicPolicyNetwork
 from model_free.common.networks.value_networks import DoubleStateActionValueNetwork
-from model_free.common.utils.ray_utils import PolicyFactorySpec, make_entrypoint, resolve_activation_fn
 from model_free.common.policies.base_head import DeterministicActorCriticHead
-
+from model_free.common.utils.ray_utils import PolicyFactorySpec, _make_entrypoint, _resolve_activation_fn
 
 # =============================================================================
 # Ray worker factory (module-level)
 # =============================================================================
 def build_td3_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build TD3Head on CPU.
+    Build a TD3Head instance for Ray rollout workers (CPU-only).
 
-    Why this exists
-    ---------------
-    In Ray multi-process rollouts, you typically construct policies inside worker
-    processes. Those workers should avoid GPU ownership and should receive only
-    JSON-serializable kwargs.
+    Ray background
+    --------------
+    In Ray multi-process/multi-node rollouts, workers typically reconstruct the
+    policy module from a `(entrypoint, kwargs)` specification. For this to work,
+    the factory must be defined at module scope (importable / picklable).
 
-    What this function enforces
-    ---------------------------
-    - device is forced to "cpu" (workers stay CPU-only)
-    - activation_fn is resolved from a string/name to an nn.Module class
-    - action_low/action_high are converted from list -> np.ndarray (float32)
+    This factory enforces rollout-safe conventions
+    ----------------------------------------------
+    - Forces ``device="cpu"`` to avoid accidental GPU allocation on workers.
+    - Resolves ``activation_fn`` from a serialized identifier (e.g., ``"relu"``)
+      into a concrete ``torch.nn`` activation class.
+    - Converts action bounds (often JSON lists) into ``np.ndarray`` for consistent
+      shape checks and downstream clamping.
+
+    Parameters
+    ----------
+    **kwargs : Any
+        JSON-serializable constructor keyword arguments for :class:`TD3Head`.
+        Typical fields include:
+        ``obs_dim``, ``action_dim``, ``hidden_sizes``, ``activation_fn``,
+        ``init_type``, ``gain``, ``bias``, ``action_low``, ``action_high``.
 
     Returns
     -------
-    head : nn.Module
-        A TD3Head instance on CPU, set to eval/inference mode.
+    head : torch.nn.Module
+        A CPU-resident :class:`TD3Head` configured for inference/rollout
+        (``set_training(False)``).
     """
     kwargs = dict(kwargs)
 
-    # Force CPU on workers to avoid GPU contention / CUDA context init in subprocesses.
+    # Force CPU on rollout workers to avoid CUDA context initialization in subprocesses.
     kwargs["device"] = "cpu"
 
-    # activation_fn might be serialized as a string; map it back to nn.Module class.
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    # activation_fn may arrive as a string; resolve into a torch.nn activation class.
+    kwargs["activation_fn"] = _resolve_activation_fn(kwargs.get("activation_fn", None))
 
-    # Action bounds are often stored as JSON-safe lists; convert back to float32 arrays.
+    # Bounds commonly arrive as JSON-safe lists; convert to float32 numpy arrays.
     if kwargs.get("action_low", None) is not None:
         kwargs["action_low"] = np.asarray(kwargs["action_low"], dtype=np.float32)
     if kwargs.get("action_high", None) is not None:
         kwargs["action_high"] = np.asarray(kwargs["action_high"], dtype=np.float32)
 
-    # Build the head and disable training behaviors (dropout/bn, etc.) for rollouts.
     head = TD3Head(**kwargs).to("cpu")
+
+    # Rollout workers are inference-only; keep networks in eval-like behavior.
     head.set_training(False)
     return head
 
@@ -61,40 +72,78 @@ def build_td3_head_worker_policy(**kwargs: Any) -> nn.Module:
 # =============================================================================
 class TD3Head(DeterministicActorCriticHead):
     """
-    TD3 Head (Actor + Twin Critics + Target Networks)
+    TD3 policy head: deterministic actor + twin critics + target networks.
 
     Overview
     --------
-    TD3 uses:
-      - a deterministic actor π(s)
-      - twin Q critics Q1(s,a), Q2(s,a)
-      - target networks π'(s), Q1'(s,a), Q2'(s,a) for stable bootstrapping
-      - target policy smoothing for critic target computation
+    TD3 (Twin Delayed DDPG) uses:
+    - Deterministic actor: :math:`a = \\pi(s)`
+    - Twin critics: :math:`Q_1(s,a)`, :math:`Q_2(s,a)`
+    - Target networks: :math:`\\pi'`, :math:`Q_1'`, :math:`Q_2'`
+    - Target policy smoothing (for critic targets) by adding clipped Gaussian noise
+      to the target actor output.
 
-    Inheritance
-    -----------
-    Inherits from DeterministicActorCriticHead (your base head for DDPG/TD3-style):
-      - set_training(training): toggles train/eval modes; targets stay eval
-      - act(obs, deterministic=False): returns action; may add exploration noise
-      - reset_exploration_noise(): if noise process needs reset (e.g., OU)
-      - hard_update(target, source) / soft_update(target, source, tau)
-      - freeze_target(module): disable grads for target nets
-      - _to_tensor_batched(x): convert obs/action to (B,dim) tensor on device
-      - _clamp_action(a): clamp to bounds if action_low/high are provided
-
-    TD3-specific additions
+    Separation of concerns
     ----------------------
-    - target_action(next_obs, noise_std, noise_clip):
-        Implements TD3 target policy smoothing:
-          a' = clip( π'(s') + clip(ε, -c, c), bounds )
+    - This *head* owns network modules and I/O (save/load, Ray spec).
+    - The *core* owns training logic (losses, optimizers, delayed policy update, etc.).
+      The core may call:
+        - ``head.target_action(...)`` for TD3 target smoothing
+        - ``head.actor``, ``head.critic`` for forward passes
+        - ``head.actor_target``, ``head.critic_target`` for target value computation
 
-    Required by downstream (OffPolicyAlgorithm / TD3Core)
-    -----------------------------------------------------
-    - self.actor: nn.Module producing actions
-    - self.critic: nn.Module returning (q1,q2)
-    - self.actor_target, self.critic_target: frozen target networks
-    - save(path), load(path) for checkpointing
-    - get_ray_policy_factory_spec() for Ray worker creation
+    Inherited utilities
+    -------------------
+    The base :class:`~model_free.common.policies.base_head.DeterministicActorCriticHead`
+    is expected to provide:
+    - ``self.device`` device management
+    - ``set_training(training)`` mode toggle
+    - ``hard_update(target, source)``, ``soft_update(target, source, tau)``
+    - ``freeze_target(module)`` (disable gradients for target nets)
+    - ``_to_tensor_batched(x)`` to normalize inputs to batched tensors
+    - ``_clamp_action(a)`` to clamp to ``action_low/high`` if configured
+    - Optional exploration noise handling in ``act(..., deterministic=False)``
+
+    Parameters
+    ----------
+    obs_dim : int
+        Observation dimension.
+    action_dim : int
+        Action dimension.
+    hidden_sizes : Sequence[int], default=(256, 256)
+        Hidden layer sizes for actor and critics.
+    activation_fn : Any, default=torch.nn.ReLU
+        Torch activation class used inside MLPs (e.g., ``nn.ReLU``).
+    init_type : str, default="orthogonal"
+        Initialization scheme identifier forwarded to your network modules.
+    gain : float, default=1.0
+        Initialization gain multiplier forwarded to your network modules.
+    bias : float, default=0.0
+        Initialization bias constant forwarded to your network modules.
+    device : Union[str, torch.device], default=("cuda" if available else "cpu")
+        Device for online and target networks.
+    action_low : Optional[Union[np.ndarray, Sequence[float]]], default=None
+        Lower bounds for actions (shape ``(action_dim,)``). If provided, ``action_high``
+        must also be provided.
+    action_high : Optional[Union[np.ndarray, Sequence[float]]], default=None
+        Upper bounds for actions (shape ``(action_dim,)``). If provided, ``action_low``
+        must also be provided.
+    noise : Optional[Any], default=None
+        Optional exploration noise object (typically used by ``act()`` when
+        ``deterministic=False``). This is treated as runtime-only and is not serialized.
+    noise_clip : Optional[float], default=None
+        Optional clamp range for exploration noise (runtime-only).
+
+    Attributes
+    ----------
+    actor : torch.nn.Module
+        Deterministic policy network :math:`\\pi(s)`.
+    critic : torch.nn.Module
+        Twin critic network returning ``(q1, q2)`` each shaped ``(B,1)``.
+    actor_target : torch.nn.Module
+        Target actor network.
+    critic_target : torch.nn.Module
+        Target twin critic network.
     """
 
     def __init__(
@@ -113,32 +162,29 @@ class TD3Head(DeterministicActorCriticHead):
         noise: Optional[Any] = None,
         noise_clip: Optional[float] = None,
     ) -> None:
-        # BaseHead initialization sets self.device and common helpers.
         super().__init__(device=device)
 
-        # Cache core hyperparams for export/repro.
+        # -----------------------------
+        # Configuration (for export/repro)
+        # -----------------------------
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.hidden_sizes = tuple(int(x) for x in hidden_sizes)
+
         self.activation_fn = activation_fn
         self.init_type = str(init_type)
         self.gain = float(gain)
         self.bias = float(bias)
 
-        # ---------------------------------------------------------------------
-        # Action bounds handling
-        # ---------------------------------------------------------------------
-        # Keep bounds as numpy arrays (float32) for easy JSON-safe export and
-        # consistent shape checks. The actor network will use these to scale/clamp.
+        # -----------------------------
+        # Action bounds (optional)
+        # -----------------------------
         self.action_low = None if action_low is None else np.asarray(action_low, dtype=np.float32).reshape(-1)
         self.action_high = None if action_high is None else np.asarray(action_high, dtype=np.float32).reshape(-1)
 
-        # Require both bounds or neither. TD3 can work without bounds, but if you
-        # provide them, it must be a matched pair.
         if (self.action_low is None) ^ (self.action_high is None):
             raise ValueError("action_low and action_high must be provided together, or both be None.")
 
-        # Validate bounds dimensionality matches action_dim.
         if self.action_low is not None:
             if self.action_low.shape[0] != self.action_dim or self.action_high.shape[0] != self.action_dim:
                 raise ValueError(
@@ -146,16 +192,13 @@ class TD3Head(DeterministicActorCriticHead):
                     f"got {self.action_low.shape}, {self.action_high.shape}"
                 )
 
-        # Exploration noise config:
-        # - noise: external noise object/process (e.g., OU or Gaussian) handled by base act()
-        # - noise_clip: optional clamp applied to the noise (common in TD3 target smoothing too)
+        # Runtime-only exploration noise configuration (not serialized).
         self.noise = noise
         self.noise_clip = None if noise_clip is None else float(noise_clip)
 
-        # ---------------------------------------------------------------------
-        # Actor network (deterministic policy)
-        # ---------------------------------------------------------------------
-        # DeterministicPolicyNetwork typically outputs in bounds directly if bounds are provided.
+        # -----------------------------
+        # Actor (deterministic)
+        # -----------------------------
         self.actor = DeterministicPolicyNetwork(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
@@ -168,10 +211,9 @@ class TD3Head(DeterministicActorCriticHead):
             bias=self.bias,
         ).to(self.device)
 
-        # ---------------------------------------------------------------------
-        # Twin critic network
-        # ---------------------------------------------------------------------
-        # DoubleStateActionValueNetwork returns (q1, q2), each shaped (B,1).
+        # -----------------------------
+        # Critic (twin Q)
+        # -----------------------------
         self.critic = DoubleStateActionValueNetwork(
             state_dim=self.obs_dim,
             action_dim=self.action_dim,
@@ -182,10 +224,9 @@ class TD3Head(DeterministicActorCriticHead):
             bias=self.bias,
         ).to(self.device)
 
-        # ---------------------------------------------------------------------
+        # -----------------------------
         # Target networks
-        # ---------------------------------------------------------------------
-        # TD3 uses target actor and target critics for bootstrapped targets.
+        # -----------------------------
         self.actor_target = DeterministicPolicyNetwork(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
@@ -208,7 +249,7 @@ class TD3Head(DeterministicActorCriticHead):
             bias=self.bias,
         ).to(self.device)
 
-        # Initialize targets to match online networks, then freeze targets (no grads).
+        # Sync targets once (hard copy), then freeze to prevent gradient updates.
         self.hard_update(self.actor_target, self.actor)
         self.hard_update(self.critic_target, self.critic)
         self.freeze_target(self.actor_target)
@@ -226,45 +267,43 @@ class TD3Head(DeterministicActorCriticHead):
         noise_clip: float,
     ) -> th.Tensor:
         """
-        Compute smoothed target action for TD3 critic target computation.
+        Compute the TD3 "smoothed" target action :math:`a'` for critic targets.
 
-        TD3 uses "target policy smoothing" to reduce overestimation by adding
-        clipped Gaussian noise to the target actor output:
-          a' = clip( π'(s') + clip(ε, -c, c), action_bounds )
-        where ε ~ N(0, noise_std^2).
+        TD3 target policy smoothing
+        ---------------------------
+        For critic target computation, TD3 adds clipped Gaussian noise to the
+        *target actor* output:
+        :math:`a' = \\mathrm{clip}(\\pi'(s') + \\mathrm{clip}(\\epsilon, -c, c))`,
+        with :math:`\\epsilon \\sim \\mathcal{N}(0, \\sigma^2)`.
 
         Parameters
         ----------
         next_obs : Any
-            Next observation(s). Accepts numpy arrays, lists, tensors, etc.
+            Next observations. Any input accepted by ``_to_tensor_batched``.
+            Expected final tensor shape is ``(B, obs_dim)`` on ``self.device``.
         noise_std : float
-            Standard deviation of Gaussian noise added to target action.
+            Standard deviation :math:`\\sigma` for Gaussian noise.
         noise_clip : float
-            Clip range for the noise term ε (applied elementwise).
+            Clip range :math:`c` applied elementwise to the noise term.
 
         Returns
         -------
         next_action : torch.Tensor
-            Smoothed target action tensor of shape (B, action_dim), clamped to bounds
-            if action_low/action_high are configured.
+            Smoothed action tensor of shape ``(B, action_dim)``. If action bounds
+            are configured, the result is clamped to ``[action_low, action_high]``.
         """
-        # Convert to (B, obs_dim) tensor on the head device.
         s2 = self._to_tensor_batched(next_obs)
-
-        # Base target action from target actor.
-        a2 = self.actor_target(s2)  # (B, action_dim)
+        a2 = self.actor_target(s2)
 
         ns = float(noise_std)
         nc = float(noise_clip)
 
-        # Add clipped Gaussian noise (policy smoothing).
         if ns > 0.0:
             eps = ns * th.randn_like(a2)
             if nc > 0.0:
                 eps = eps.clamp(-nc, nc)
             a2 = a2 + eps
 
-        # Clamp to valid action bounds (if bounds are defined).
         return self._clamp_action(a2)
 
     # =============================================================================
@@ -272,13 +311,21 @@ class TD3Head(DeterministicActorCriticHead):
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export constructor kwargs in JSON-safe form.
+        Export constructor configuration in a JSON-serializable format.
+
+        Returns
+        -------
+        kwargs : Dict[str, Any]
+            JSON-friendly kwargs used for:
+            - checkpoint metadata (debugging / reproducibility)
+            - Ray policy reconstruction (``PolicyFactorySpec``)
 
         Notes
         -----
-        - activation_fn is converted to a name/string (resolved back on load/worker)
-        - device is stored as string for portability
-        - action bounds are stored as Python lists
+        - ``activation_fn`` is exported as a string name and later resolved via
+          :func:`~model_free.common.utils.ray_utils._resolve_activation_fn`.
+        - ``noise`` and ``noise_clip`` are intentionally excluded since they are
+          typically runtime-only and may not be serializable.
         """
         low = None if self.action_low is None else [float(x) for x in self.action_low.reshape(-1)]
         high = None if self.action_high is None else [float(x) for x in self.action_high.reshape(-1)]
@@ -297,18 +344,25 @@ class TD3Head(DeterministicActorCriticHead):
 
     def save(self, path: str) -> None:
         """
-        Save actor/critic + target networks into a single checkpoint file.
+        Save TD3Head weights and minimal configuration to a checkpoint.
 
         Parameters
         ----------
         path : str
-            Target path prefix. If not ending with ".pt", it will be appended.
+            Output path. If ``path`` does not end with ``.pt``, the extension is appended.
 
-        Saved contents
-        --------------
-        - kwargs: json-safe constructor args (for Ray/spec reconstruction)
-        - actor, critic: online networks
-        - actor_target, critic_target: target networks
+        Saved payload
+        -------------
+        kwargs : Dict[str, Any]
+            JSON-safe constructor kwargs (see ``_export_kwargs_json_safe``).
+        actor : Dict[str, torch.Tensor]
+            State dict of the online actor.
+        critic : Dict[str, torch.Tensor]
+            State dict of the online twin critics.
+        actor_target : Dict[str, torch.Tensor]
+            State dict of the target actor.
+        critic_target : Dict[str, torch.Tensor]
+            State dict of the target twin critics.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -324,17 +378,23 @@ class TD3Head(DeterministicActorCriticHead):
 
     def load(self, path: str) -> None:
         """
-        Load actor/critic + target networks from a checkpoint file.
+        Load TD3Head weights from a checkpoint produced by :meth:`save`.
 
         Parameters
         ----------
         path : str
-            Checkpoint path prefix. If not ending with ".pt", it will be appended.
+            Checkpoint path. If ``path`` does not end with ``.pt``, the extension is appended.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint does not contain the minimal expected keys.
 
         Notes
         -----
-        - If a target network state is missing, targets are hard-copied from online.
-        - Targets are frozen after loading to ensure no accidental gradient updates.
+        - If target networks are missing (older checkpoints), they are reconstructed
+          via hard copy from the corresponding online networks.
+        - Target networks are frozen after loading to avoid accidental optimization.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -343,11 +403,9 @@ class TD3Head(DeterministicActorCriticHead):
         if not isinstance(ckpt, dict) or "actor" not in ckpt or "critic" not in ckpt:
             raise ValueError(f"Unrecognized TD3Head checkpoint format at: {path}")
 
-        # Restore online networks.
         self.actor.load_state_dict(ckpt["actor"])
         self.critic.load_state_dict(ckpt["critic"])
 
-        # Restore targets if present; otherwise re-init from online.
         if ckpt.get("actor_target", None) is not None:
             self.actor_target.load_state_dict(ckpt["actor_target"])
         else:
@@ -358,21 +416,33 @@ class TD3Head(DeterministicActorCriticHead):
         else:
             self.hard_update(self.critic_target, self.critic)
 
-        # Targets should not receive gradients.
         self.freeze_target(self.actor_target)
         self.freeze_target(self.critic_target)
+
+        # Targets should always stay in eval mode.
+        self.actor_target.eval()
+        self.critic_target.eval()
 
     # =============================================================================
     # Ray integration
     # =============================================================================
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Return a Ray-serializable spec that reconstructs this head inside workers.
+        Build a Ray-serializable specification to reconstruct this head on workers.
 
-        The entrypoint must be a module-level function (Ray cloudpickle-safe),
-        and kwargs must be JSON-safe (no tensors, no classes).
+        Returns
+        -------
+        spec : PolicyFactorySpec
+            A spec containing:
+            - ``entrypoint``: importable module-level factory function
+            - ``kwargs``: JSON-safe constructor kwargs
+
+        Notes
+        -----
+        Ray requires the entrypoint to be module-level (import path resolution),
+        and kwargs must avoid non-serializable objects (tensors, callables, etc.).
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_td3_head_worker_policy),
+            entrypoint=_make_entrypoint(build_td3_head_worker_policy),
             kwargs=self._export_kwargs_json_safe(),
         )

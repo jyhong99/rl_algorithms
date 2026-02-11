@@ -7,85 +7,117 @@ import torch.nn as nn
 
 from model_free.common.networks.policy_networks import DiscretePolicyNetwork
 from model_free.common.networks.value_networks import StateValueNetwork
+from model_free.common.policies.base_head import OnPolicyDiscreteActorCriticHead
 from model_free.common.utils.ray_utils import (
     PolicyFactorySpec,
-    make_entrypoint,
-    resolve_activation_fn,
+    _make_entrypoint,
+    _resolve_activation_fn,
 )
-from model_free.common.policies.base_head import OnPolicyDiscreteActorCriticHead
-
 
 # =============================================================================
 # Ray worker factory (MUST be module-level)
 # =============================================================================
+
+
 def build_a2c_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build a DISCRETE A2C head on CPU.
+    Build an :class:`A2CDiscreteHead` inside a Ray rollout worker (CPU-only).
 
-    Why this function exists
-    ------------------------
-    Ray workers often reconstruct policies from a pickled entrypoint + kwargs.
-    The safest pattern is:
-      - keep the factory function at module scope (pickle-friendly)
-      - pass JSON-safe kwargs (so kwargs can be serialized easily)
-      - force worker policies onto CPU (rollout workers should not depend on GPU)
+    Ray pattern and rationale
+    -------------------------
+    Ray commonly reconstructs policies through a pickled entrypoint callable plus
+    JSON-serializable kwargs. To make this robust across different machines and
+    cluster setups:
 
-    Behavior
+    - Keep this factory at **module scope** (pickle-friendly).
+    - Expect kwargs to be **JSON-safe** (strings/numbers/lists/dicts only).
+    - Force the policy module onto **CPU** for rollout workers (GPU should remain
+      optional and typically reserved for the learner).
+
+    Parameters
+    ----------
+    **kwargs : Any
+        Constructor keyword arguments for :class:`A2CDiscreteHead`. In Ray use,
+        this dict is usually produced by :meth:`A2CDiscreteHead._export_kwargs_json_safe`.
+
+        Notes
+        -----
+        - ``activation_fn`` is serialized as a string name (or ``None``) and must
+          be resolved back to a callable activation class via :func:`_resolve_activation_fn`.
+        - ``device`` is overwritten to ``"cpu"`` unconditionally.
+
+    Returns
+    -------
+    torch.nn.Module
+        An :class:`A2CDiscreteHead` instance on CPU with training disabled via
+        :meth:`set_training(False)`.
+
+    See Also
     --------
-    - Forces `device="cpu"` for portability/safety on remote workers.
-    - `activation_fn` is stored as a string (or None) in kwargs; we resolve it back
-      to a callable here.
-    - Puts the returned head into evaluation mode via `set_training(False)`.
+    A2CDiscreteHead.get_ray_policy_factory_spec
+        Produces the (entrypoint, kwargs) pair used by Ray for worker reconstruction.
     """
-    kwargs = dict(kwargs)
-    kwargs["device"] = "cpu"
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    cfg = dict(kwargs)
+    cfg["device"] = "cpu"
+    cfg["activation_fn"] = _resolve_activation_fn(cfg.get("activation_fn", None))
 
-    head = A2CDiscreteHead(**kwargs).to("cpu")
+    head = A2CDiscreteHead(**cfg).to("cpu")
     head.set_training(False)
     return head
 
 
 # =============================================================================
-# A2C (DISCRETE)
+# A2C head (DISCRETE)
 # =============================================================================
+
+
 class A2CDiscreteHead(OnPolicyDiscreteActorCriticHead):
     """
-    A2C network container for DISCRETE action spaces.
+    A2C network head for **discrete** action spaces.
 
-    Components
-    ----------
+    This module is a *network container* (actor + critic) used by on-policy
+    algorithms such as A2C/PPO variants configured for categorical actions.
+
+    Architecture
+    ------------
     Actor
-      - `DiscretePolicyNetwork`: categorical policy π(a|s) over `n_actions`.
+        Categorical policy :math:`\\pi(a\\mid s)` implemented by
+        :class:`DiscretePolicyNetwork`, producing logits over ``n_actions``.
 
     Critic
-      - `StateValueNetwork`: state-value baseline V(s).
+        State-value baseline :math:`V(s)` implemented by :class:`StateValueNetwork`.
 
-    Inherited contract (from OnPolicyDiscreteActorCriticHead)
-    ---------------------------------------------------------
-    - act(obs, deterministic=False) -> action indices, shape (B,)
-    - value_only(obs) -> value tensor, shape (B, 1)
-    - evaluate_actions(obs, action) -> dict with:
-        value    : (B, 1)
-        log_prob : (B, 1)   (categorical log_prob standardized)
-        entropy  : (B, 1)
+    Inherited interface
+    -------------------
+    The parent class :class:`OnPolicyDiscreteActorCriticHead` is expected to provide
+    (or require) the following common API:
 
-    Constructor compatibility note
-    ------------------------------
-    In your codebase you may have a unified dispatcher/builder that forwards a shared
-    kwargs set for both continuous and discrete heads. To keep checkpoint/Ray
-    reconstruction robust, this discrete head accepts continuous-only kwargs
-    (e.g., `log_std_*`) but ignores them.
+    - ``act(obs, deterministic=False)`` -> action indices, shape ``(B,)``
+    - ``value_only(obs)`` -> value tensor, shape ``(B, 1)``
+    - ``evaluate_actions(obs, action)`` -> mapping with keys:
+        - ``"value"``    : ``(B, 1)``
+        - ``"log_prob"`` : ``(B, 1)``
+        - ``"entropy"``  : ``(B, 1)``
 
-    This prevents failures like:
-      - "unexpected keyword argument log_std_mode" during load/Ray worker creation
+    Builder compatibility note
+    --------------------------
+    Many codebases use a unified builder that forwards a shared kwargs set for both
+    continuous and discrete policies. To keep checkpoint/Ray reconstruction robust,
+    this class is conservative about what it exports (JSON-safe only) and uses
+    stable keys.
+
+    Notes
+    -----
+    - This head stores enough constructor configuration to support:
+        - checkpoint metadata
+        - Ray worker reconstruction
     """
 
     def __init__(
         self,
         *,
         obs_dim: int,
-        n_actions: int,  # DISCRETE: number of actions
+        n_actions: int,
         hidden_sizes: Sequence[int] = (64, 64),
         activation_fn: Any = nn.ReLU,
         init_type: str = "orthogonal",
@@ -97,23 +129,34 @@ class A2CDiscreteHead(OnPolicyDiscreteActorCriticHead):
         Parameters
         ----------
         obs_dim : int
-            Observation dimension.
+            Dimension of the flattened observation vector.
         n_actions : int
-            Number of discrete actions (size of categorical distribution).
-        hidden_sizes : Sequence[int]
-            MLP hidden sizes for actor and critic.
-        activation_fn : Any
-            Activation function class (e.g., nn.ReLU).
-        init_type : str
-            Weight initialization scheme name used by your network builders.
-        gain : float
-            Optional initialization gain.
-        bias : float
-            Optional initialization bias.
-        device : str | torch.device
-            Torch device for this head.
-        log_std_mode, log_std_init
-            Accepted only for compatibility with a unified builder; unused in discrete.
+            Number of discrete actions (size of the categorical distribution).
+        hidden_sizes : Sequence[int], default=(64, 64)
+            Hidden layer sizes for both actor and critic MLPs.
+        activation_fn : Any, default=torch.nn.ReLU
+            Activation function class (not an instance), e.g. ``nn.ReLU``.
+        init_type : str, default="orthogonal"
+            Weight initialization scheme identifier understood by your network builders.
+        gain : float, default=1.0
+            Optional initialization gain passed to network builders.
+        bias : float, default=0.0
+            Optional initialization bias passed to network builders.
+        device : str | torch.device, default="cpu"
+            Torch device on which this head will live.
+
+        Raises
+        ------
+        ValueError
+            If ``n_actions <= 0``.
+
+        Notes
+        -----
+        The actor is expected to implement:
+
+        - ``actor.get_dist(obs)`` -> Categorical-like distribution
+        - ``dist.log_prob(action_idx)`` -> ``(B,)`` (or broadcastable to it)
+        - ``dist.entropy()`` -> ``(B,)``
         """
         super().__init__(device=device)
 
@@ -137,10 +180,6 @@ class A2CDiscreteHead(OnPolicyDiscreteActorCriticHead):
         # -----------------------------
         # Actor: categorical policy π(a|s)
         # -----------------------------
-        # Expected behavior:
-        # - actor.get_dist(obs) returns a Categorical-like distribution
-        # - distribution.log_prob(action_idx) returns shape (B,)
-        # - distribution.entropy() returns shape (B,)
         self.actor = DiscretePolicyNetwork(
             obs_dim=self.obs_dim,
             n_actions=self.n_actions,
@@ -168,23 +207,37 @@ class A2CDiscreteHead(OnPolicyDiscreteActorCriticHead):
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export constructor kwargs in a JSON-safe form.
+        Export constructor kwargs in a JSON-serializable form.
 
-        Why include log_std_* here?
-        ---------------------------
-        If you have a unified constructor path for continuous and discrete heads
-        (e.g., a single builder that forwards a shared kwargs set), storing these
-        fields avoids mismatch during:
-          - checkpoint load/rebuild
-          - Ray worker reconstruction
+        This payload is intended for:
+        - checkpoint metadata (reproducibility/debugging)
+        - Ray worker reconstruction (kwargs must be JSON-safe)
 
-        They are harmless for discrete and simply ignored by the implementation.
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-safe configuration dictionary.
+
+        Notes
+        -----
+        Key naming
+            This implementation exports:
+
+            - ``n_actions`` under the key ``action_dim``
+
+            If your broader codebase standardizes discrete sizing under ``n_actions``,
+            consider changing this to export ``"n_actions": ...`` instead, and updating
+            the builder/reconstruction path accordingly.
+
+        Activation serialization
+            ``activation_fn`` is exported by name using ``_activation_to_name`` and is
+            resolved back to a callable via :func:`_resolve_activation_fn` in the worker
+            factory.
         """
         return {
             "obs_dim": int(self.obs_dim),
             "action_space": "discrete",
-            # NOTE: if your codebase standardizes the key name as `n_actions`,
-            # consider exporting "n_actions" instead of "action_dim".
+            # If your codebase standardizes `n_actions`, consider exporting "n_actions".
             "action_dim": int(self.n_actions),
             "hidden_sizes": [int(x) for x in self.hidden_sizes],
             "activation_fn": self._activation_to_name(self.activation_fn),
@@ -196,47 +249,83 @@ class A2CDiscreteHead(OnPolicyDiscreteActorCriticHead):
 
     def save(self, path: str) -> None:
         """
-        Save head checkpoint.
+        Save a head checkpoint to disk.
 
-        Stored fields
-        -------------
-        - kwargs : JSON-safe config for reconstruction/debugging
-        - actor  : actor state_dict
-        - critic : critic state_dict
+        Parameters
+        ----------
+        path : str
+            Output path. If ``.pt`` is missing, it is appended automatically.
+
+        Saved contents
+        --------------
+        kwargs : dict
+            JSON-safe constructor config (for reconstruction/debugging).
+        actor : dict
+            ``state_dict`` for the actor network.
+        critic : dict
+            ``state_dict`` for the critic network.
+
+        Notes
+        -----
+        - This method stores weights + metadata.
+        - Object reconstruction is not performed here; create a compatible instance
+          and then call :meth:`load` to restore weights.
         """
-        if not path.endswith(".pt"):
-            path += ".pt"
+        out = path if path.endswith(".pt") else (path + ".pt")
         th.save(
             {
                 "kwargs": self._export_kwargs_json_safe(),
                 "actor": self.actor.state_dict(),
                 "critic": self.critic.state_dict(),
             },
-            path,
+            out,
         )
 
     def load(self, path: str) -> None:
         """
-        Load checkpoint weights into the existing instance.
+        Load checkpoint weights into the *existing* instance.
+
+        Parameters
+        ----------
+        path : str
+            Checkpoint path. If ``.pt`` is missing, it is appended automatically.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint format does not match expectations.
 
         Notes
         -----
-        - Loads weights only; does not reconstruct the object.
-        - Assumes this instance was created with compatible shapes.
+        - This loads weights only; it does not reconstruct the object.
+        - Assumes the current instance was built with compatible shapes.
+        - Uses ``map_location=self.device`` to support CPU/GPU portability.
         """
-        if not path.endswith(".pt"):
-            path += ".pt"
-        ckpt = th.load(path, map_location=self.device)
+        ckpt_path = path if path.endswith(".pt") else (path + ".pt")
+        ckpt = th.load(ckpt_path, map_location=self.device)
+
         if not isinstance(ckpt, dict) or "actor" not in ckpt or "critic" not in ckpt:
-            raise ValueError(f"Unrecognized checkpoint format: {path}")
+            raise ValueError(f"Unrecognized checkpoint format: {ckpt_path}")
+
         self.actor.load_state_dict(ckpt["actor"])
         self.critic.load_state_dict(ckpt["critic"])
 
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Return a Ray-safe construction spec (entrypoint + JSON-safe kwargs).
+        Build a Ray-safe construction spec (entrypoint + JSON-safe kwargs).
+
+        Returns
+        -------
+        PolicyFactorySpec
+            A lightweight spec containing:
+            - ``entrypoint``: picklable reference to :func:`build_a2c_head_worker_policy`
+            - ``kwargs``: JSON-safe constructor arguments for worker-side reconstruction
+
+        Notes
+        -----
+        Worker-side reconstruction forces CPU and resolves ``activation_fn`` from name.
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_a2c_head_worker_policy),
+            entrypoint=_make_entrypoint(build_a2c_head_worker_policy),
             kwargs=self._export_kwargs_json_safe(),
         )

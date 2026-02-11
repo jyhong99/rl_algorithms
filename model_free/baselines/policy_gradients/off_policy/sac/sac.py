@@ -62,7 +62,6 @@ def sac(
     # -----------------------------
     buffer_size: int = 1_000_000,
     batch_size: int = 256,
-    warmup_env_steps: int = 10_000,
     update_after: int = 1_000,
     update_every: int = 1,
     utd: float = 1.0,
@@ -145,9 +144,6 @@ def sac(
         Replay buffer capacity (transitions).
     batch_size : int
         Batch size sampled from replay per update step.
-    warmup_env_steps : int
-        Number of environment steps to collect before allowing updates.
-        (OffPolicyAlgorithm uses this as warmup_steps)
     update_after : int
         Additional gate for updates (e.g., do not update before this many env steps).
     update_every : int
@@ -259,7 +255,6 @@ def sac(
         device=device,
         buffer_size=int(buffer_size),
         batch_size=int(batch_size),
-        warmup_steps=int(warmup_env_steps),
         update_after=int(update_after),
         update_every=int(update_every),
         utd=float(utd),

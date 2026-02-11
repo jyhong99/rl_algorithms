@@ -4,83 +4,118 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import torch as th
 
-from model_free.common.utils.common_utils import to_column, to_scalar
+from model_free.common.utils.common_utils import _to_column, _to_scalar
 from model_free.common.policies.base_core import QLearningCore
-from model_free.common.utils.policy_utils import get_per_weights, distribution_projection
+from model_free.common.utils.policy_utils import _get_per_weights, _distribution_projection
 
 
 class RainbowCore(QLearningCore):
     """
-    Rainbow (C51) update engine (discrete) refactored to reuse QLearningCore.
+    Rainbow (C51) update engine for discrete action spaces.
 
-    What this core does
-    -------------------
-    Implements the distributional Bellman update used in Rainbow's C51:
-      1) predict the online categorical distribution p_theta(z | s, a) for taken action a
-      2) build a projected target categorical distribution T_z p_bar(z | s', a*)
-      3) minimize cross-entropy between target distribution and current distribution
+    This core implements the *distributional* Bellman update used by Rainbow's C51
+    component. It reuses the shared :class:`~model_free.common.policies.base_core.QLearningCore`
+    infrastructure for optimizer/scheduler wiring, AMP bookkeeping, gradient
+    clipping, and target-network updates.
+
+    Algorithm summary
+    -----------------
+    Let ``Z(s, a)`` be the return distribution for action ``a`` at state ``s``.
+    In C51, ``Z(s, a)`` is represented as a categorical distribution over a fixed
+    discrete support (atoms):
+
+    - Support (atoms): ``z = linspace(v_min, v_max, K)``
+    - Predicted PMF: ``p_theta(z_k | s, a)``, shape ``(K,)`` per (s, a)
+
+    For a replay batch, this core performs:
+
+    1) **Online distribution**:
+       predict ``p_theta(z | s, a)`` for the *taken* action ``a``.
+
+    2) **Target distribution**:
+       choose greedy action ``a*`` at next state ``s'`` (Double DQN option),
+       then take the target PMF ``p_bar(z | s', a*)`` from the target network.
+
+    3) **Distributional Bellman backup + projection**:
+       apply the distributional Bellman operator and project back onto the fixed
+       support ``[v_min, v_max]``:
+
+       ``Tz p_bar := Proj( r + gamma^n * (1-done) * z, p_bar(z|s',a*) )``
+
+    4) **Loss**:
+       minimize cross-entropy between projected target distribution and online
+       predicted distribution:
+
+       ``L = - E_i[ sum_k target_i[k] * log p_theta_i[k] ]``
 
     Reused from QLearningCore
     -------------------------
-    - Optimizer + scheduler initialization: self.opt / self.sched
-    - AMP scaler + update counter: self._bump(), self.update_calls
-    - Gradient clipping helper: self._clip_params(...)
-    - Target update helper (hard/soft): self._maybe_update_target(...)
+    - Optimizer / scheduler: ``self.opt`` / ``self.sched``
+    - Update bookkeeping: ``self._bump()``, ``self.update_calls``
+    - AMP scaler: ``self.scaler`` when ``use_amp=True``
+    - Gradient clipping: ``self._clip_params(...)``
+    - Target update helper: ``self._maybe_update_target(...)``
 
     Expected head contract (duck-typed)
     -----------------------------------
-    Required attributes / methods:
-      - head.q: nn.Module
-          * head.q(obs) -> expected Q-values, shape (B, A)
-          * head.q.dist(obs) -> categorical distribution, shape (B, A, K)
-          * head.q.reset_noise() -> None (optional; for NoisyNet)
-      - head.q_target: nn.Module
-          * head.q_target(obs) -> expected Q-values, shape (B, A)
-          * head.q_target.dist(obs) -> categorical distribution, shape (B, A, K)
-          * head.q_target.reset_noise() -> None (optional)
-      - head.support: torch.Tensor of shape (K,)
-      - head.v_min: float
-      - head.v_max: float
+    The provided ``head`` must expose:
+
+    - ``head.q``: nn.Module
+        * ``head.q.dist(obs) -> (B, A, K)`` categorical PMFs over atoms
+        * optional ``head.q.reset_noise()`` for NoisyNet
+    - ``head.q_target``: nn.Module
+        * ``head.q_target.dist(obs) -> (B, A, K)``
+        * optional ``head.q_target.reset_noise()``
+    - ``head.q_values(obs) -> (B, A)``
+        Expected Q-values computed from distribution (used for action selection).
+    - ``head.q_values_target(obs) -> (B, A)``
+        Expected Q-values from target network.
+    - ``head.support``: torch.Tensor, shape ``(K,)``
+        Atom values (C51 support).
+    - ``head.v_min`` / ``head.v_max``: float
+        Support bounds.
 
     Notes
     -----
-    - PER weighting: get_per_weights(batch, B) returns (B,1) or None.
-      If present, we compute a weighted mean loss.
-    - PER priorities proxy: we return per-sample cross-entropy magnitude as "per/td_errors".
-      (Strictly speaking, this is not TD error, but serves as a stable priority signal.)
+    - PER weighting:
+        If the batch carries PER weights, ``w`` is read via :func:`_get_per_weights`
+        and used to compute a weighted mean loss.
+    - PER priority proxy:
+        This implementation returns per-sample cross-entropy magnitude as
+        ``"per/td_errors"``. It is not a true TD error, but provides a stable and
+        monotone priority signal for PER buffers.
     """
 
     def __init__(
         self,
         *,
         head: Any,
-        # -----------------------------
+        # ------------------------------------------------------------------
         # TD / target update
-        # -----------------------------
+        # ------------------------------------------------------------------
         gamma: float = 0.99,
         n_step: int = 1,
         target_update_interval: int = 1000,
-        tau: float = 0.0,          # tau>0 => soft update at interval; else hard copy
-        double_dqn: bool = True,   # select a* using online Q, evaluate on target dist
-        # -----------------------------
-        # Grad / AMP
-        # -----------------------------
+        tau: float = 0.0,
+        double_dqn: bool = True,
+        # ------------------------------------------------------------------
+        # Gradient / AMP
+        # ------------------------------------------------------------------
         max_grad_norm: float = 0.0,
         use_amp: bool = False,
-        # -----------------------------
-        # PER proxy epsilon
-        # -----------------------------
+        # ------------------------------------------------------------------
+        # PER proxy / numeric stability
+        # ------------------------------------------------------------------
         per_eps: float = 1e-6,
-        # numeric stability for log(p)
         log_eps: float = 1e-6,
-        # -----------------------------
+        # ------------------------------------------------------------------
         # Optimizer / scheduler (QLearningCore)
-        # -----------------------------
+        # ------------------------------------------------------------------
         optim_name: str = "adamw",
         lr: float = 3e-4,
         weight_decay: float = 0.0,
         sched_name: str = "none",
-        # sched shared knobs
+        # scheduler shared knobs
         total_steps: int = 0,
         warmup_steps: int = 0,
         min_lr_ratio: float = 0.0,
@@ -89,6 +124,43 @@ class RainbowCore(QLearningCore):
         sched_gamma: float = 0.99,
         milestones: Sequence[int] = (),
     ) -> None:
+        """
+        Parameters
+        ----------
+        head : Any
+            Head object satisfying the contract described in the class docstring.
+        gamma : float, default=0.99
+            Discount factor in ``[0, 1)``.
+        n_step : int, default=1
+            N-step return horizon. If ``n_step > 1`` and the replay batch provides
+            n-step fields, the core will use them. The discount used in the backup
+            is ``gamma**n_step``.
+        target_update_interval : int, default=1000
+            Target update period measured in **core update calls**:
+            - ``0``: never update target network
+            - ``1``: update every update call
+        tau : float, default=0.0
+            Polyak coefficient for soft updates performed at ``target_update_interval``.
+            Convention:
+            - ``tau <= 0``: treat as hard update (copy parameters)
+            - ``tau > 0`` : soft update
+        double_dqn : bool, default=True
+            If True, select next greedy action using *online* expected Q-values and
+            evaluate the distribution using the *target* network (Double DQN).
+        max_grad_norm : float, default=0.0
+            Global gradient norm clipping threshold. ``0`` disables clipping.
+        use_amp : bool, default=False
+            Enable mixed precision (AMP) on CUDA (uses QLearningCore scaler).
+        per_eps : float, default=1e-6
+            Small epsilon used when exporting PER priority proxy to avoid zeros.
+        log_eps : float, default=1e-6
+            Clamp floor for probabilities before ``log`` to prevent ``-inf``.
+
+        Raises
+        ------
+        ValueError
+            If any hyperparameter is out of its valid range.
+        """
         super().__init__(
             head=head,
             use_amp=use_amp,
@@ -119,11 +191,11 @@ class RainbowCore(QLearningCore):
         # Hyperparameter validation
         # ------------------------------------------------------------------
         if self.n_step <= 0:
-            raise ValueError(f"n_step must be >= 1, got: {self.n_step}")
+            raise ValueError(f"n_step must be >= 1, got {self.n_step}")
         if not (0.0 <= self.gamma < 1.0):
             raise ValueError(f"gamma must be in [0,1), got {self.gamma}")
         if self.target_update_interval < 0:
-            raise ValueError(f"target_update_interval must be >= 0, got: {self.target_update_interval}")
+            raise ValueError(f"target_update_interval must be >= 0, got {self.target_update_interval}")
         if not (0.0 <= self.tau <= 1.0):
             raise ValueError(f"tau must be in [0,1], got {self.tau}")
         if self.max_grad_norm < 0.0:
@@ -133,9 +205,11 @@ class RainbowCore(QLearningCore):
         if self.log_eps <= 0.0:
             raise ValueError(f"log_eps must be > 0, got {self.log_eps}")
 
-        # Freeze target net once at init (core "owns" this responsibility).
+        # Freeze target net once at init (core owns this invariant).
         q_target = getattr(self.head, "q_target", None)
         if q_target is not None:
+            # QLearningCore (or its base) is expected to provide a freezing helper.
+            # If your actual base method name differs, rename accordingly.
             self._freeze_target(q_target)
 
     # =============================================================================
@@ -143,16 +217,32 @@ class RainbowCore(QLearningCore):
     # =============================================================================
     def _get_nstep_fields(self, batch: Any) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
-        Prefer n-step fields when they are present AND not None.
-        Fallback to 1-step fields otherwise.
+        Select reward/done/next_obs tensors for 1-step or n-step backups.
+
+        This helper prefers n-step fields when:
+        - ``self.n_step > 1``, and
+        - all of the following batch attributes exist and are not None:
+            * ``batch.n_step_returns``
+            * ``batch.n_step_dones``
+            * ``batch.n_step_next_observations``
+
+        Otherwise it falls back to standard 1-step fields:
+        - ``batch.rewards``, ``batch.dones``, ``batch.next_observations``
+
+        Parameters
+        ----------
+        batch : Any
+            Replay batch object that exposes the required attributes.
 
         Returns
         -------
         rewards : torch.Tensor
-        dones   : torch.Tensor
-        next_obs: torch.Tensor
+            Reward tensor, shape ``(B,)`` or ``(B,1)`` (caller normalizes).
+        dones : torch.Tensor
+            Done tensor, shape ``(B,)`` or ``(B,1)`` (caller normalizes).
+        next_obs : torch.Tensor
+            Next observation tensor, shape ``(B, obs_dim)``.
         """
-        # If n_step == 1, don't even try n-step fields.
         if int(self.n_step) <= 1:
             return (
                 batch.rewards.to(self.device),
@@ -164,16 +254,9 @@ class RainbowCore(QLearningCore):
         d = getattr(batch, "n_step_dones", None)
         ns = getattr(batch, "n_step_next_observations", None)
 
-        # Use n-step only if all three are not None.
         if (r is not None) and (d is not None) and (ns is not None):
-            # Defensive: ensure they are tensors or tensor-like
-            return (
-                r.to(self.device),
-                d.to(self.device),
-                ns.to(self.device),
-            )
+            return (r.to(self.device), d.to(self.device), ns.to(self.device))
 
-        # Fallback to 1-step fields
         return (
             batch.rewards.to(self.device),
             batch.dones.to(self.device),
@@ -182,11 +265,13 @@ class RainbowCore(QLearningCore):
 
     def _gamma_n(self) -> float:
         """
-        Compute gamma^n for the Bellman backup.
+        Compute ``gamma**n`` for the Bellman backup.
 
-        Important:
-        - If the replay buffer already computed n-step returns for `n_step`,
-          the discount exponent must match that same n.
+        Returns
+        -------
+        float
+            Discount exponent used for the backup. If ``n_step`` is invalid
+            (should not happen due to validation), it defaults to exponent 1.
         """
         return float(self.gamma) ** max(1, int(self.n_step))
 
@@ -195,68 +280,73 @@ class RainbowCore(QLearningCore):
     # =============================================================================
     def update_from_batch(self, batch: Any) -> Dict[str, Any]:
         """
-        Perform one Rainbow(C51) update from a replay batch.
+        Perform one Rainbow (C51) update from a replay batch.
+
+        Parameters
+        ----------
+        batch : Any
+            Replay batch providing at least:
+            - ``observations``: (B, obs_dim)
+            - ``actions``: (B,) or (B,1) integer action indices
+            - ``rewards``: (B,) or (B,1)
+            - ``next_observations``: (B, obs_dim)
+            - ``dones``: (B,) or (B,1)
+
+            Optionally, when ``n_step > 1``:
+            - ``n_step_returns``, ``n_step_dones``, ``n_step_next_observations``
+
+            Optionally for PER:
+            - weight fields consumed by :func:`_get_per_weights`.
 
         Returns
         -------
         metrics : Dict[str, Any]
-            Scalar logs plus PER feedback vector "per/td_errors" of shape (B,).
+            Scalar logs plus PER priority proxy:
+            - ``"per/td_errors"``: numpy array of shape (B,), where each element is
+              the per-sample cross-entropy magnitude (clipped by ``per_eps``).
         """
-        # Bump update counter and AMP bookkeeping (QLearningCore utility).
         self._bump()
 
         # ------------------------------------------------------------------
-        # Move batch to device.
+        # Move batch to device
         # ------------------------------------------------------------------
-        obs = batch.observations.to(self.device)       # (B, obs_dim)
-        act = batch.actions.to(self.device).long()     # (B,) discrete action indices
+        obs = batch.observations.to(self.device)          # (B, obs_dim)
+        act = batch.actions.to(self.device).long()        # (B,) or (B,1)
 
-        # Potentially use n-step targets if replay provides them.
         rew, done, nxt = self._get_nstep_fields(batch)
-        rew = to_column(rew)                           # (B,1)
-        done = to_column(done)                         # (B,1)
+        rew = _to_column(rew)                             # (B,1)
+        done = _to_column(done)                           # (B,1)
 
         B = int(obs.shape[0])
-        w = get_per_weights(batch, B, device=self.device)  # (B,1) or None
+        w = _get_per_weights(batch, B, device=self.device)  # (B,1) or None
 
         # ------------------------------------------------------------------
-        # Current distribution for taken action.
-        #
-        # head.q.dist(obs): (B, A, K)
-        # gather along action dim -> (B, 1, K)
-        # squeeze -> (B, K)
+        # Current distribution for taken action: p_theta(z | s, a)
         # ------------------------------------------------------------------
-        dist_all = self.head.q.dist(obs)               # (B, A, K)
+        dist_all = self.head.q.dist(obs)                  # (B, A, K)
         if dist_all.dim() != 3:
             raise ValueError(f"head.q.dist(obs) must be (B,A,K), got {tuple(dist_all.shape)}")
 
         K = int(dist_all.shape[-1])
-        dist_a = dist_all.gather(
-            1, act.view(-1, 1, 1).expand(-1, 1, K)
-        ).squeeze(1)                                   # (B, K)
+
+        # gather along action dimension -> (B,1,K) -> (B,K)
+        dist_a = dist_all.gather(1, act.view(-1, 1, 1).expand(-1, 1, K)).squeeze(1)  # (B, K)
 
         # ------------------------------------------------------------------
-        # Target distribution (no grad): select a* then apply C51 projection.
-        #
-        # a* selection:
-        #   - Double DQN: argmax_a Q_online(s', a)
-        #   - Otherwise:  argmax_a Q_target(s', a)
-        #
-        # Then obtain next_dist = p_target(z | s', a*) and project:
-        #   Tz p(z|s',a*) onto fixed support [v_min, v_max] with K atoms.
+        # Build projected target distribution (no grad)
         # ------------------------------------------------------------------
         with th.no_grad():
             if self.double_dqn:
-                # Common Rainbow behavior: resample online noise before evaluating greedy action.
+                # Optional Rainbow convention: resample online NoisyNet noise before greedy selection.
                 if hasattr(self.head.q, "reset_noise"):
                     self.head.q.reset_noise()
-                q_next_online = self.head.q_values(nxt)        # (B, A) expected Q
-                a_star = th.argmax(q_next_online, dim=-1)  # (B,)
+                q_next_online = self.head.q_values(nxt)      # (B, A)
+                a_star = th.argmax(q_next_online, dim=-1)    # (B,)
             else:
-                q_next_t = self.head.q_values_target(nxt)      # (B, A)
-                a_star = th.argmax(q_next_t, dim=-1)    # (B,)
+                q_next_t = self.head.q_values_target(nxt)    # (B, A)
+                a_star = th.argmax(q_next_t, dim=-1)         # (B,)
 
-            next_dist_all = self.head.q_target.dist(nxt)  # (B, A, K)
+            next_dist_all = self.head.q_target.dist(nxt)     # (B, A, K)
             if next_dist_all.dim() != 3:
                 raise ValueError(
                     f"head.q_target.dist(nxt) must be (B,A,K), got {tuple(next_dist_all.shape)}"
@@ -268,32 +358,28 @@ class RainbowCore(QLearningCore):
 
             next_dist = next_dist_all.gather(
                 1, a_star.view(-1, 1, 1).expand(-1, 1, K)
-            ).squeeze(1)                                 # (B, K)
+            ).squeeze(1)  # (B, K)
 
-            target_dist = distribution_projection(
-                next_dist=next_dist,                     # (B, K)
-                rewards=rew,                             # (B, 1)
-                dones=done,                              # (B, 1)
-                gamma=self._gamma_n(),                 # scalar gamma^n
-                support=self.head.support,               # (K,)
+            target_dist = _distribution_projection(
+                next_dist=next_dist,                    # (B, K)
+                rewards=rew,                            # (B, 1)
+                dones=done,                             # (B, 1)
+                gamma=self._gamma_n(),                  # scalar gamma^n
+                support=self.head.support,              # (K,)
                 v_min=float(self.head.v_min),
                 v_max=float(self.head.v_max),
-            )                                             # (B, K)
+            )  # (B, K)
 
         # ------------------------------------------------------------------
-        # Cross-entropy loss:
-        #   L_i = - sum_k target_dist[i,k] * log(dist_a[i,k])
-        #
-        # PER weighting:
-        #   If weights w are provided, compute weighted mean over batch.
+        # Cross-entropy loss: -sum_k target[k] * log p[k]
         # ------------------------------------------------------------------
-        logp = th.log(dist_a.clamp(min=self.log_eps))      # (B, K)
-        per_sample = -(target_dist * logp).sum(dim=-1)     # (B,)
+        logp = th.log(dist_a.clamp(min=self.log_eps))        # (B, K)
+        per_sample = -(target_dist * logp).sum(dim=-1)       # (B,)
 
         loss = per_sample.mean() if w is None else (per_sample.view(-1, 1) * w).mean()
 
         # ------------------------------------------------------------------
-        # Optimization step (optionally AMP).
+        # Optimizer step (online network only)
         # ------------------------------------------------------------------
         self.opt.zero_grad(set_to_none=True)
 
@@ -313,7 +399,7 @@ class RainbowCore(QLearningCore):
             self.sched.step()
 
         # ------------------------------------------------------------------
-        # Target update (hard/soft). The helper should re-freeze after update.
+        # Target update (hard/soft)
         # ------------------------------------------------------------------
         self._maybe_update_target(
             target=getattr(self.head, "q_target", None),
@@ -323,26 +409,23 @@ class RainbowCore(QLearningCore):
         )
 
         # ------------------------------------------------------------------
-        # Metrics + PER proxy vector.
-        #
-        # q_taken is expected Q(s,a) for taken action derived from dist_a:
-        #   q = sum_k p_k * support_k
-        #
-        # per/td_errors:
-        #   we use |cross_entropy| as a stable per-sample priority proxy.
+        # Metrics + PER proxy vector
         # ------------------------------------------------------------------
         with th.no_grad():
             support = self.head.support.to(self.device)
             if support.dim() != 1 or int(support.shape[0]) != K:
                 raise ValueError(f"head.support must be (K,), got {tuple(support.shape)} vs K={K}")
 
-            q_taken = (dist_a * support.view(1, -1)).sum(dim=-1)         # (B,)
-            td_abs = per_sample.detach().abs().clamp(min=self.per_eps)   # (B,)
+            # Expected Q(s,a) from categorical distribution.
+            q_taken = (dist_a * support.view(1, -1)).sum(dim=-1)  # (B,)
+
+            # PER priority proxy: cross-entropy magnitude.
+            td_abs = per_sample.detach().abs().clamp(min=self.per_eps)  # (B,)
 
         return {
-            "loss/q": float(to_scalar(loss)),
-            "q/mean": float(to_scalar(q_taken.mean())),
-            "target/mean": float(to_scalar(target_dist.mean())),
+            "loss/q": float(_to_scalar(loss)),
+            "q/mean": float(_to_scalar(q_taken.mean())),
+            "target/mean": float(_to_scalar(target_dist.mean())),
             "lr": float(self.opt.param_groups[0]["lr"]),
             "per/td_errors": td_abs.detach().cpu().numpy(),
         }
@@ -352,11 +435,15 @@ class RainbowCore(QLearningCore):
     # =============================================================================
     def state_dict(self) -> Dict[str, Any]:
         """
-        Serialize core state.
+        Serialize core state (optimizer/scheduler/update counter + hyperparameters).
 
-        QLearningCore already includes:
-          - update_calls
-          - optimizer / scheduler state (under a nested key)
+        Notes
+        -----
+        The base :class:`QLearningCore` state typically includes:
+        - ``update_calls``
+        - optimizer state (and scheduler state if present)
+
+        This method adds Rainbow/C51-specific hyperparameters for reproducibility.
         """
         s = super().state_dict()
         s.update(
@@ -375,10 +462,12 @@ class RainbowCore(QLearningCore):
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
-        Restore core state (optimizer/scheduler/update counter).
+        Restore inherited state (optimizer/scheduler/update counter).
 
-        Note:
-        - Hyperparameters are considered constructor-owned and are NOT overwritten.
+        Notes
+        -----
+        Hyperparameters are constructor-owned by design and are **not** overridden
+        from the checkpoint to avoid silent behavior changes.
         """
         super().load_state_dict(state)
         return

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Sequence, Callable, List
+from typing import Any, Dict, Mapping, Sequence, Callable, List, Optional
 
 import torch as th
 import torch.nn.functional as F
 
-from model_free.common.utils.common_utils import to_scalar, to_column
+from model_free.common.utils.common_utils import _to_scalar, _to_column
 from model_free.common.policies.base_core import BaseCore
 from model_free.common.optimizers.optimizer_builder import build_optimizer
 from model_free.common.optimizers.scheduler_builder import build_scheduler
@@ -13,20 +13,77 @@ from model_free.common.optimizers.scheduler_builder import build_scheduler
 
 class TRPOCore(BaseCore):
     """
-    TRPO Update Engine (config-free)  [continuous-only]
+    Trust Region Policy Optimization (TRPO) update engine.
 
-    Features
-    --------
-    - One update per call (on-policy batch)
-    - Natural gradient via conjugate gradient (CG) using Fisher-vector product (FVP)
-    - KL constraint via backtracking line search
-    - Critic updated with standard regression optimizer/scheduler
+    This core performs a single TRPO update per call using an on-policy batch:
+    - Critic: supervised regression on returns.
+    - Actor: natural-gradient step computed by conjugate gradient (CG) on the
+      Fisher information matrix (approximated via the Hessian of the mean KL),
+      followed by backtracking line search to satisfy a KL trust region.
 
-    Expected head interface
-    -----------------------
-    head.actor: policy network (must implement get_dist(obs))
-    head.critic: value network V(s)
-    head.device: torch.device (or string)
+    Notes
+    -----
+    - This implementation is intended for *continuous* action spaces where the
+      policy distribution provides a differentiable log_prob and KL.
+    - The "old" policy distribution is treated as a fixed reference during the
+      actor update.
+    - The actor step is computed by solving (F + damping I) x = g, where:
+        * F is the Fisher matrix approximation,
+        * damping stabilizes CG and improves conditioning,
+        * g is the policy gradient of the surrogate objective.
+    - The final step is scaled to satisfy: 0.5 * step^T F step <= max_kl.
+
+    Expected `head` interface (duck-typed)
+    --------------------------------------
+    - head.actor: torch.nn.Module
+        Must implement get_dist(obs) -> dist, where dist provides:
+        * dist.log_prob(action) -> Tensor
+        * dist.kl(old_dist) -> Tensor   (analytic KL preferred)
+    - head.critic: torch.nn.Module
+        Must implement forward(obs) -> value prediction V(s)
+    - head.device: torch.device or str
+        Device where computation happens.
+
+    Parameters
+    ----------
+    head:
+        Container that exposes actor/critic and device.
+    max_kl:
+        Maximum allowed mean KL divergence for the TRPO trust region.
+    cg_iters:
+        Number of conjugate gradient iterations for solving the natural gradient system.
+    cg_damping:
+        Damping coefficient added to Fisher-vector product: (F + damping I) v.
+    backtrack_iters:
+        Maximum number of backtracking steps during line search.
+    backtrack_coeff:
+        Multiplicative factor applied to step fraction each backtracking iteration.
+        Must be in (0, 1).
+    accept_ratio:
+        Minimum ratio of actual improvement to expected improvement required to accept
+        a line-search step. Larger values are stricter.
+    critic_optim_name:
+        Name of critic optimizer (via `build_optimizer`).
+    critic_lr:
+        Critic learning rate.
+    critic_weight_decay:
+        Critic weight decay.
+    critic_sched_name:
+        Name of critic scheduler (via `build_scheduler`). Use "none" to disable.
+    total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones:
+        Generic scheduler knobs passed through to `build_scheduler` for parity with other cores.
+    max_grad_norm:
+        Global norm clipping threshold for critic gradients. Set to 0 to disable clipping.
+    use_amp:
+        Enable mixed precision for critic update (actor update uses higher-order grads and
+        is not run under autocast).
+
+    Raises
+    ------
+    ValueError
+        If hyperparameters are invalid (e.g., non-positive max_kl, invalid backtrack_coeff).
+    RuntimeError
+        If the policy distribution does not implement a differentiable KL method.
     """
 
     def __init__(
@@ -46,7 +103,7 @@ class TRPOCore(BaseCore):
         critic_lr: float = 3e-4,
         critic_weight_decay: float = 0.0,
         critic_sched_name: str = "none",
-        # sched shared knobs (optional; keep parity with other cores)
+        # sched shared knobs
         total_steps: int = 0,
         warmup_steps: int = 0,
         min_lr_ratio: float = 0.0,
@@ -60,6 +117,9 @@ class TRPOCore(BaseCore):
     ) -> None:
         super().__init__(head=head, use_amp=use_amp)
 
+        # -------------------------
+        # Hyperparameters
+        # -------------------------
         self.max_kl = float(max_kl)
         self.cg_iters = int(cg_iters)
         self.cg_damping = float(cg_damping)
@@ -82,7 +142,9 @@ class TRPOCore(BaseCore):
         if self.cg_damping < 0.0:
             raise ValueError(f"cg_damping must be >= 0, got {self.cg_damping}")
         if not (0.0 < self.backtrack_coeff < 1.0):
-            raise ValueError(f"backtrack_coeff must be in (0,1), got {self.backtrack_coeff}")
+            raise ValueError(
+                f"backtrack_coeff must be in (0,1), got {self.backtrack_coeff}"
+            )
         if self.backtrack_iters <= 0:
             raise ValueError(f"backtrack_iters must be > 0, got {self.backtrack_iters}")
         if self.accept_ratio < 0.0:
@@ -109,8 +171,18 @@ class TRPOCore(BaseCore):
             milestones=tuple(int(m) for m in milestones),
         )
 
+    # ============================================================
+    # Schedulers
+    # ============================================================
     def _step_scheds(self) -> None:
-        """Step actor/critic schedulers if they exist."""
+        """
+        Step learning-rate schedulers if configured.
+
+        Notes
+        -----
+        - TRPO actor update does not use an optimizer/scheduler; only the critic has one.
+        - This is called by the outer algorithm driver (via BaseCore conventions).
+        """
         if self.critic_sched is not None:
             self.critic_sched.step()
 
@@ -120,14 +192,42 @@ class TRPOCore(BaseCore):
     @staticmethod
     def _flat_params(module: th.nn.Module) -> th.Tensor:
         """
-        Return a single flat vector containing all parameters (in module order).
-        Uses .data for speed; TRPO line search explicitly assigns candidate params.
+        Flatten module parameters into a single 1-D tensor.
+
+        Parameters
+        ----------
+        module:
+            Torch module whose parameters will be concatenated in iteration order.
+
+        Returns
+        -------
+        flat:
+            1-D tensor containing all parameters concatenated.
+
+        Notes
+        -----
+        - Uses `p.data` for speed because TRPO line search explicitly assigns parameter
+          candidates. This bypasses autograd tracking intentionally.
         """
         return th.cat([p.data.view(-1) for p in module.parameters()])
 
     @staticmethod
     def _assign_flat_params(module: th.nn.Module, flat: th.Tensor) -> None:
-        """Assign parameters from a flat vector (must match total parameter count)."""
+        """
+        Assign module parameters from a single 1-D tensor.
+
+        Parameters
+        ----------
+        module:
+            Module to be updated in-place.
+        flat:
+            Flat parameter vector. Total length must match the sum of module parameter sizes.
+
+        Notes
+        -----
+        - Uses `p.data.copy_` to overwrite parameters without building a graph.
+        - This is required for backtracking line search (try candidate steps efficiently).
+        """
         i = 0
         for p in module.parameters():
             n = p.numel()
@@ -137,16 +237,29 @@ class TRPOCore(BaseCore):
     @staticmethod
     def _flat_grad_like_params(
         params: List[th.nn.Parameter],
-        grads: Sequence[th.Tensor | None],
+        grads: Sequence[Optional[th.Tensor]],
     ) -> th.Tensor:
         """
-        Flatten gradients into a single vector, matching the parameter vector length.
+        Flatten gradients into a single vector with parameter-aligned shape.
 
-        Unlike a naive "skip None grads" approach, this fills missing grads with zeros,
-        ensuring shape consistency with the flat parameter vector. This is critical for
-        TRPO/CG where vector lengths must match exactly.
+        Parameters
+        ----------
+        params:
+            Parameter list defining the target flattening layout.
+        grads:
+            Gradients returned by `torch.autograd.grad`. Some entries may be None.
+
+        Returns
+        -------
+        flat_grad:
+            1-D tensor of the same length as the flattened parameter vector.
+
+        Notes
+        -----
+        - None gradients are replaced with zeros to preserve vector length.
+          This is critical for TRPO/CG where vector dimensions must match exactly.
         """
-        out = []
+        out: List[th.Tensor] = []
         for p, g in zip(params, grads):
             if g is None:
                 out.append(th.zeros_like(p).contiguous().view(-1))
@@ -159,14 +272,32 @@ class TRPOCore(BaseCore):
     # ============================================================
     def _mean_kl(self, obs: th.Tensor, old_dist: Any) -> th.Tensor:
         """
-        Compute mean KL(new || old) over the batch.
+        Compute the mean KL divergence KL(new || old) over a batch.
 
-        Requires `new_dist.kl(old_dist)` to exist and be differentiable w.r.t.
-        the new policy parameters (actor parameters).
+        Parameters
+        ----------
+        obs:
+            Observation batch, shape (B, obs_dim).
+        old_dist:
+            Distribution produced by the behavior policy (treated as constant reference).
+
+        Returns
+        -------
+        mean_kl:
+            Scalar tensor: mean KL over the batch.
+
+        Raises
+        ------
+        RuntimeError
+            If the distribution does not implement `kl(old_dist)`.
+
+        Notes
+        -----
+        - KL must be differentiable w.r.t. *new* policy parameters (actor params).
+        - This value defines the trust region constraint used in line search.
         """
         new_dist = self.head.actor.get_dist(obs)
 
-        # Prefer analytic KL if available (your dist implementation must provide it)
         if hasattr(new_dist, "kl") and callable(getattr(new_dist, "kl")):
             return new_dist.kl(old_dist).mean()
 
@@ -174,12 +305,30 @@ class TRPOCore(BaseCore):
 
     def _fvp(self, obs: th.Tensor, old_dist: Any, v: th.Tensor) -> th.Tensor:
         """
-        Fisher-vector product: (F + damping*I) v, approximated by Hessian of KL.
+        Compute Fisher-vector product (F + damping I) v.
 
-        IMPORTANT: Do NOT wrap in no_grad; this needs second-order gradients.
+        Parameters
+        ----------
+        obs:
+            Observation batch.
+        old_dist:
+            Frozen old policy distribution (reference for KL).
+        v:
+            Vector to multiply, shape (P,) where P is number of actor parameters.
+
+        Returns
+        -------
+        fvp:
+            Vector (P,) representing (F + damping I) v.
+
+        Notes
+        -----
+        - Fisher is approximated via the Hessian of mean KL(new || old) w.r.t.
+          actor parameters.
+        - Requires second-order gradients; do NOT wrap this function in no_grad.
+        - Damping improves conditioning and stabilizes CG.
         """
         kl = self._mean_kl(obs, old_dist)
-
         params = list(self.head.actor.parameters())
 
         grads = th.autograd.grad(
@@ -203,12 +352,27 @@ class TRPOCore(BaseCore):
         iters: int,
     ) -> th.Tensor:
         """
-        Solve A x = b for x using conjugate gradient, where Avp computes A v.
+        Solve A x = b using conjugate gradient (CG), given a matrix-vector product.
+
+        Parameters
+        ----------
+        Avp:
+            Callable computing A @ v (matrix-vector product).
+        b:
+            Right-hand side vector.
+        iters:
+            Maximum number of CG iterations.
+
+        Returns
+        -------
+        x:
+            Approximate solution to A x = b.
 
         Notes
         -----
-        - A is assumed symmetric positive definite (approximately true for Fisher).
-        - Stops early if residual becomes sufficiently small.
+        - A is assumed symmetric positive definite (SPD). The Fisher approximation
+          is typically near-SPD in practice (with damping).
+        - Stops early if the residual norm becomes sufficiently small.
         """
         x = th.zeros_like(b)
         r = b.clone()
@@ -221,9 +385,11 @@ class TRPOCore(BaseCore):
             alpha = rdotr / denom
             x = x + alpha * p
             r = r - alpha * Avp_p
+
             new_rdotr = th.dot(r, r)
             if new_rdotr < 1e-10:
                 break
+
             beta = new_rdotr / (rdotr + 1e-8)
             p = r + beta * p
             rdotr = new_rdotr
@@ -235,24 +401,45 @@ class TRPOCore(BaseCore):
     # ============================================================
     def update_from_batch(self, batch: Any) -> Dict[str, float]:
         """
-        Perform one TRPO-style update from an on-policy batch.
+        Perform one TRPO update using an on-policy batch.
 
-        Batch requirements (typical)
-        ----------------------------
-        batch.observations : (B, obs_dim)
-        batch.actions      : (B, act_dim)  (or (act_dim,) for B=1)
-        batch.returns      : (B,) or (B,1)
-        batch.advantages   : (B,) or (B,1)
-        batch.log_probs    : (B,) or (B,1)  old log-prob under behavior policy
+        Parameters
+        ----------
+        batch:
+            Batch container providing (at minimum):
+            - observations: Tensor, shape (B, obs_dim)
+            - actions: Tensor, shape (B, act_dim) or (act_dim,)
+            - returns: Tensor, shape (B,) or (B,1)
+            - advantages: Tensor, shape (B,) or (B,1)
+            - log_probs: Tensor, shape (B,) or (B,1), behavior-policy log-prob of actions
+
+        Returns
+        -------
+        metrics:
+            Dict of scalars for logging (loss/value, KL, line-search step fraction, lr, etc.).
+
+        Notes
+        -----
+        Update structure:
+        1) Critic: minimize 0.5 * MSE(V(s), returns)
+        2) Actor:
+           - Define surrogate objective: E[ exp(logp_new - logp_old) * adv ]
+           - Compute gradient g = ∇ surrogate
+           - Solve (F + damping I) step_dir = g via CG
+           - Scale step to satisfy the KL constraint
+           - Backtracking line search to ensure:
+               * improvement > 0
+               * mean KL <= max_kl
+               * actual/expected improvement ratio >= accept_ratio
         """
         self._bump()
 
         obs = batch.observations.to(self.device)
         act = batch.actions.to(self.device)
 
-        ret = to_column(batch.returns.to(self.device))
-        adv = to_column(batch.advantages.to(self.device))
-        old_logp = to_column(batch.log_probs.to(self.device))
+        ret = _to_column(batch.returns.to(self.device))
+        adv = _to_column(batch.advantages.to(self.device))
+        old_logp = _to_column(batch.log_probs.to(self.device))
 
         # ------------------------------------------------------------
         # Critic update (regression on returns)
@@ -261,7 +448,7 @@ class TRPOCore(BaseCore):
 
         if self.use_amp:
             with th.cuda.amp.autocast(enabled=True):
-                v = to_column(self.head.critic(obs))
+                v = _to_column(self.head.critic(obs))
                 value_loss = 0.5 * F.mse_loss(v, ret)
 
             self.scaler.scale(value_loss).backward()
@@ -273,7 +460,7 @@ class TRPOCore(BaseCore):
             self.scaler.step(self.critic_opt)
             self.scaler.update()
         else:
-            v = to_column(self.head.critic(obs))
+            v = _to_column(self.head.critic(obs))
             value_loss = 0.5 * F.mse_loss(v, ret)
 
             value_loss.backward()
@@ -287,50 +474,64 @@ class TRPOCore(BaseCore):
         # ------------------------------------------------------------
         # Policy update (TRPO)
         # ------------------------------------------------------------
-        # Freeze the "old" distribution as a fixed reference.
+        # Freeze the old distribution (behavior policy) as reference.
         with th.no_grad():
             old_dist = self.head.actor.get_dist(obs)
 
-        def surrogate(with_grad: bool) -> th.Tensor:
+        def surrogate(*, with_grad: bool) -> th.Tensor:
             """
-            Standard importance-weighted surrogate objective:
-                E[ exp(logp - old_logp) * adv ]
+            Compute the TRPO surrogate objective.
+
+            Parameters
+            ----------
+            with_grad:
+                If True, build a computation graph w.r.t. actor parameters.
+
+            Returns
+            -------
+            surr:
+                Scalar tensor equal to mean(ratio * advantages) where
+                ratio = exp(logp_new - logp_old).
+
+            Notes
+            -----
+            - Uses importance sampling to compare new policy to behavior policy.
+            - We maximize this surrogate; the CG system uses g = ∇ surrogate.
             """
             if with_grad:
                 dist = self.head.actor.get_dist(obs)
-                logp = to_column(dist.log_prob(act))
+                logp = _to_column(dist.log_prob(act))
                 ratio = th.exp(logp - old_logp)
                 return (ratio * adv).mean()
 
             with th.no_grad():
                 dist = self.head.actor.get_dist(obs)
-                logp = to_column(dist.log_prob(act))
+                logp = _to_column(dist.log_prob(act))
                 ratio = th.exp(logp - old_logp)
                 return (ratio * adv).mean()
 
-        # We maximize surrogate, but autograd is a minimizer mindset.
-        # Use surr gradient (NOT -surr) as b in CG.
-        surr = surrogate(with_grad=True)  # graph needed for policy gradient
+        # Compute policy gradient of surrogate objective.
+        surr = surrogate(with_grad=True)
         params = list(self.head.actor.parameters())
 
         grads_surr = th.autograd.grad(surr, params, retain_graph=False)
-        g = self._flat_grad_like_params(params, grads_surr).detach()  # b = ∇surr
+        g = self._flat_grad_like_params(params, grads_surr).detach()
 
-        # Solve (F + damping I) x = g
+        # Solve (F + damping I) x = g via conjugate gradient.
         step_dir = self._conjugate_gradient(
             lambda v_: self._fvp(obs, old_dist, v_),
             g,
             self.cg_iters,
         )
 
-        # Scale step so that 0.5 * step^T F step <= max_kl
+        # Scale step so that 0.5 * step^T F step <= max_kl.
         shs = 0.5 * (step_dir * self._fvp(obs, old_dist, step_dir)).sum()
-        step_size = th.sqrt(self.max_kl / (shs + 1e-12))
-        full_step = step_size * step_dir
+        step_scale = th.sqrt(self.max_kl / (shs + 1e-12))
+        full_step = step_scale * step_dir
 
         old_params = self._flat_params(self.head.actor).clone()
 
-        # Expected improvement under linear model: g^T step
+        # Expected improvement under first-order approximation: g^T step
         expected_improve = float((g * full_step).sum().item())
 
         surr_old = float(surr.detach().cpu().item())
@@ -338,7 +539,9 @@ class TRPOCore(BaseCore):
         step_frac = 1.0
         best_kl = 0.0
 
-        # Backtracking line search to satisfy KL constraint and sufficient improvement
+        # Backtracking line search:
+        # Accept if we improve, satisfy KL, and the improvement is not too small
+        # relative to linearized expectation.
         for _ in range(self.backtrack_iters):
             step = step_frac * full_step
             self._assign_flat_params(self.head.actor, old_params + step)
@@ -358,13 +561,13 @@ class TRPOCore(BaseCore):
             step_frac *= self.backtrack_coeff
 
         if not accepted:
-            # Revert parameters if no acceptable step was found
+            # Revert parameters if no acceptable step was found.
             self._assign_flat_params(self.head.actor, old_params)
             step_frac = 0.0
             best_kl = 0.0
 
         return {
-            "loss/value": float(to_scalar(value_loss)),
+            "loss/value": float(_to_scalar(value_loss)),
             "stats/surr": float(surr_old),
             "stats/kl": float(best_kl),
             "stats/step_frac": float(step_frac),
@@ -378,16 +581,21 @@ class TRPOCore(BaseCore):
         """
         Serialize core state.
 
+        Returns
+        -------
+        state:
+            Serializable state dictionary.
+
         Notes
         -----
-        - `super().state_dict()` is assumed to include generic BaseCore fields.
-        - Critic optimizer/scheduler state is stored using BaseCore helpers.
+        - `super().state_dict()` is assumed to include BaseCore generic fields.
+        - Critic optimizer/scheduler state is stored under "critic".
+        - TRPO hyperparameters are stored at the root for backward compatibility.
         """
         s = super().state_dict()
         s.update(
             {
                 "critic": self._save_opt_sched(self.critic_opt, self.critic_sched),
-                # Store TRPO hyperparameters at the root level (keep backward compatibility)
                 "max_kl": float(self.max_kl),
                 "cg_iters": int(self.cg_iters),
                 "cg_damping": float(self.cg_damping),
@@ -401,20 +609,24 @@ class TRPOCore(BaseCore):
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
-        Restore core state.
+        Restore core state from a serialized dictionary.
 
-        Fix
-        ---
-        The previous implementation read TRPO config from `state["trpo"]`,
-        but `state_dict()` stores keys at the root. This version restores
-        from the root keys to match the saved format.
+        Parameters
+        ----------
+        state:
+            State dictionary produced by `state_dict()`.
+
+        Notes
+        -----
+        - Restores critic optimizer/scheduler if present.
+        - Restores TRPO hyperparameters from root keys (matching `state_dict()`).
+        - Ignores missing keys to allow forward/backward compatibility across versions.
         """
         super().load_state_dict(state)
 
         if "critic" in state:
             self._load_opt_sched(self.critic_opt, self.critic_sched, state["critic"])
 
-        # Restore TRPO hyperparameters from root keys (matches state_dict()).
         if "max_kl" in state:
             self.max_kl = float(state["max_kl"])
         if "cg_iters" in state:

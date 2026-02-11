@@ -7,35 +7,52 @@ import torch.nn as nn
 
 from model_free.common.networks.policy_networks import ContinuousPolicyNetwork
 from model_free.common.networks.value_networks import QuantileStateActionValueNetwork
-from model_free.common.utils.ray_utils import PolicyFactorySpec, make_entrypoint, resolve_activation_fn
 from model_free.common.policies.base_head import OffPolicyContinuousActorCriticHead
-
+from model_free.common.utils.ray_utils import (
+    PolicyFactorySpec,
+    _make_entrypoint,
+    _resolve_activation_fn,
+)
 
 # =============================================================================
-# Ray worker factory (MUST be module-level for your entrypoint resolver)
+# Ray worker factory (must be module-level for entrypoint resolution)
 # =============================================================================
 def build_tqc_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build TQCHead on CPU.
+   Build a :class:`TQCHead` instance for Ray rollout workers (CPU-only).
 
-    Why this exists
-    ---------------
-    In Ray multi-worker rollouts, you generally want:
-      - worker-side policies forced onto CPU (GPU reserved for learner)
-      - JSON-safe kwargs (activation_fn stored as string) re-resolved on worker
+    Ray integration requires policies to be reconstructible from an
+    ``(entrypoint, kwargs)`` specification, where:
 
-    Notes
-    -----
-    - device is overridden to "cpu" for worker stability and lower GPU contention
-    - activation_fn is resolved from a string/name into a torch.nn module class
-      (because kwargs are serialized through JSON / Ray plasma)
+    - ``entrypoint`` is an importable module-level function (pickle/CloudPickle safe).
+    - ``kwargs`` are JSON-serializable primitives (no classes, no devices, no tensors).
+
+    This function enforces rollout-worker conventions:
+
+    - **CPU forcing**: sets ``device="cpu"`` regardless of incoming configuration.
+      This prevents accidental CUDA context creation and GPU contention in workers.
+    - **Activation resolution**: converts ``activation_fn`` from a serialized
+      representation (typically a string) into a ``torch.nn`` activation class.
+    - **Eval-like mode**: calls ``head.set_training(False)`` so rollout behavior is
+      deterministic with respect to dropout/batchnorm (if any) and target nets remain eval.
+
+    Parameters
+    ----------
+    **kwargs : Any
+        JSON-safe keyword arguments that match :class:`TQCHead` constructor inputs.
+        In practice, these come from :meth:`TQCHead.get_ray_policy_factory_spec`.
+
+    Returns
+    -------
+    torch.nn.Module
+        A CPU-resident :class:`TQCHead` instance ready for inference/rollout.
     """
-    kwargs = dict(kwargs)
-    kwargs["device"] = "cpu"
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    cfg = dict(kwargs)
+    cfg["device"] = "cpu"
+    cfg["activation_fn"] = _resolve_activation_fn(cfg.get("activation_fn", None))
 
-    head = TQCHead(**kwargs).to("cpu")
-    head.set_training(False)  # ensure eval-mode behavior on workers
+    head = TQCHead(**cfg).to("cpu")
+    head.set_training(False)
     return head
 
 
@@ -44,25 +61,46 @@ def build_tqc_head_worker_policy(**kwargs: Any) -> nn.Module:
 # =============================================================================
 class TQCHead(OffPolicyContinuousActorCriticHead):
     """
-    TQC Head (Actor + Quantile Critic Ensemble + Target Critic Ensemble)
+    Truncated Quantile Critics (TQC) head: actor + distributional critic ensemble + targets.
 
-    What it contains
-    ----------------
-    - actor: squashed Gaussian policy (SAC-style)
-    - critic: quantile critic ensemble producing Z(s,a) (distributional Q)
-    - critic_target: target copy of critic (Polyak / hard update)
+    This "head" owns the neural networks and inference utilities required by TQC:
 
-    Contract (for OffPolicyAlgorithm)
-    --------------------------------
-    - device
-    - set_training(training)
-    - act(obs, deterministic=False)
-    - sample_action_and_logp(obs) -> (action, logp)
-    - quantiles(obs, action) -> (B, C, N)
-    - quantiles_target(obs, action) -> (B, C, N)
-    - hard_update_target() / soft_update_target(tau) (inherited helpers)
-    - save(path), load(path)
-    - get_ray_policy_factory_spec()
+    - **Actor**: a squashed Gaussian policy (SAC-style) producing actions and log-probs.
+    - **Critic**: a *quantile* critic ensemble outputting a distribution over returns,
+      represented as quantiles.
+    - **Target critic**: a lagged copy of the critic used to build stable TD targets.
+
+    The head is *network-centric* (construction + inference). Optimization and update
+    logic (losses, truncation, temperature, Polyak updates) belongs in the *core*.
+
+    Contract (expected by OffPolicyAlgorithm / core)
+    -----------------------------------------------
+    Required attributes/methods used downstream:
+
+    - ``device`` : torch.device
+    - ``set_training(training: bool)`` : toggle train/eval for online nets
+    - ``act(obs, deterministic=False)`` : action selection (provided by base head)
+    - ``sample_action_and_logp(obs)`` : stochastic sampling + log-prob (base head)
+    - ``quantiles(obs, action) -> Tensor`` : quantiles from online critic
+    - ``quantiles_target(obs, action) -> Tensor`` : quantiles from target critic
+    - Target helpers: ``hard_update(...)``, ``soft_update(...)``, ``freeze_target(...)``
+    - Persistence: ``save(path)``, ``load(path)``
+    - Ray: ``get_ray_policy_factory_spec()``
+
+    Shapes
+    ------
+    Let:
+      - ``B`` be batch size
+      - ``C`` be number of critic ensemble members (``n_nets``)
+      - ``N`` be number of quantiles per critic (``n_quantiles``)
+
+    Then quantile tensors have shape ``(B, C, N)``.
+
+    Notes
+    -----
+    - This head does *not* implement truncation logic itself; truncation is typically
+      applied in the core when computing targets/critic losses (TQC key idea).
+    - Target critic parameters are frozen to avoid optimizer updates and accidental grads.
     """
 
     def __init__(
@@ -76,10 +114,10 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
         gain: float = 1.0,
         bias: float = 0.0,
         device: Union[str, th.device] = "cuda" if th.cuda.is_available() else "cpu",
-        # actor distribution params (SAC-like)
+        # Actor distribution configuration (SAC-like)
         log_std_mode: str = "layer",
         log_std_init: float = -0.5,
-        # quantile critic params
+        # Distributional critic configuration
         n_quantiles: int = 25,
         n_nets: int = 2,
     ) -> None:
@@ -87,35 +125,43 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
         Parameters
         ----------
         obs_dim : int
-            Observation dimension.
+            Observation vector dimension.
         action_dim : int
-            Action dimension.
-        hidden_sizes : Sequence[int]
-            Shared MLP hidden layer sizes for both actor and critic networks.
-        activation_fn : Any
-            Activation class (e.g., nn.ReLU). If serialized for Ray, store name and
-            re-resolve via resolve_activation_fn on the worker.
-        init_type : str
-            Weight initialization strategy used by your network builders.
-        gain : float
-            Gain parameter forwarded to init logic (commonly orthogonal gain).
-        bias : float
-            Bias initialization value forwarded to init logic.
-        device : str or torch.device
-            Target device for learner-side head (workers override to CPU).
-        log_std_mode : str
-            Actor log-std parameterization mode (e.g., "layer", "state_dependent", ...),
-            depends on your ContinuousPolicyNetwork implementation.
-        log_std_init : float
-            Initial log standard deviation for the Gaussian policy.
-        n_quantiles : int
-            Number of quantiles per critic head (N).
-        n_nets : int
-            Number of critic ensemble members (C).
+            Action vector dimension (continuous control).
+        hidden_sizes : Sequence[int], default=(256, 256)
+            MLP hidden layer widths used by both actor and critic networks.
+        activation_fn : Any, default=torch.nn.ReLU
+            Activation *class* used in MLP blocks (e.g., ``nn.ReLU``).
+            For Ray, this is exported as a string and resolved back on workers.
+        init_type : str, default="orthogonal"
+            Initialization scheme name forwarded to network constructors.
+        gain : float, default=1.0
+            Gain forwarded to the initialization logic (commonly orthogonal gain).
+        bias : float, default=0.0
+            Bias initialization constant forwarded to network constructors.
+        device : Union[str, torch.device], default="cuda" if available else "cpu"
+            Device for learner-side networks. Ray workers override this to CPU.
+        log_std_mode : str, default="layer"
+            Policy log-std parameterization mode (depends on your actor implementation).
+            Common options are "layer" (predict log-std from a layer) or "parameter"
+            (global learnable log-std).
+        log_std_init : float, default=-0.5
+            Initial value for log standard deviation.
+        n_quantiles : int, default=25
+            Number of quantiles per critic head (``N``). Must be positive.
+        n_nets : int, default=2
+            Number of critic ensemble members (``C``). Must be positive.
+
+        Raises
+        ------
+        ValueError
+            If ``n_quantiles <= 0`` or ``n_nets <= 0``.
         """
         super().__init__(device=device)
 
-        # ---- basic shapes / config ----
+        # -----------------------------
+        # Core configuration
+        # -----------------------------
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.hidden_sizes = tuple(int(x) for x in hidden_sizes)
@@ -125,11 +171,11 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
         self.gain = float(gain)
         self.bias = float(bias)
 
-        # ---- actor distribution hyperparams ----
+        # Actor distribution hyperparameters
         self.log_std_mode = str(log_std_mode)
         self.log_std_init = float(log_std_init)
 
-        # ---- distributional critic hyperparams ----
+        # Quantile critic hyperparameters
         self.n_quantiles = int(n_quantiles)
         self.n_nets = int(n_nets)
 
@@ -139,17 +185,14 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
             raise ValueError(f"n_nets must be positive, got {self.n_nets}")
 
         # ---------------------------------------------------------------------
-        # Actor: Squashed Gaussian policy (SAC-style)
-        #
-        # - outputs distribution parameters (mean + log_std)
-        # - sampling uses rsample + tanh bijector correction (usually implemented in base head)
+        # Actor: squashed Gaussian policy (SAC-style)
         # ---------------------------------------------------------------------
         self.actor = ContinuousPolicyNetwork(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
             hidden_sizes=list(self.hidden_sizes),
             activation_fn=self.activation_fn,
-            squash=True,  # tanh-squash to keep actions in [-1, 1] before any rescale
+            squash=True,
             log_std_mode=self.log_std_mode,
             log_std_init=self.log_std_init,
             init_type=self.init_type,
@@ -158,12 +201,7 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
         ).to(self.device)
 
         # ---------------------------------------------------------------------
-        # Critic: Quantile ensemble
-        #
-        # Returns: Z(s,a) with shape (B, C, N)
-        #   B = batch size
-        #   C = n_nets (ensemble members)
-        #   N = n_quantiles (atoms)
+        # Critic: quantile ensemble (distributional Q)
         # ---------------------------------------------------------------------
         self.critic = QuantileStateActionValueNetwork(
             state_dim=self.obs_dim,
@@ -178,12 +216,7 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
         ).to(self.device)
 
         # ---------------------------------------------------------------------
-        # Target critic: same architecture, updated from critic by hard/soft update.
-        #
-        # NOTE:
-        # - your existing line: bias=self.gain if False else self.bias
-        #   is a no-op "explicitness" trick. It's harmless but confusing.
-        #   Recommended: just pass bias=self.bias for clarity.
+        # Target critic: lagged copy of the critic (frozen)
         # ---------------------------------------------------------------------
         self.critic_target = QuantileStateActionValueNetwork(
             state_dim=self.obs_dim,
@@ -197,30 +230,32 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
             bias=self.bias,
         ).to(self.device)
 
-        # Initialize target = online critic, then freeze to avoid accidental grads.
+        # Initialize targets from online critic, then freeze to block gradients/optimizer.
         self.hard_update(self.critic_target, self.critic)
         self.freeze_target(self.critic_target)
 
     # =============================================================================
-    # Quantiles (TQC-specific)
+    # Quantile interfaces (TQC-specific)
     # =============================================================================
     def quantiles(self, obs: Any, action: Any) -> th.Tensor:
         """
-        Compute critic quantiles Z(s,a).
+       Compute online critic quantiles :math:`Z(s,a)`.
 
         Parameters
         ----------
         obs : Any
-            Observation(s). Accepts numpy arrays, tensors, or single obs depending
-            on your _to_tensor_batched implementation.
+            Observations convertible by the base helper ``_to_tensor_batched``.
+            Typical inputs include numpy arrays, torch tensors, lists, or single
+            observations. Output will be batched as ``(B, obs_dim)``.
         action : Any
-            Action(s). Same batching rules as obs.
+            Actions convertible by ``_to_tensor_batched``. Output will be batched
+            as ``(B, action_dim)``.
 
         Returns
         -------
-        z : torch.Tensor
-            Quantiles with shape (B, C, N) where:
-              B=batch size, C=n_nets, N=n_quantiles
+        torch.Tensor
+            Quantile tensor with shape ``(B, C, N)`` where:
+            ``C = n_nets`` and ``N = n_quantiles``.
         """
         s = self._to_tensor_batched(obs)
         a = self._to_tensor_batched(action)
@@ -229,12 +264,19 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
     @th.no_grad()
     def quantiles_target(self, obs: Any, action: Any) -> th.Tensor:
         """
-        Compute target critic quantiles Z_t(s,a).
+       Compute target critic quantiles :math:`Z_t(s,a)` (no gradients).
+
+        Parameters
+        ----------
+        obs : Any
+            Observation batch.
+        action : Any
+            Action batch.
 
         Returns
         -------
-        z_t : torch.Tensor
-            Target quantiles with shape (B, C, N).
+        torch.Tensor
+            Target quantile tensor with shape ``(B, C, N)``.
         """
         s = self._to_tensor_batched(obs)
         a = self._to_tensor_batched(action)
@@ -245,11 +287,17 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export constructor kwargs in a JSON-safe form.
+       Export constructor kwargs in a JSON-safe format.
 
-        Why:
-        - Ray/serialization prefers primitive types.
-        - activation_fn is exported as a string and re-resolved on worker.
+        This metadata is used for:
+        - checkpoint reproducibility (store configuration alongside weights)
+        - Ray worker reconstruction (kwargs must be JSON-serializable)
+
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-safe constructor arguments. ``activation_fn`` is exported as a
+            string name, and ``device`` is stringified.
         """
         return {
             "obs_dim": int(self.obs_dim),
@@ -268,16 +316,24 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
 
     def save(self, path: str) -> None:
         """
-        Save head weights and JSON-safe kwargs.
+       Save actor + critic + target critic weights to a single checkpoint file.
 
-        File format
-        -----------
-        torch.save({
-          "kwargs": {...},
-          "actor": actor_state_dict,
-          "critic": critic_state_dict,
-          "critic_target": critic_target_state_dict,
-        }, path + ".pt")
+        Parameters
+        ----------
+        path : str
+            Checkpoint file path prefix. If ``path`` does not end with ``".pt"``,
+            the extension is appended automatically.
+
+        Notes
+        -----
+        The saved payload has the structure::
+
+            {
+              "kwargs": {...json-safe...},
+              "actor": actor_state_dict,
+              "critic": critic_state_dict,
+              "critic_target": critic_target_state_dict,
+            }
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -292,13 +348,24 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
 
     def load(self, path: str) -> None:
         """
-        Load head weights from a checkpoint.
+       Load actor + critic (+ optional target critic) weights from a checkpoint.
 
-        Behavior
-        --------
-        - Loads actor + critic.
-        - Loads critic_target if present; otherwise syncs from critic.
-        - Always re-freezes critic_target afterwards.
+        Parameters
+        ----------
+        path : str
+            Checkpoint file path prefix. If ``path`` does not end with ``".pt"``,
+            the extension is appended automatically.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint does not match the expected format.
+
+        Notes
+        -----
+        - If ``critic_target`` is missing (backward compatibility), the target is
+          rebuilt by hard-copying from the online critic.
+        - Target critic parameters are always re-frozen after loading.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -315,7 +382,6 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
         else:
             self.hard_update(self.critic_target, self.critic)
 
-        # Ensure target is frozen even if checkpoint was created differently.
         self.freeze_target(self.critic_target)
         self.critic_target.eval()
 
@@ -324,12 +390,16 @@ class TQCHead(OffPolicyContinuousActorCriticHead):
     # =============================================================================
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Return a JSON-serializable spec used by Ray workers to reconstruct this head.
+       Build a Ray-serializable factory spec for reconstructing this head on workers.
 
-        - entrypoint: a module-level function (required by your resolver)
-        - kwargs: JSON-safe exported kwargs
+        Returns
+        -------
+        PolicyFactorySpec
+            A spec containing:
+            - ``entrypoint``: importable module-level factory function
+            - ``kwargs``: JSON-safe constructor arguments
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_tqc_head_worker_policy),
+            entrypoint=_make_entrypoint(build_tqc_head_worker_policy),
             kwargs=self._export_kwargs_json_safe(),
         )

@@ -7,85 +7,114 @@ import torch.nn as nn
 
 from model_free.common.networks.policy_networks import ContinuousPolicyNetwork
 from model_free.common.networks.value_networks import StateValueNetwork
+from model_free.common.policies.base_head import OnPolicyContinuousActorCriticHead
 from model_free.common.utils.ray_utils import (
     PolicyFactorySpec,
-    make_entrypoint,
-    resolve_activation_fn,
+    _make_entrypoint,
+    _resolve_activation_fn,
 )
-from model_free.common.policies.base_head import OnPolicyContinuousActorCriticHead
-
 
 # =============================================================================
 # Ray worker factory (MUST be module-level for your entrypoint resolver)
 # =============================================================================
+
+
 def build_acktr_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build ACKTRHead on CPU.
+    Build an :class:`ACKTRHead` inside a Ray rollout worker (CPU-only).
 
-    Why this exists
-    ---------------
-    When using Ray, policy modules are often constructed on remote workers.
-    Ray requires a module-level callable as an "entrypoint" so it can serialize
-    and recreate the object deterministically on each worker process.
+    Ray pattern and rationale
+    -------------------------
+    Ray typically reconstructs policy modules through a pickled "entrypoint"
+    callable plus JSON-serializable kwargs. The most robust pattern is:
 
-    Notes
-    -----
-    - device is forced to "cpu" on the worker for safety/portability.
-      (Workers can still run rollout on CPU even if the learner is on GPU.)
-    - activation_fn is serialized as a string/None, so we resolve it here.
+    - Keep the factory at **module scope** (pickle-friendly).
+    - Pass **JSON-safe kwargs** (strings, numbers, lists, dicts).
+    - Force the resulting module onto **CPU** for rollout workers, so remote
+      inference does not depend on GPUs or CUDA drivers.
+
+    Parameters
+    ----------
+    **kwargs : Any
+        Constructor keyword arguments for :class:`ACKTRHead`. In Ray settings,
+        these kwargs are usually produced by :meth:`ACKTRHead._export_kwargs_json_safe`.
+
+        Notes
+        -----
+        - ``activation_fn`` is stored as a string name (or ``None``) and is resolved
+          here via :func:`_resolve_activation_fn`.
+        - ``device`` is overwritten to ``"cpu"`` unconditionally.
+
+    Returns
+    -------
+    torch.nn.Module
+        An :class:`ACKTRHead` instance on CPU with training disabled via
+        :meth:`set_training(False)`.
+
+    See Also
+    --------
+    ACKTRHead.get_ray_policy_factory_spec
+        Returns the entrypoint+kwargs pair used by Ray for worker reconstruction.
     """
-    kwargs = dict(kwargs)
+    cfg = dict(kwargs)
 
-    # Always build worker-side policy on CPU
-    kwargs["device"] = "cpu"
+    # Always build worker-side policy on CPU for portability.
+    cfg["device"] = "cpu"
 
-    # Resolve activation function from serialized representation (e.g., "relu")
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    # Resolve activation function from serialized representation (e.g., "relu").
+    cfg["activation_fn"] = _resolve_activation_fn(cfg.get("activation_fn", None))
 
-    # Construct the head
-    head = ACKTRHead(**kwargs).to("cpu")
-
-    # Workers usually run inference only (no gradients)
+    head = ACKTRHead(**cfg).to("cpu")
     head.set_training(False)
     return head
 
 
 # =============================================================================
-# ACKTRHead (refactored: BaseHead + OnPolicy actor-critic)
+# ACKTRHead (standard on-policy actor-critic container)
 # =============================================================================
+
+
 class ACKTRHead(OnPolicyContinuousActorCriticHead):
     """
-    ACKTR network container (Actor + Critic) for continuous control.
+    ACKTR network head for **continuous** action spaces (Gaussian actor + V(s) critic).
 
-    Overview
-    --------
-    ACKTR (Actor Critic using Kronecker-Factored Trust Region) uses the same
-    actor/critic *network architecture* as PPO/A2C for continuous actions:
-      - Actor : Gaussian policy π(a|s) (unsquashed)
-      - Critic: State-value function V(s)
+    This module is a *network container* (actor + critic) intended to be used by an
+    ACKTR-style algorithm. Importantly, ACKTR's distinguishing feature (K-FAC /
+    natural-gradient approximation) lives in the **optimizer/core**, not in the
+    network architecture itself.
 
-    Important
-    ---------
-    The "ACKTR-specific" part is NOT the head.
-    The algorithmic difference (K-FAC / natural gradient approximation) belongs
-    to the optimizer/core implementation. Therefore, this head is intentionally
-    a standard on-policy actor-critic container.
+    Architecture
+    ------------
+    Actor
+        Diagonal Gaussian policy :math:`\\pi(a\\mid s)` implemented by
+        :class:`ContinuousPolicyNetwork`.
 
-    Head contract (for OnPolicyAlgorithm)
-    -------------------------------------
-    Inherited from OnPolicyContinuousActorCriticHead:
-      - device: torch.device
-      - set_training(training: bool) -> None
-      - act(obs, deterministic=False) -> torch.Tensor
-      - evaluate_actions(obs, action, as_scalar=False) -> Dict[str, Any]
-      - value_only(obs) -> torch.Tensor
-      - save(path) / load(path)
-      - get_ray_policy_factory_spec() -> PolicyFactorySpec
+        Notes
+        -----
+        - Uses ``squash=False`` to produce an **unsquashed** Gaussian.
+        - Action bounding (tanh/clipping) can be handled by the environment or a wrapper.
 
-    Returned tensors follow your base head conventions:
-      - value    : (B, 1)
-      - log_prob : (B, 1) or per-dim depending on distribution
-      - entropy  : (B, 1) or per-dim depending on distribution
+    Critic
+        State-value baseline :math:`V(s)` implemented by :class:`StateValueNetwork`.
+
+    Inherited interface
+    -------------------
+    The parent class :class:`OnPolicyContinuousActorCriticHead` is expected to provide
+    (or require) the following API:
+
+    - ``set_training(training: bool) -> None``
+    - ``act(obs, deterministic=False) -> torch.Tensor``
+    - ``evaluate_actions(obs, action, as_scalar=False) -> Dict[str, Any]``
+    - ``value_only(obs) -> torch.Tensor`` with shape ``(B, 1)``
+    - persistence hooks (save/load) and Ray factory spec methods
+
+    Notes
+    -----
+    Returned tensors generally follow the base head conventions:
+
+    - value    : ``(B, 1)``
+    - log_prob : ``(B, 1)`` or ``(B, action_dim)`` depending on distribution impl
+    - entropy  : ``(B, 1)`` or ``(B, action_dim)``
     """
 
     def __init__(
@@ -99,7 +128,6 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
         gain: float = 1.0,
         bias: float = 0.0,
         device: Union[str, th.device] = "cpu",
-        # Gaussian log-std parameterization options
         log_std_mode: str = "param",
         log_std_init: float = -0.5,
     ) -> None:
@@ -107,30 +135,39 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
         Parameters
         ----------
         obs_dim : int
-            Observation dimension.
+            Dimension of the flattened observation vector.
         action_dim : int
-            Continuous action dimension.
-        hidden_sizes : Sequence[int]
-            MLP hidden layer sizes for actor/critic.
-        activation_fn : Any
-            Activation function class (e.g., nn.ReLU).
-        init_type : str
-            Weight initialization scheme (library-specific).
-        gain : float
-            Initialization gain (library-specific).
-        bias : float
-            Initialization bias (library-specific).
-        device : Union[str, torch.device]
-            Device for this module ("cpu" or "cuda").
-        log_std_mode : str
-            How to parameterize the Gaussian log standard deviation.
-            Example: "param" means learnable parameter vector.
-        log_std_init : float
-            Initial value for log_std parameters.
+            Dimension of the continuous action vector.
+        hidden_sizes : Sequence[int], default=(64, 64)
+            Hidden layer sizes used for both actor and critic MLPs.
+        activation_fn : Any, default=torch.nn.ReLU
+            Activation function class (not an instance), e.g. ``nn.ReLU``.
+        init_type : str, default="orthogonal"
+            Weight initialization scheme identifier understood by your network builders.
+        gain : float, default=1.0
+            Optional initialization gain passed to network builders.
+        bias : float, default=0.0
+            Optional initialization bias passed to network builders.
+        device : str | torch.device, default="cpu"
+            Torch device on which this head will live (e.g., ``"cpu"``, ``"cuda:0"``).
+        log_std_mode : str, default="param"
+            Log-standard-deviation parameterization mode for the Gaussian actor.
+
+            Common options (implementation-dependent)
+            - ``"param"``: trainable, state-independent log-std vector.
+            - other modes may exist in your codebase.
+        log_std_init : float, default=-0.5
+            Initial log-std value used by the Gaussian actor when applicable.
+
+        Notes
+        -----
+        The constructor stores a JSON-safe subset of arguments for checkpoint metadata
+        and Ray reconstruction. Non-JSON values like ``activation_fn`` are serialized
+        by name.
         """
         super().__init__(device=device)
 
-        # Store config for checkpoint/Ray reconstruction
+        # ---- Store configuration for checkpoint/Ray reconstruction
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.hidden_sizes = tuple(int(x) for x in hidden_sizes)
@@ -144,15 +181,14 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
         self.log_std_init = float(log_std_init)
 
         # ---------------------------------------------------------------------
-        # Actor network: unsquashed diagonal Gaussian policy
+        # Actor: unsquashed diagonal Gaussian policy π(a|s)
         # ---------------------------------------------------------------------
-        # squash=False: no tanh squashing; ACKTR/A2C-style usually uses raw Gaussian.
         self.actor = ContinuousPolicyNetwork(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
             hidden_sizes=list(self.hidden_sizes),
             activation_fn=self.activation_fn,
-            squash=False,
+            squash=False,  # ACKTR/A2C/PPO-style commonly uses an unsquashed Gaussian
             log_std_mode=self.log_std_mode,
             log_std_init=self.log_std_init,
             init_type=self.init_type,
@@ -161,7 +197,7 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
         ).to(self.device)
 
         # ---------------------------------------------------------------------
-        # Critic network: state-value function V(s)
+        # Critic: state-value function V(s)
         # ---------------------------------------------------------------------
         self.critic = StateValueNetwork(
             state_dim=self.obs_dim,
@@ -177,11 +213,23 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export constructor kwargs into a JSON-safe dict.
+        Export constructor kwargs in a JSON-serializable form.
 
-        This is used for:
-        - checkpoint reproducibility
-        - Ray worker reconstruction (PolicyFactorySpec kwargs)
+        This payload is intended for:
+        - checkpoint metadata (reproducibility/debugging)
+        - Ray worker reconstruction (kwargs must be JSON-safe)
+
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-safe configuration dictionary.
+
+        Notes
+        -----
+        - ``activation_fn`` is exported by name using ``_activation_to_name`` and must
+          be resolved back to a callable via :func:`_resolve_activation_fn` when
+          reconstructing.
+        - ``device`` is stored as a string for portability.
         """
         return {
             "obs_dim": int(self.obs_dim),
@@ -198,13 +246,24 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
 
     def _state_payload(self) -> Dict[str, Any]:
         """
-        Return the checkpoint payload (ready to be passed into torch.save()).
+        Build the checkpoint payload for :func:`torch.save`.
 
-        Contents
-        --------
-        - kwargs : JSON-safe constructor config
-        - actor  : actor state_dict
-        - critic : critic state_dict
+        Returns
+        -------
+        Dict[str, Any]
+            Checkpoint payload containing:
+
+            kwargs : dict
+                JSON-safe constructor configuration.
+            actor : dict
+                ``state_dict`` for the actor network.
+            critic : dict
+                ``state_dict`` for the critic network.
+
+        Notes
+        -----
+        This method exists to keep save/load logic centralized and consistent with
+        other on-policy heads (e.g., PPO-style checkpointing).
         """
         return {
             "kwargs": self._export_kwargs_json_safe(),
@@ -214,11 +273,21 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
 
     def _load_state_payload(self, ckpt: Dict[str, Any]) -> None:
         """
-        Load weights from a checkpoint payload dict into this instance.
+        Load weights from an in-memory checkpoint payload into this instance.
+
+        Parameters
+        ----------
+        ckpt : Dict[str, Any]
+            A checkpoint payload as produced by :meth:`_state_payload`.
+
+        Raises
+        ------
+        ValueError
+            If required keys are missing.
 
         Notes
         -----
-        - This does NOT reconstruct the module; it only loads parameters.
+        - This does **not** reconstruct the module; it only loads parameters.
         - The existing instance must have compatible shapes.
         """
         if "actor" not in ckpt or "critic" not in ckpt:
@@ -231,26 +300,49 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
         """
         Save a checkpoint to disk.
 
-        The saved file contains only:
-        - ctor kwargs (JSON-safe)
-        - actor weights
-        - critic weights
+        Parameters
+        ----------
+        path : str
+            Output file path. If ``.pt`` is missing, it is appended automatically.
+
+        Saved contents
+        --------------
+        - ``kwargs`` : JSON-safe constructor config (for reconstruction/debugging)
+        - ``actor``  : actor ``state_dict``
+        - ``critic`` : critic ``state_dict``
+
+        Notes
+        -----
+        The checkpoint contains weights and metadata only. It does not store an
+        optimizer state (that belongs to the core/algorithm).
         """
-        if not path.endswith(".pt"):
-            path += ".pt"
-        th.save(self._state_payload(), path)
+        out = path if path.endswith(".pt") else (path + ".pt")
+        th.save(self._state_payload(), out)
 
     def load(self, path: str) -> None:
         """
-        Load a checkpoint from disk into the existing instance.
+        Load a checkpoint from disk into the *existing* instance.
 
-        This loads weights only (no reconstruction).
+        Parameters
+        ----------
+        path : str
+            Checkpoint path. If ``.pt`` is missing, it is appended automatically.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint is not a dictionary payload.
+
+        Notes
+        -----
+        - Loads weights only; does not reconstruct the object.
+        - Uses ``map_location=self.device`` for CPU/GPU portability.
         """
-        if not path.endswith(".pt"):
-            path += ".pt"
-        ckpt = th.load(path, map_location=self.device)
+        ckpt_path = path if path.endswith(".pt") else (path + ".pt")
+        ckpt = th.load(ckpt_path, map_location=self.device)
         if not isinstance(ckpt, dict):
-            raise ValueError(f"Unrecognized checkpoint format: {path}")
+            raise ValueError(f"Unrecognized checkpoint format: {ckpt_path}")
+
         self._load_state_payload(ckpt)
 
     # =============================================================================
@@ -258,14 +350,20 @@ class ACKTRHead(OnPolicyContinuousActorCriticHead):
     # =============================================================================
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Provide a Ray-safe construction spec:
-          - entrypoint : module-level function pointer
-          - kwargs      : JSON-safe ctor args
+        Build a Ray-safe construction spec (entrypoint + JSON-safe kwargs).
 
-        Ray workers can call:
-          build_acktr_head_worker_policy(**kwargs)
+        Returns
+        -------
+        PolicyFactorySpec
+            A lightweight spec containing:
+            - ``entrypoint``: picklable reference to :func:`build_acktr_head_worker_policy`
+            - ``kwargs``: JSON-safe constructor args for worker-side reconstruction
+
+        Notes
+        -----
+        The worker factory forces CPU and resolves the activation function name.
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_acktr_head_worker_policy),
+            entrypoint=_make_entrypoint(build_acktr_head_worker_policy),
             kwargs=self._export_kwargs_json_safe(),
         )

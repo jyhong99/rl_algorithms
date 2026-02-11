@@ -66,7 +66,6 @@ def sac_discrete(
     # -----------------------------
     buffer_size: int = 1_000_000,
     batch_size: int = 256,
-    warmup_env_steps: int = 10_000,
     update_after: int = 1_000,
     update_every: int = 1,
     utd: float = 1.0,
@@ -159,11 +158,8 @@ def sac_discrete(
         Replay buffer capacity.
     batch_size : int
         Batch size sampled from replay for each update.
-    warmup_env_steps : int
-        How many environment steps to collect before allowing updates.
-        Passed to OffPolicyAlgorithm as `warmup_steps` (env-step based).
     update_after : int
-        Earliest env step when updates are allowed (typical: >= warmup_env_steps).
+        Earliest env step when updates are allowed.
     update_every : int
         Frequency of attempting updates in env steps (1 = every step).
     utd : float
@@ -273,7 +269,6 @@ def sac_discrete(
         device=device,
         buffer_size=int(buffer_size),
         batch_size=int(batch_size),
-        warmup_steps=int(warmup_env_steps),      # env-step warmup gate
         update_after=int(update_after),          # first env step when updates allowed
         update_every=int(update_every),          # env-step update cadence
         utd=float(utd),

@@ -5,9 +5,10 @@ from typing import Any, Optional, Tuple, Union
 import numpy as np
 import torch as th
 
-from .head import A2CHead
-from .core import A2CCore
 from model_free.common.policies.on_policy_algorithm import OnPolicyAlgorithm
+
+from .core import A2CCore
+from .head import A2CHead
 
 
 def a2c(
@@ -66,32 +67,149 @@ def a2c(
     update_epochs: int = 1,
     minibatch_size: Optional[int] = None,
     dtype_obs: Any = np.float32,
-    dtype_act: Any = np.float32,  # continuous actions stored as float
+    dtype_act: Any = np.float32,
     normalize_advantages: bool = False,
     adv_eps: float = 1e-8,
 ) -> OnPolicyAlgorithm:
     """
-    Build an A2C OnPolicyAlgorithm for CONTINUOUS actions (Gaussian policy).
+    Build an A2C :class:`~model_free.common.policies.on_policy_algorithm.OnPolicyAlgorithm`
+    for **continuous** action spaces.
 
-    Pipeline
-    --------
-    1) Head:
-       - Builds the actor+critic networks (Gaussian policy + V(s) baseline).
-    2) Core:
-       - Implements one update step (policy/value/entropy losses, optimizer steps,
-         gradient clipping, optional AMP, optional schedulers).
-    3) OnPolicyAlgorithm:
-       - Orchestrates rollout collection, batching, and the update schedule.
+    This is a *builder* function that wires together three layers:
+
+    1) **Head** (:class:`A2CHead`)
+       Owns the neural networks:
+       - Actor: diagonal Gaussian policy :math:`\\pi(a\\mid s)`
+       - Critic: state-value baseline :math:`V(s)`
+
+    2) **Core** (:class:`A2CCore`)
+       Owns the update rule and optimization:
+       - policy/value/entropy losses
+       - optimizer steps (actor + critic)
+       - optional AMP
+       - global grad clipping
+       - optional LR schedulers (via base core)
+
+    3) **Algorithm** (:class:`OnPolicyAlgorithm`)
+       Owns rollout collection and training schedule:
+       - collects `rollout_steps` transitions
+       - computes returns/advantages (GAE-λ)
+       - runs `update_epochs` epochs of minibatch updates
+
+    Parameters
+    ----------
+    obs_dim : int
+        Observation dimension (flattened), i.e., number of features in ``obs``.
+    action_dim : int
+        Continuous action dimension (flattened).
+    device : str | torch.device, default="cpu"
+        Torch device used by the learner/head (e.g., ``"cpu"``, ``"cuda:0"``).
+
+        Notes
+        -----
+        Ray rollout workers (if used) may still force CPU for worker-side policies
+        via :meth:`A2CHead.get_ray_policy_factory_spec`.
+
+    hidden_sizes : tuple[int, ...], default=(64, 64)
+        MLP hidden layer sizes shared by actor and critic networks.
+    activation_fn : Any, default=torch.nn.ReLU
+        Activation function class for MLPs (e.g., ``nn.ReLU``, ``nn.Tanh``).
+    init_type : str, default="orthogonal"
+        Weight initialization scheme name understood by your network builders.
+    gain : float, default=1.0
+        Optional initialization gain passed through to network builders.
+    bias : float, default=0.0
+        Optional initialization bias passed through to network builders.
+    log_std_mode : str, default="param"
+        Log-standard-deviation parameterization for the Gaussian actor.
+
+        Common options (implementation-dependent)
+        - ``"param"``: trainable, state-independent log-std vector.
+        - other modes may exist in your codebase.
+    log_std_init : float, default=-0.5
+        Initial log-std value (used when ``log_std_mode="param"``).
+
+    vf_coef : float, default=0.5
+        Value-loss coefficient used by :class:`A2CCore`.
+    ent_coef : float, default=0.0
+        Entropy coefficient used by :class:`A2CCore`.
+
+        Notes
+        -----
+        Entropy is implemented as a loss term ``ent_loss = -entropy.mean()``, so
+        positive ``ent_coef`` encourages exploration.
+    max_grad_norm : float, default=0.5
+        Global gradient norm clipping threshold (0 disables clipping).
+    use_amp : bool, default=False
+        Enable CUDA AMP in the core (best-effort; meaningful on CUDA).
+
+    actor_optim_name, critic_optim_name : str, default="adamw"
+        Optimizer identifiers for actor and critic optimizer builders.
+    actor_lr, critic_lr : float, default=3e-4
+        Learning rates for actor and critic.
+    actor_weight_decay, critic_weight_decay : float, default=0.0
+        Weight decay (L2) for actor and critic.
+
+    actor_sched_name, critic_sched_name : str, default="none"
+        Scheduler identifiers (if supported by your base core).
+    total_steps : int, default=0
+        Total steps used by schedules requiring a horizon (polynomial, cosine, etc.).
+    warmup_steps : int, default=0
+        Warmup steps for schedules that support warmup.
+    min_lr_ratio : float, default=0.0
+        Minimum LR as a ratio of the base LR for decay schedules.
+    poly_power : float, default=1.0
+        Power for polynomial decay schedules.
+    step_size : int, default=1000
+        Step size for step-based schedulers.
+    sched_gamma : float, default=0.99
+        Decay factor for exponential/step schedulers.
+    milestones : tuple[int, ...], default=()
+        Milestones for multi-step schedulers.
+
+    rollout_steps : int, default=2048
+        Number of environment steps collected per rollout before updates.
+    gamma : float, default=0.99
+        Discount factor for returns/GAE.
+    gae_lambda : float, default=0.95
+        GAE-λ parameter.
+    update_epochs : int, default=1
+        Number of epochs over the rollout buffer per iteration.
+
+        Notes
+        -----
+        Classic A2C uses ``update_epochs=1`` (single pass), while PPO often uses
+        multiple epochs.
+    minibatch_size : int | None, default=None
+        Minibatch size for updates. If ``None``, the algorithm may use the full
+        rollout batch (implementation-dependent in :class:`OnPolicyAlgorithm`).
+    dtype_obs : Any, default=numpy.float32
+        Numpy dtype used to store observations in the rollout buffer.
+    dtype_act : Any, default=numpy.float32
+        Numpy dtype used to store actions in the rollout buffer.
+
+        Notes
+        -----
+        Continuous actions are stored as floats.
+    normalize_advantages : bool, default=False
+        Whether the algorithm/buffer normalizes advantages before updates.
+    adv_eps : float, default=1e-8
+        Small epsilon used when normalizing advantages (to avoid division by zero).
+
+    Returns
+    -------
+    OnPolicyAlgorithm
+        Fully constructed on-policy algorithm object with A2C head/core.
 
     Notes
     -----
-    - This builder is continuous-only (action_dim required).
-    - Advantage normalization (if enabled) is typically handled at the algorithm/buffer level,
-      not inside the core.
+    - This builder is **continuous-only**; discrete/categorical actions require a
+      different head/core pair.
+    - Advantage computation (GAE) and any advantage normalization typically happens
+      in :class:`OnPolicyAlgorithm` and/or its rollout buffer, not in the core.
     """
-
     # -------------------------------------------------------------------------
-    # 1) Head: build actor+critic networks (continuous)
+    # 1) Head: actor + critic networks (continuous Gaussian policy + V(s))
     # -------------------------------------------------------------------------
     head = A2CHead(
         obs_dim=int(obs_dim),
@@ -107,7 +225,7 @@ def a2c(
     )
 
     # -------------------------------------------------------------------------
-    # 2) Core: build the update engine (continuous)
+    # 2) Core: update rule + optimizers/schedulers
     # -------------------------------------------------------------------------
     core = A2CCore(
         head=head,
@@ -135,7 +253,7 @@ def a2c(
     )
 
     # -------------------------------------------------------------------------
-    # 3) Algorithm: rollout collection + update scheduling
+    # 3) Algorithm: rollout collection + advantage/return computation + updates
     # -------------------------------------------------------------------------
     algo = OnPolicyAlgorithm(
         head=head,

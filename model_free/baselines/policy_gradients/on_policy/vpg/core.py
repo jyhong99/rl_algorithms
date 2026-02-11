@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple, List
 
 import torch as th
 import torch.nn.functional as F
 
-from model_free.common.utils.common_utils import to_scalar, to_column
+from model_free.common.utils.common_utils import _to_scalar, _to_column
 from model_free.common.policies.base_core import BaseCore
 from model_free.common.optimizers.optimizer_builder import build_optimizer
 from model_free.common.optimizers.scheduler_builder import build_scheduler
@@ -16,22 +16,39 @@ class VPGCore(BaseCore):
     Vanilla Policy Gradient (VPG) update engine for continuous control.
 
     This core performs a single on-policy gradient update per call using:
-      - Policy loss:   -E[ log π(a|s) * A(s,a) ]
-      - Entropy bonus:  -E[ H(π(.|s)) ]  (optional; via ent_coef)
-      - Value loss:     0.5 * MSE(V(s), R) (optional baseline; via vf_coef)
+
+    - Policy loss:
+        .. math::
+            \\mathcal{L}_{\\pi} = -\\mathbb{E}[\\log \\pi_\\theta(a\\mid s)\\, A(s,a)]
+
+    - Entropy regularization (optional):
+        .. math::
+            \\mathcal{L}_{H} = -\\mathbb{E}[H(\\pi_\\theta(\\cdot\\mid s))]
+
+      The total objective adds ``ent_coef * L_H`` (equivalently: adds
+      ``+ent_coef * E[entropy]`` to the maximization objective).
+
+    - Value loss (optional baseline):
+        .. math::
+            \\mathcal{L}_V = \\tfrac{1}{2}\\,\\mathrm{MSE}(V_\\phi(s), R)
+
+      Included only if a value baseline is enabled and scaled by ``vf_coef``.
 
     Baseline policy (critic usage)
     ------------------------------
     Baseline usage is dictated by the head:
-      - If head has attribute `use_baseline`, follow it strictly.
-      - Else, infer baseline usage as (head.critic is not None).
+
+    - If the head has attribute ``use_baseline``, follow it strictly.
+    - Else, infer baseline usage as ``(head.critic is not None)``.
 
     Notes
     -----
-    - If baseline is disabled: critic optimizer/scheduler are not created and
-      value_loss is a constant zero scalar.
-    - Advantage normalization is intentionally NOT handled here (should be done
-      by buffer/algorithm).
+    - If the baseline is disabled, critic optimizer/scheduler are not created and
+      ``value_loss`` is always a scalar zero.
+    - Advantage normalization is intentionally NOT handled here; do it in the rollout
+      buffer / algorithm.
+    - This core does not compute advantages except for a REINFORCE fallback when
+      ``batch.advantages`` is missing (uses returns).
     """
 
     def __init__(
@@ -51,7 +68,7 @@ class VPGCore(BaseCore):
         # schedulers
         actor_sched_name: str = "none",
         critic_sched_name: str = "none",
-        # (optional scheduler knobs)
+        # optional scheduler knobs
         total_steps: int = 0,
         warmup_steps: int = 0,
         min_lr_ratio: float = 0.0,
@@ -67,34 +84,52 @@ class VPGCore(BaseCore):
         Parameters
         ----------
         head : Any
-            Policy head providing:
-              - head.actor.get_dist(obs)  -> distribution with log_prob / entropy
-              - head.critic(obs)          -> V(s) (only if baseline enabled)
-              - head.device               -> device placement
-        vf_coef : float
+            Policy head providing at least:
+            - ``head.actor.get_dist(obs)`` -> distribution with ``log_prob`` and ``entropy``
+            - ``head.critic(obs)`` -> value prediction ``V(s)`` (only if baseline enabled)
+            - ``head.device`` -> torch device placement (string or torch.device)
+
+            Baseline usage is determined by:
+            - ``head.use_baseline`` if present, otherwise
+            - ``(head.critic is not None)``.
+        vf_coef : float, default=0.5
             Coefficient for value loss when baseline is enabled.
-        ent_coef : float
-            Coefficient for entropy bonus term (encourages exploration).
-        actor_optim_name / actor_lr / actor_weight_decay
-            Optimizer config for actor parameters.
-        critic_optim_name / critic_lr / critic_weight_decay
-            Optimizer config for critic parameters (only if baseline enabled).
-        actor_sched_name / critic_sched_name
-            Learning-rate scheduler names (optional).
+        ent_coef : float, default=0.0
+            Coefficient for entropy regularization. Typical values are small (e.g., 0 to 1e-2).
+        actor_optim_name : str, default="adamw"
+            Optimizer name for actor parameters (resolved by ``build_optimizer``).
+        actor_lr : float, default=3e-4
+            Actor learning rate.
+        actor_weight_decay : float, default=0.0
+            Actor weight decay.
+        critic_optim_name : str, default="adamw"
+            Optimizer name for critic parameters (only if baseline enabled).
+        critic_lr : float, default=3e-4
+            Critic learning rate (only if baseline enabled).
+        critic_weight_decay : float, default=0.0
+            Critic weight decay (only if baseline enabled).
+        actor_sched_name : str, default="none"
+            Scheduler name for actor LR schedule (resolved by ``build_scheduler``).
+        critic_sched_name : str, default="none"
+            Scheduler name for critic LR schedule (only if baseline enabled).
         total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones
-            Common scheduler knobs used by build_scheduler().
-        max_grad_norm : float
-            Gradient clipping norm (global norm).
-        use_amp : bool
-            Enable mixed precision (AMP) training if supported by BaseCore.
+            Scheduler knobs passed through to ``build_scheduler``. Exact meaning depends on scheduler.
+        max_grad_norm : float, default=0.5
+            Global norm clipping threshold. Set to 0 to disable clipping.
+        use_amp : bool, default=False
+            Enable AMP autocast + gradient scaling. Uses BaseCore scaler utilities.
+
+        Raises
+        ------
+        ValueError
+            If ``max_grad_norm`` is negative or baseline configuration is inconsistent
+            (e.g., head indicates baseline enabled but ``head.critic`` is missing).
         """
         super().__init__(head=head, use_amp=use_amp)
 
-        # Coefficients for composing the total loss
         self.vf_coef = float(vf_coef)
         self.ent_coef = float(ent_coef)
 
-        # Gradient clipping knob
         self.max_grad_norm = float(max_grad_norm)
         if self.max_grad_norm < 0.0:
             raise ValueError(f"max_grad_norm must be >= 0, got {self.max_grad_norm}")
@@ -102,24 +137,21 @@ class VPGCore(BaseCore):
         # ------------------------------------------------------------------
         # Baseline usage is dictated by the head
         # ------------------------------------------------------------------
-        # We support both styles:
-        #  - explicit: head.use_baseline (preferred)
-        #  - implicit: critic exists -> baseline enabled
         head_has_critic = getattr(self.head, "critic", None) is not None
         if hasattr(self.head, "use_baseline"):
             self.use_baseline = bool(getattr(self.head, "use_baseline"))
         else:
             self.use_baseline = bool(head_has_critic)
 
-        # Track whether a critic module is actually present (internal consistency)
         self._has_critic = bool(head_has_critic)
         if self.use_baseline and not self._has_critic:
-            raise ValueError("Head indicates baseline enabled (use_baseline=True) but head.critic is None.")
+            raise ValueError(
+                "Head indicates baseline enabled (use_baseline=True) but head.critic is None."
+            )
 
         # ------------------------------------------------------------------
         # Optimizers
         # ------------------------------------------------------------------
-        # Actor optimizer always exists.
         self.actor_opt = build_optimizer(
             self.head.actor.parameters(),
             name=str(actor_optim_name),
@@ -127,7 +159,6 @@ class VPGCore(BaseCore):
             weight_decay=float(actor_weight_decay),
         )
 
-        # Critic optimizer only exists when baseline is enabled.
         self.critic_opt = None
         if self.use_baseline:
             self.critic_opt = build_optimizer(
@@ -138,9 +169,8 @@ class VPGCore(BaseCore):
             )
 
         # ------------------------------------------------------------------
-        # Schedulers
+        # Schedulers (best-effort; may return None)
         # ------------------------------------------------------------------
-        # Scheduler construction is best-effort; build_scheduler may return None.
         self.actor_sched = build_scheduler(
             self.actor_opt,
             name=str(actor_sched_name),
@@ -167,49 +197,71 @@ class VPGCore(BaseCore):
                 milestones=tuple(int(m) for m in milestones),
             )
 
+    # ============================================================
+    # Schedulers
+    # ============================================================
     def _step_scheds(self) -> None:
-        """Step actor/critic schedulers if they exist."""
+        """
+        Step actor/critic schedulers if they exist.
+
+        Notes
+        -----
+        Some algorithm drivers call this hook after each update. This method is
+        safe to call regardless of whether schedulers are configured.
+        """
         if self.actor_sched is not None:
             self.actor_sched.step()
         if self.critic_sched is not None:
             self.critic_sched.step()
-            
-    # ------------------------------------------------------------------
+
+    # ============================================================
     # Update
-    # ------------------------------------------------------------------
+    # ============================================================
     def update_from_batch(self, batch: Any) -> Dict[str, float]:
         """
-        Perform one VPG update from an on-policy batch.
+        Perform one VPG update using an on-policy batch.
 
-        Expected batch fields (typical)
-        -------------------------------
-        batch.observations : (B, obs_dim)
-        batch.actions      : (B, act_dim) or (act_dim,) when B=1
-        batch.returns      : (B,) or (B,1)
-        batch.advantages   : (B,) or (B,1) (optional; if missing, uses returns)
+        Parameters
+        ----------
+        batch : Any
+            Batch container providing (at minimum):
+            - ``observations`` : torch.Tensor, shape (B, obs_dim)
+            - ``actions``      : torch.Tensor, shape (B, act_dim) or (act_dim,) if B=1
+            - ``returns``      : torch.Tensor, shape (B,) or (B,1)
+            - ``advantages``   : torch.Tensor, shape (B,) or (B,1), optional
+
+            If ``advantages`` is missing, the update falls back to REINFORCE
+            behavior by using returns as advantages.
+
+        Returns
+        -------
+        metrics : Dict[str, float]
+            Scalar metrics for logging, including:
+            - ``loss/policy``, ``loss/entropy``, ``loss/total``
+            - ``stats/entropy``
+            - learning rates
+            - optional value metrics if baseline is enabled
 
         Notes
         -----
         - This core does NOT compute advantages (except a REINFORCE fallback).
-        - If advantages are present, they are treated as fixed targets for the policy
-          gradient (detached).
+          If advantages are provided, they are treated as fixed targets for policy
+          gradients (detached).
+        - Entropy and log-prob shapes depend on your distribution implementation.
+          They are normalized to column vectors via ``_to_column`` for consistent
+          reductions.
         """
-        self._bump()  # increment internal update counters (BaseCore)
+        self._bump()
 
-        # Move batch tensors to device
         obs = batch.observations.to(self.device)
         act = batch.actions.to(self.device)
-        ret = to_column(batch.returns.to(self.device))
+        ret = _to_column(batch.returns.to(self.device))
 
-        # Advantage:
-        # - If batch provides advantages, use them.
-        # - Else fall back to returns (REINFORCE-style). This is not variance-optimal,
-        #   but allows the core to run without a separate advantage computation stage.
         adv = getattr(batch, "advantages", None)
         if adv is None:
             adv = ret
         else:
-            adv = to_column(adv.to(self.device))
+            adv = _to_column(adv.to(self.device))
 
         def _forward_losses() -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
             """
@@ -217,41 +269,35 @@ class VPGCore(BaseCore):
 
             Returns
             -------
-            total_loss : torch.Tensor (scalar)
-            policy_loss: torch.Tensor (scalar)
-            value_loss : torch.Tensor (scalar, 0 if baseline disabled)
-            ent_loss   : torch.Tensor (scalar)
-            ent_mean   : torch.Tensor (scalar) mean entropy
-            v_mean     : torch.Tensor (scalar) mean value prediction (0 if baseline disabled)
+            total_loss : torch.Tensor
+                Scalar tensor for backprop. Includes policy loss, entropy regularization,
+                and (optionally) value loss.
+            policy_loss : torch.Tensor
+                Scalar tensor: negative surrogate objective ``-(logp * adv).mean()``.
+            value_loss : torch.Tensor
+                Scalar tensor: 0 if baseline disabled, else ``0.5 * MSE(V, returns)``.
+            ent_loss : torch.Tensor
+                Scalar tensor: negative mean entropy (so adding ent_coef encourages exploration).
+            ent_mean : torch.Tensor
+                Scalar tensor: mean entropy (for logging).
+            v_mean : torch.Tensor
+                Scalar tensor: mean value prediction (0 if baseline disabled).
             """
-            # Distribution parameterized by current policy
             dist = self.head.actor.get_dist(obs)
 
-            # Log-prob and entropy may have shape (B,) or (B, act_dim) depending on dist implementation.
-            logp = dist.log_prob(act)
-            entropy = dist.entropy()
+            logp = _to_column(dist.log_prob(act))
+            entropy = _to_column(dist.entropy())
 
-            # Normalize to (B,1) so downstream reductions are consistent.
-            logp = to_column(logp)
-            entropy = to_column(entropy)
-
-            # Policy gradient loss: maximize E[logp * adv] -> minimize -(logp * adv)
-            # adv is detached to avoid backprop through advantage estimation.
             policy_loss = -(logp * adv.detach()).mean()
-
-            # Entropy loss: typical convention is to add +ent_coef * entropy to objective.
-            # Here we write ent_loss = -entropy.mean(), so total adds ent_coef * ent_loss.
             ent_loss = -entropy.mean()
 
-            # Value loss: only when baseline enabled
             value_loss = th.zeros((), device=self.device)
             v_mean = th.zeros((), device=self.device)
             if self.use_baseline:
-                v = to_column(self.head.critic(obs))  # type: ignore[attr-defined]
+                v = _to_column(self.head.critic(obs))  # type: ignore[attr-defined]
                 value_loss = 0.5 * F.mse_loss(v, ret)
                 v_mean = v.mean()
 
-            # Compose total loss
             total_loss = policy_loss + self.ent_coef * ent_loss
             if self.use_baseline:
                 total_loss = total_loss + self.vf_coef * value_loss
@@ -266,28 +312,24 @@ class VPGCore(BaseCore):
             self.critic_opt.zero_grad(set_to_none=True)
 
         # ------------------------------------------------------------------
-        # Backward + optimizer steps (optionally AMP)
+        # Backward + optimizer steps (optional AMP)
         # ------------------------------------------------------------------
         if self.use_amp:
-            # AMP path: loss scaling is handled by BaseCore's scaler
             with th.cuda.amp.autocast(enabled=True):
                 total_loss, policy_loss, value_loss, ent_loss, ent_mean, v_mean = _forward_losses()
 
             self.scaler.scale(total_loss).backward()
 
-            # Clip gradients across all updated parameters
-            params = list(self.head.actor.parameters())
+            params: List[th.nn.Parameter] = list(self.head.actor.parameters())
             if self.use_baseline:
                 params += list(self.head.critic.parameters())  # type: ignore[attr-defined]
             self._clip_params(params, max_grad_norm=self.max_grad_norm, optimizer=None)
 
-            # Optimizer steps under AMP
             self.scaler.step(self.actor_opt)
             if self.critic_opt is not None:
                 self.scaler.step(self.critic_opt)
             self.scaler.update()
         else:
-            # FP32 path
             total_loss, policy_loss, value_loss, ent_loss, ent_mean, v_mean = _forward_losses()
             total_loss.backward()
 
@@ -301,48 +343,54 @@ class VPGCore(BaseCore):
                 self.critic_opt.step()
 
         # ------------------------------------------------------------------
-        # Scheduler steps (if enabled)
+        # Scheduler steps
         # ------------------------------------------------------------------
-        if self.actor_sched is not None:
-            self.actor_sched.step()
-        if self.critic_sched is not None:
-            self.critic_sched.step()
+        self._step_scheds()
 
         # ------------------------------------------------------------------
         # Metrics
         # ------------------------------------------------------------------
         out: Dict[str, float] = {
-            "loss/policy": float(to_scalar(policy_loss)),
-            "loss/entropy": float(to_scalar(ent_loss)),
-            "loss/total": float(to_scalar(total_loss)),
-            "stats/entropy": float(to_scalar(ent_mean)),
+            "loss/policy": float(_to_scalar(policy_loss)),
+            "loss/entropy": float(_to_scalar(ent_loss)),
+            "loss/total": float(_to_scalar(total_loss)),
+            "stats/entropy": float(_to_scalar(ent_mean)),
             "lr/actor": float(self.actor_opt.param_groups[0]["lr"]),
         }
+
         if self.use_baseline:
-            out["loss/value"] = float(to_scalar(value_loss))
-            out["stats/value_mean"] = float(to_scalar(v_mean))
+            out["loss/value"] = float(_to_scalar(value_loss))
+            out["stats/value_mean"] = float(_to_scalar(v_mean))
             out["lr/critic"] = float(self.critic_opt.param_groups[0]["lr"]) if self.critic_opt is not None else 0.0
 
         return out
 
-    # ------------------------------------------------------------------
+    # ============================================================
     # Persistence
-    # ------------------------------------------------------------------
+    # ============================================================
     def state_dict(self) -> Dict[str, Any]:
         """
         Serialize core state.
 
-        Stored fields
-        -------------
+        Returns
+        -------
+        state : Dict[str, Any]
+            Serializable state dictionary.
+
+        Notes
+        -----
+        The state includes:
         - actor optimizer/scheduler state
-        - critic optimizer/scheduler state (or None if no baseline)
-        - hyperparameters needed to resume training consistently
+        - critic optimizer/scheduler state (or None if baseline disabled)
+        - hyperparameters required to resume training consistently
         """
         s = super().state_dict()
         s.update(
             {
                 "actor": self._save_opt_sched(self.actor_opt, self.actor_sched),
-                "critic": None if self.critic_opt is None else self._save_opt_sched(self.critic_opt, self.critic_sched),
+                "critic": None
+                if self.critic_opt is None
+                else self._save_opt_sched(self.critic_opt, self.critic_sched),
                 "vf_coef": float(self.vf_coef),
                 "ent_coef": float(self.ent_coef),
                 "max_grad_norm": float(self.max_grad_norm),
@@ -353,10 +401,21 @@ class VPGCore(BaseCore):
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
-        Restore core state.
+        Restore core state from a serialized dictionary.
 
-        Compatibility rules
-        -------------------
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State dictionary produced by :meth:`state_dict`.
+
+        Raises
+        ------
+        ValueError
+            If checkpoint baseline configuration is incompatible with the current head.
+
+        Notes
+        -----
+        Compatibility rules:
         - If current head baseline is enabled, checkpoint must contain critic optimizer state.
         - If current head baseline is disabled, checkpoint must NOT contain critic optimizer state.
         """
@@ -367,13 +426,18 @@ class VPGCore(BaseCore):
 
         ckpt_critic = state.get("critic", None)
 
-        # Checkpoint <-> current baseline compatibility checks
         if self.use_baseline:
             if ckpt_critic is None:
-                raise ValueError("Checkpoint has no critic optimizer state but head baseline is enabled.")
+                raise ValueError(
+                    "Checkpoint has no critic optimizer state but head baseline is enabled."
+                )
             if self.critic_opt is None:
-                raise ValueError("Head baseline enabled but critic optimizer is None (internal inconsistency).")
+                raise ValueError(
+                    "Head baseline enabled but critic optimizer is None (internal inconsistency)."
+                )
             self._load_opt_sched(self.critic_opt, self.critic_sched, ckpt_critic)
         else:
             if ckpt_critic is not None:
-                raise ValueError("Checkpoint contains critic optimizer state but head baseline is disabled.")
+                raise ValueError(
+                    "Checkpoint contains critic optimizer state but head baseline is disabled."
+                )

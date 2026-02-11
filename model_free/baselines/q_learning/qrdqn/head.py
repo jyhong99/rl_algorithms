@@ -6,71 +6,88 @@ import torch as th
 import torch.nn as nn
 
 from model_free.common.networks.q_networks import QuantileQNetwork
-from model_free.common.utils.ray_utils import PolicyFactorySpec, make_entrypoint, resolve_activation_fn
 from model_free.common.policies.base_head import QLearningHead
-
+from model_free.common.utils.ray_utils import (
+    PolicyFactorySpec,
+    _make_entrypoint,
+    _resolve_activation_fn,
+)
 
 # =============================================================================
 # Ray worker factory (MUST be module-level)
 # =============================================================================
 def build_qrdqn_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build QRDQNHead on CPU.
+    Build a :class:`QRDQNHead` instance on a Ray worker (CPU-only).
 
-    Purpose
+    Ray typically reconstructs policy modules inside remote worker processes using:
+      1) a module-level entrypoint (importable / pickle-friendly), and
+      2) a JSON-safe kwargs payload.
+
+    This factory enforces worker-side invariants:
+
+    - **CPU-only** execution on rollout workers (avoid GPU contention).
+    - **Activation resolution**: serialized activation identifiers (e.g., ``"ReLU"``)
+      are converted back into a torch activation class via ``_resolve_activation_fn``.
+    - **Inference mode**: the created head is switched to evaluation/inference
+      behavior via ``set_training(False)``.
+
+    Parameters
+    ----------
+    **kwargs : Any
+        Constructor keyword arguments intended for :class:`QRDQNHead`.
+        The payload should be JSON/pickle-safe. In particular, ``activation_fn``
+        is expected to be serialized (string/None) and is resolved here.
+
+    Returns
     -------
-    When using Ray remote workers, the policy object must be constructible
-    from a module-level function (so that it is pickleable/importable).
-
-    Notes
-    -----
-    - `device` is overridden to "cpu" because Ray workers typically keep policies on CPU.
-    - `activation_fn` is serialized as a string or None; it is resolved here back to
-      the actual torch.nn.Module class/function.
+    nn.Module
+        A CPU-allocated :class:`QRDQNHead` set to inference mode.
     """
-    kwargs = dict(kwargs)
-    kwargs["device"] = "cpu"
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    cfg = dict(kwargs)  # defensive copy (Ray may reuse dict objects)
+    cfg["device"] = "cpu"
+    cfg["activation_fn"] = _resolve_activation_fn(cfg.get("activation_fn", None))
 
-    head = QRDQNHead(**kwargs).to("cpu")
+    head = QRDQNHead(**cfg).to("cpu")
     head.set_training(False)
     return head
 
 
 class QRDQNHead(QLearningHead):
     """
-    QR-DQN Head: (Online Quantile Q) + (Target Quantile Q)
+    Quantile Regression DQN (QR-DQN) head (online + target quantile Q-networks).
 
-    High-level behavior
-    -------------------
-    QR-DQN learns a distributional Q-function, represented by N quantiles per action:
-        Z(s, a) ~ distribution over returns
-    The network outputs quantiles:
-        quantiles(s) -> (B, N, A)
+    QR-DQN learns a **distributional** action-value function by approximating the
+    return distribution ``Z(s,a)`` with a fixed set of quantiles.
 
-    This head provides both:
-      - distributional outputs (quantiles)
-      - expected Q-values (mean over quantiles) for compatibility with
-        classic Q-learning interfaces.
+    Representation
+    --------------
+    For each state ``s`` and action ``a``, the network outputs ``N`` quantile values.
+    With a batch of size ``B`` and ``A`` actions, the quantile tensor has shape:
 
-    Inherited from QLearningHead
-    ----------------------------
-    This class assumes QLearningHead provides:
-      - self.device
-      - _to_tensor_batched(obs): convert numpy/list -> torch tensor (B, obs_dim)
-      - set_training(training): toggles train/eval mode
-      - act(obs, epsilon=..., deterministic=...):
-            epsilon-greedy wrapper built on top of q_values(obs)
-      - hard_update(target, source), soft_update(target, source, tau), freeze_target(module)
+    - ``(B, N, A)``
 
-    QRDQN overrides / additions
-    ---------------------------
-    - quantiles(obs) -> (B, N, A)
-    - quantiles_target(obs) -> (B, N, A)
-    - q_values(obs) -> (B, A)            (expected Q; mean over N)
-    - q_values_target(obs) -> (B, A)     (expected Q; mean over N)
-    - save/load: includes ctor kwargs + both nets (online/target)
-    - get_ray_policy_factory_spec(): ray-compatible factory spec
+    This head exposes both:
+    - **Quantiles**: distributional outputs for distributional RL updates, and
+    - **Expected Q-values**: mean over quantiles for epsilon-greedy action selection
+      and compatibility with classic Q-learning interfaces.
+
+    Inherited contract (from QLearningHead)
+    --------------------------------------
+    This class assumes :class:`~model_free.common.policies.base_head.QLearningHead`
+    provides utilities such as:
+
+    - ``self.device`` device resolution/storage
+    - ``_to_tensor_batched(obs)`` conversion helper for ``obs`` to (B, obs_dim)
+    - ``set_training(training: bool)``
+    - epsilon-greedy ``act(obs, epsilon=..., deterministic=...)`` built on ``q_values()``
+    - target net helpers: ``hard_update``, ``soft_update``, ``freeze_target``
+
+    Notes
+    -----
+    - The target network is conventionally frozen (no gradients) for stability.
+    - This head is “thin”: it owns networks and serialization metadata; the learning
+      rule lives in the core.
     """
 
     def __init__(
@@ -93,28 +110,35 @@ class QRDQNHead(QLearningHead):
         obs_dim : int
             Observation dimension (flattened state vector size).
         n_actions : int
-            Number of discrete actions (A).
-        n_quantiles : int
-            Number of quantiles per action (N). Typical values: 50~200.
-        hidden_sizes : Sequence[int]
-            MLP hidden layer sizes for the quantile Q-network.
-        activation_fn : Any
-            Activation function class, e.g., nn.ReLU, nn.SiLU, nn.Tanh.
-        dueling_mode : bool
-            If True, use a dueling architecture (value + advantage streams)
-            inside QuantileQNetwork (if supported).
-        init_type : str
-            Initialization strategy string (passed through to QuantileQNetwork).
-        gain : float
-            Gain scaling for initialization (depends on init_type).
-        bias : float
-            Bias init constant.
-        device : Union[str, torch.device]
-            Torch device for the networks.
+            Number of discrete actions (``A``).
+        n_quantiles : int, default=200
+            Number of quantiles per action (``N``). Typical values: 50–200.
+        hidden_sizes : Sequence[int], default=(256, 256)
+            Hidden layer sizes for the quantile Q-network MLP.
+        activation_fn : Any, default=torch.nn.ReLU
+            Activation function **class** (e.g., ``nn.ReLU``).
+            This may be serialized for Ray and reconstructed with
+            ``_resolve_activation_fn``.
+        dueling_mode : bool, default=False
+            If True, enable a dueling architecture (value + advantage streams)
+            inside :class:`~model_free.common.networks.q_networks.QuantileQNetwork`
+            if supported by your implementation.
+        init_type : str, default="orthogonal"
+            Initialization strategy string (passed to network builder).
+        gain : float, default=1.0
+            Gain scaling for initialization (depends on ``init_type``).
+        bias : float, default=0.0
+            Bias initialization constant.
+        device : Union[str, torch.device], default=("cuda" if available else "cpu")
+            Device for allocating the networks.
+
+        Raises
+        ------
+        ValueError
+            If ``n_actions`` or ``n_quantiles`` are not positive.
         """
         super().__init__(device=device)
 
-        # --- basic config ---
         self.obs_dim = int(obs_dim)
         self.n_actions = int(n_actions)
         self.n_quantiles = int(n_quantiles)
@@ -133,14 +157,9 @@ class QRDQNHead(QLearningHead):
         self.bias = float(bias)
 
         # ---------------------------------------------------------------------
-        # Online / Target networks
+        # Online / target quantile networks
         #
-        # Both networks output quantiles:
-        #   (B, N, A)
-        #
-        # Convention:
-        #   - Online net: trained by gradient descent
-        #   - Target net: updated periodically via hard/soft updates and frozen
+        # Both networks return quantiles with shape: (B, N, A)
         # ---------------------------------------------------------------------
         self.q = QuantileQNetwork(
             state_dim=self.obs_dim,
@@ -166,30 +185,32 @@ class QRDQNHead(QLearningHead):
             bias=self.bias,
         ).to(self.device)
 
-        # Copy online -> target, then freeze target (no gradients) for stability
+        # Initialize target parameters from online parameters, then freeze target.
         self.hard_update(self.q_target, self.q)
         self.freeze_target(self.q_target)
 
     # =============================================================================
-    # Quantiles
+    # Quantiles API
     # =============================================================================
     def quantiles(self, obs: Any) -> th.Tensor:
         """
-        Compute online quantiles Z(s, a).
+        Compute online quantiles ``Z(s, a)``.
 
         Parameters
         ----------
         obs : Any
-            Single observation (obs_dim,) or batch (B, obs_dim).
-            Accepts numpy arrays, lists, torch tensors, etc.
+            Observation input. Accepts:
+            - single observation of shape ``(obs_dim,)``
+            - batch of observations of shape ``(B, obs_dim)``
+            - torch tensors / numpy arrays / lists (as supported by your base head)
 
         Returns
         -------
         quantiles : torch.Tensor
-            Quantile samples with shape (B, N, A):
-              - B : batch size
-              - N : number of quantiles
-              - A : number of discrete actions
+            Quantile outputs with shape ``(B, N, A)`` where:
+            - ``B`` is the batch size,
+            - ``N`` is the number of quantiles,
+            - ``A`` is the number of actions.
         """
         s = self._to_tensor_batched(obs)  # (B, obs_dim)
         return self.q(s)                  # (B, N, A)
@@ -197,12 +218,17 @@ class QRDQNHead(QLearningHead):
     @th.no_grad()
     def quantiles_target(self, obs: Any) -> th.Tensor:
         """
-        Compute target quantiles Z_target(s, a).
+        Compute target quantiles ``Z_target(s, a)``.
+
+        Parameters
+        ----------
+        obs : Any
+            Observation input, same conventions as :meth:`quantiles`.
 
         Returns
         -------
         quantiles : torch.Tensor
-            Shape (B, N, A)
+            Target quantile outputs with shape ``(B, N, A)``.
         """
         s = self._to_tensor_batched(obs)
         return self.q_target(s)
@@ -210,53 +236,89 @@ class QRDQNHead(QLearningHead):
     @staticmethod
     def q_mean_from_quantiles(quantiles: th.Tensor) -> th.Tensor:
         """
-        Convert distributional quantiles into expected Q-values.
+        Convert quantiles to expected Q-values by averaging over quantile dimension.
 
         Parameters
         ----------
         quantiles : torch.Tensor
-            Shape (B, N, A)
+            Quantile tensor with shape ``(B, N, A)``.
 
         Returns
         -------
         q_values : torch.Tensor
-            Expected Q-values, shape (B, A), computed as mean over quantiles.
+            Expected Q-values with shape ``(B, A)`` computed as ``mean(dim=1)``.
+
+        Raises
+        ------
+        ValueError
+            If ``quantiles`` is not a rank-3 tensor of shape ``(B, N, A)``.
         """
         if quantiles.dim() != 3:
             raise ValueError(f"Expected quantiles shape (B,N,A), got: {tuple(quantiles.shape)}")
         return quantiles.mean(dim=1)
 
     # =============================================================================
-    # Expected Q (override for QLearningHead compatibility)
+    # Expected Q API (QLearningHead compatibility)
     # =============================================================================
     def q_values(self, obs: Any) -> th.Tensor:
         """
-        Expected Q-values from online quantiles.
+        Compute expected Q-values from the **online** quantiles.
 
-        This is used by epsilon-greedy action selection in QLearningHead.act().
+        This is the quantity used for epsilon-greedy action selection and for
+        Double DQN action selection (argmax) in the core.
+
+        Parameters
+        ----------
+        obs : Any
+            Observation input, same conventions as :meth:`quantiles`.
+
+        Returns
+        -------
+        q_values : torch.Tensor
+            Expected Q-values with shape ``(B, A)``.
         """
-        return self.q_mean_from_quantiles(self.quantiles(obs))  # (B, A)
+        return self.q_mean_from_quantiles(self.quantiles(obs))
 
     @th.no_grad()
     def q_values_target(self, obs: Any) -> th.Tensor:
         """
-        Expected Q-values from target quantiles.
+        Compute expected Q-values from the **target** quantiles.
 
-        Used by QRDQN core when constructing bootstrapped targets.
+        Parameters
+        ----------
+        obs : Any
+            Observation input, same conventions as :meth:`quantiles_target`.
+
+        Returns
+        -------
+        q_values : torch.Tensor
+            Expected target Q-values with shape ``(B, A)``.
         """
-        return self.q_mean_from_quantiles(self.quantiles_target(obs))  # (B, A)
+        return self.q_mean_from_quantiles(self.quantiles_target(obs))
 
     # =============================================================================
     # Persistence
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export ctor kwargs in JSON-safe form.
+        Export constructor kwargs in a JSON-safe form.
+
+        Uses
+        ----
+        - Checkpoint metadata (reconstruction/debugging)
+        - Ray worker instantiation via :class:`PolicyFactorySpec`
 
         Notes
         -----
-        - `activation_fn` is stored as a string name so it can be reconstructed on Ray workers.
-        - `device` is included for convenience, but Ray worker factory will override to CPU.
+        - ``activation_fn`` is converted to a stable identifier using
+          ``self._activation_to_name`` because classes/functions are not
+          JSON-serializable.
+        - ``device`` is included for convenience; Ray worker factory overrides it to CPU.
+
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-serializable kwargs payload.
         """
         return {
             "obs_dim": int(self.obs_dim),
@@ -273,14 +335,21 @@ class QRDQNHead(QLearningHead):
 
     def save(self, path: str) -> None:
         """
-        Save head checkpoint.
+        Save a QR-DQN head checkpoint.
 
-        Saves:
-          - ctor kwargs (json-safe)
-          - online network weights
-          - target network weights
+        Parameters
+        ----------
+        path : str
+            Output path. Appends ``.pt`` if missing.
 
-        This makes the checkpoint self-contained and robust to restarts.
+        Notes
+        -----
+        The checkpoint contains:
+        - ``kwargs``   : JSON-safe constructor arguments
+        - ``q``        : online network state_dict
+        - ``q_target`` : target network state_dict
+
+        This makes the checkpoint self-contained for reconstruction and debugging.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -294,14 +363,18 @@ class QRDQNHead(QLearningHead):
 
     def load(self, path: str) -> None:
         """
-        Load head checkpoint.
+        Load a QR-DQN head checkpoint into the current instance.
 
-        Behavior
-        --------
-        - Always restores online weights.
-        - Restores target weights if present.
-          Otherwise, rebuilds target as a copy of online.
-        - Ensures target stays frozen + eval mode.
+        Parameters
+        ----------
+        path : str
+            Path to checkpoint saved by :meth:`save`. Appends ``.pt`` if missing.
+
+        Notes
+        -----
+        - Loads weights only; does not reconstruct a new object.
+        - Restores target weights if present; otherwise synchronizes target from online.
+        - Re-applies target freezing/eval invariants after load.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -324,13 +397,16 @@ class QRDQNHead(QLearningHead):
     # =============================================================================
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Return Ray policy factory specification.
+        Return a Ray-friendly factory specification for this head.
 
-        The spec includes:
-          - entrypoint: module-level factory function
-          - kwargs: JSON-safe ctor kwargs for rebuilding the head on workers
+        Returns
+        -------
+        PolicyFactorySpec
+            Spec containing:
+            - ``entrypoint`` : module-level factory function (pickle/import friendly)
+            - ``kwargs``     : JSON-safe constructor kwargs used by the factory
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_qrdqn_head_worker_policy),
-            kwargs=self._export_kwargs_json_safe(),  # NOTE: ensure this method exists (typo risk)
+            entrypoint=_make_entrypoint(build_qrdqn_head_worker_policy),
+            kwargs=self._export_kwargs_json_safe(),
         )

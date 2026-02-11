@@ -7,36 +7,58 @@ import torch.nn as nn
 
 from model_free.common.networks.policy_networks import DiscretePolicyNetwork
 from model_free.common.networks.q_networks import QNetwork, DoubleQNetwork
-from model_free.common.utils.ray_utils import PolicyFactorySpec, make_entrypoint, resolve_activation_fn
+from model_free.common.utils.ray_utils import (
+    PolicyFactorySpec,
+    _make_entrypoint,
+    _resolve_activation_fn,
+)
 from model_free.common.policies.base_head import OffPolicyDiscreteActorCriticHead
 
 
 # =============================================================================
-# Ray worker factory (MUST be module-level for your entrypoint resolver)
+# Ray worker factory (MUST be module-level for entrypoint resolver)
 # =============================================================================
 def build_acer_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build an ACERHead instance on CPU.
+    Build an :class:`ACERHead` instance on the Ray worker side (CPU-only).
 
-    Why this exists
-    ---------------
-    In Ray, remote worker processes often reconstruct policies from a serialized
-    "factory spec" (entrypoint + kwargs). The entrypoint must be module-level so
-    it is importable by name in a separate process.
+    This function exists to support Ray-style policy reconstruction, where remote
+    workers rebuild a policy from a serialized "factory spec" consisting of:
 
-    Notes
-    -----
-    - Forces `device="cpu"` to keep Ray workers lightweight and avoid GPU contention.
-    - `activation_fn` may be provided as string/None in kwargs; it is resolved here.
-    - Returned module is put into inference mode via set_training(False) (best-effort).
+    - an importable module-level entrypoint (this function)
+    - a JSON-serializable ``kwargs`` payload
+
+    Parameters
+    ----------
+    **kwargs : Any
+        Keyword arguments forwarded to :class:`ACERHead`.
+
+        Notes
+        -----
+        - ``device`` is forcibly overridden to ``"cpu"`` to avoid GPU contention
+          or accidental device placement on worker processes.
+        - ``activation_fn`` may arrive as ``None`` or a string name; it is resolved
+          into a PyTorch activation constructor via ``_resolve_activation_fn``.
+
+    Returns
+    -------
+    torch.nn.Module
+        The constructed head on CPU. A best-effort call to
+        ``head.set_training(False)`` is made to put the module into inference
+        behavior (depending on the base head implementation).
+
+    See Also
+    --------
+    ACERHead.get_ray_policy_factory_spec :
+        Produces the corresponding Ray-friendly factory spec.
     """
     kwargs = dict(kwargs)
 
     # Force CPU on Ray worker side (avoid accidental GPU allocation).
     kwargs["device"] = "cpu"
 
-    # activation_fn can be a name/string; resolve to actual nn.Module class.
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    # activation_fn can be a name/string; resolve to actual nn.Module constructor.
+    kwargs["activation_fn"] = _resolve_activation_fn(kwargs.get("activation_fn", None))
 
     head = ACERHead(**kwargs).to("cpu")
     head.set_training(False)
@@ -48,35 +70,85 @@ def build_acer_head_worker_policy(**kwargs: Any) -> nn.Module:
 # =============================================================================
 class ACERHead(OffPolicyDiscreteActorCriticHead):
     """
-    ACER Head (Discrete Actor + Q Critic + Target Critic)
+    Discrete ACER head: stochastic actor + Q critic + target critic.
 
-    Overview
+    This head bundles the network components typically required for
+    off-policy discrete actor-critic methods (including ACER-style training):
+
+    - **Actor**: a categorical policy :math:`\\pi(a\\mid s)`
+    - **Critic**: an action-value function :math:`Q(s,a)`
+    - **Target critic**: a delayed copy :math:`Q_{\\text{targ}}(s,a)` used to
+      stabilize bootstrapped targets
+
+    The head is designed to be "algorithm-agnostic" at the network level:
+    ACER-specific training (importance sampling, retrace, truncated IS, etc.)
+    is expected to live in your algorithm/core update logic, while the head
+    provides the neural building blocks and utilities.
+
+    Parameters
+    ----------
+    obs_dim : int
+        Observation (state) vector dimension :math:`d_s`.
+    n_actions : int
+        Number of discrete actions :math:`|\\mathcal{A}|`.
+    hidden_sizes : Sequence[int], default=(256, 256)
+        Hidden layer widths for both actor and critic MLPs.
+    activation_fn : Any, default=torch.nn.ReLU
+        Activation constructor (e.g., ``nn.ReLU``) used in MLP blocks.
+
+        Notes
+        -----
+        - This value may also be provided as a string name when reconstructed
+          by Ray; in that case it should be resolved before instantiation via
+          ``_resolve_activation_fn``.
+    dueling_mode : bool, default=False
+        If ``True`` and supported by your critic implementation, enables
+        dueling Q architecture:
+
+        .. math::
+            Q(s,a) = V(s) + A(s,a) - \\frac{1}{|\\mathcal{A}|} \\sum_{a'} A(s,a')
+
+    double_q : bool, default=True
+        If ``True``, uses a double Q critic (two independent Q estimators) which
+        is commonly used to reduce overestimation bias in TD targets.
+    init_type : str, default="orthogonal"
+        Weight initialization strategy string forwarded to the underlying
+        network constructors (actor/critic). The accepted values depend on
+        your network implementations.
+    gain : float, default=1.0
+        Initialization gain forwarded to network constructors.
+    bias : float, default=0.0
+        Bias initialization value forwarded to network constructors.
+    device : str or torch.device, default=("cuda" if available else "cpu")
+        Device used for the online networks. The Ray worker factory will override
+        this to CPU regardless of what is saved in a checkpoint.
+
+    Attributes
+    ----------
+    actor : DiscretePolicyNetwork
+        Categorical policy network producing action logits or probabilities
+        depending on your implementation.
+    critic : QNetwork or DoubleQNetwork
+        Online critic network :math:`Q(s,a)`.
+    critic_target : QNetwork or DoubleQNetwork
+        Target critic network :math:`Q_{\\text{targ}}(s,a)`, synchronized from the
+        online critic at initialization and then updated via hard/soft update.
+
+    Notes
+    -----
+    Inherited utilities from ``OffPolicyDiscreteActorCriticHead`` (names may vary
+    by your base implementation):
+
+    - device management and tensor conversion helpers (e.g., batching)
+    - ``set_training(training: bool)`` to toggle train/eval behavior
+    - target-network helpers such as:
+      ``hard_update(dst, src)``, ``freeze_target(module)``,
+      and optionally ``hard_update_target()`` / ``soft_update_target(tau)``
+
+    See Also
     --------
-    This head bundles:
-      - A discrete stochastic actor π(a|s) (categorical policy)
-      - An action-value critic Q(s,a) (either single Q or Double Q)
-      - A target critic Q_target(s,a) for stable off-policy targets
-
-    Inherited base functionality (from OffPolicyActorCriticHead)
-    ------------------------------------------------------------
-    The base head typically provides:
-      - `device` management
-      - `_to_tensor_batched(x)` utilities that ensure (B, dim) tensor shapes
-      - `set_training(training: bool)` to switch train/eval behavior
-      - `act(...)` helper (depending on your base class)
-      - target-network utilities like:
-          * hard_update(dst, src)
-          * freeze_target(module)
-          * hard_update_target() / soft_update_target(tau)
-        (Exact names depend on your base implementation.)
-
-    ACER-specific helpers
-    ---------------------
-    - dist(obs)  -> returns a categorical distribution object
-    - logp(obs, action) -> log π(a|s), shape (B, 1)
-    - probs(obs) -> π(a|s), shape (B, A)
-    - save/load for persistence
-    - get_ray_policy_factory_spec() for Ray reconstruction
+    build_acer_head_worker_policy :
+        Ray worker-side entrypoint for reconstruction.
     """
 
     def __init__(
@@ -93,7 +165,6 @@ class ACERHead(OffPolicyDiscreteActorCriticHead):
         bias: float = 0.0,
         device: Union[str, th.device] = "cuda" if th.cuda.is_available() else "cpu",
     ) -> None:
-        # Base head stores the device and provides shared utilities.
         super().__init__(device=device)
 
         # ---------------------------------------------------------------------
@@ -113,9 +184,6 @@ class ACERHead(OffPolicyDiscreteActorCriticHead):
 
         # ---------------------------------------------------------------------
         # Actor: discrete policy network π(a|s)
-        #
-        # Expected output:
-        # - logits over actions or a distribution wrapper internally
         # ---------------------------------------------------------------------
         self.actor = DiscretePolicyNetwork(
             obs_dim=self.obs_dim,
@@ -128,80 +196,63 @@ class ACERHead(OffPolicyDiscreteActorCriticHead):
         ).to(self.device)
 
         # ---------------------------------------------------------------------
-        # Critic: Q(s,a) and target Q_target(s,a)
-        #
-        # double_q=True:
-        #   - use DoubleQNetwork (two independent Q heads)
-        #   - reduces positive bias in TD targets (typical Double Q motivation)
-        #
-        # dueling_mode=True:
-        #   - if supported by your QNetwork implementation, uses dueling architecture:
-        #       Q(s,a) = V(s) + A(s,a) - mean_a A(s,a)
+        # Critic: Q(s,a) + target Q_target(s,a)
         # ---------------------------------------------------------------------
-        if self.double_q:
-            self.critic = DoubleQNetwork(
-                state_dim=self.obs_dim,
-                action_dim=self.n_actions,
-                hidden_sizes=self.hidden_sizes,
-                activation_fn=self.activation_fn,
-                dueling_mode=self.dueling_mode,
-                init_type=self.init_type,
-                gain=self.gain,
-                bias=self.bias,
-            ).to(self.device)
+        CriticCls = DoubleQNetwork if self.double_q else QNetwork
 
-            self.critic_target = DoubleQNetwork(
-                state_dim=self.obs_dim,
-                action_dim=self.n_actions,
-                hidden_sizes=self.hidden_sizes,
-                activation_fn=self.activation_fn,
-                dueling_mode=self.dueling_mode,
-                init_type=self.init_type,
-                gain=self.gain,
-                bias=self.bias,
-            ).to(self.device)
-        else:
-            self.critic = QNetwork(
-                state_dim=self.obs_dim,
-                action_dim=self.n_actions,
-                hidden_sizes=self.hidden_sizes,
-                activation_fn=self.activation_fn,
-                dueling_mode=self.dueling_mode,
-                init_type=self.init_type,
-                gain=self.gain,
-                bias=self.bias,
-            ).to(self.device)
+        self.critic = CriticCls(
+            state_dim=self.obs_dim,
+            action_dim=self.n_actions,
+            hidden_sizes=self.hidden_sizes,
+            activation_fn=self.activation_fn,
+            dueling_mode=self.dueling_mode,
+            init_type=self.init_type,
+            gain=self.gain,
+            bias=self.bias,
+        ).to(self.device)
 
-            self.critic_target = QNetwork(
-                state_dim=self.obs_dim,
-                action_dim=self.n_actions,
-                hidden_sizes=self.hidden_sizes,
-                activation_fn=self.activation_fn,
-                dueling_mode=self.dueling_mode,
-                init_type=self.init_type,
-                gain=self.gain,
-                bias=self.bias,
-            ).to(self.device)
+        self.critic_target = CriticCls(
+            state_dim=self.obs_dim,
+            action_dim=self.n_actions,
+            hidden_sizes=self.hidden_sizes,
+            activation_fn=self.activation_fn,
+            dueling_mode=self.dueling_mode,
+            init_type=self.init_type,
+            gain=self.gain,
+            bias=self.bias,
+        ).to(self.device)
 
         # ---------------------------------------------------------------------
-        # Initialize target critic weights from online critic, then freeze it.
-        # This ensures Q_target starts identical and is updated only via
-        # hard/soft updates (not by gradient descent).
+        # Initialize target critic from online critic, then freeze it.
         # ---------------------------------------------------------------------
         self.hard_update(self.critic_target, self.critic)
         self.freeze_target(self.critic_target)
-    
+
     # =============================================================================
     # Persistence
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export constructor kwargs in a JSON-safe format.
+        Export constructor kwargs in a JSON-serializable form.
+
+        This payload is intended to be safe for:
+        - saving alongside checkpoints
+        - sending across processes (e.g., Ray workers)
+
+        Returns
+        -------
+        dict
+            JSON-safe kwargs sufficient to reconstruct this head. Notably:
+
+            - ``activation_fn`` is converted into a stable string name via the
+              base helper ``_activation_to_name``.
+            - ``device`` is stored as a string, but Ray worker reconstruction
+              will override it to CPU.
 
         Notes
         -----
-        - activation_fn must be converted to a stable string name.
-        - device is stored as string, but worker-side factory will override to "cpu".
+        The base head is expected to provide ``_activation_to_name``. If it does
+        not, you should implement a stable mapping in this class.
         """
         return {
             "obs_dim": int(self.obs_dim),
@@ -218,15 +269,23 @@ class ACERHead(OffPolicyDiscreteActorCriticHead):
 
     def save(self, path: str) -> None:
         """
-        Save actor/critic/target weights plus minimal constructor kwargs.
+        Save actor/critic/target parameters and minimal reconstruction kwargs.
 
-        Format
-        ------
-        Uses torch.save with a dict payload:
-          - kwargs         : json-safe ctor args (enough to reconstruct)
-          - actor          : actor.state_dict()
-          - critic         : critic.state_dict()
-          - critic_target  : target critic state_dict()
+        Parameters
+        ----------
+        path : str
+            Output path. If ``.pt`` is not present, it is appended.
+
+        Notes
+        -----
+        The checkpoint is stored via ``torch.save`` as a dict with keys:
+
+        - ``"kwargs"``: JSON-safe constructor args (for reconstruction)
+        - ``"actor"``: actor ``state_dict()``
+        - ``"critic"``: critic ``state_dict()``
+        - ``"critic_target"``: target critic ``state_dict()``
+
+        This format is intentionally minimal and does not include optimizer state.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -241,13 +300,26 @@ class ACERHead(OffPolicyDiscreteActorCriticHead):
 
     def load(self, path: str) -> None:
         """
-        Load actor/critic/target weights from a checkpoint.
+        Load actor/critic/target parameters from a checkpoint.
+
+        Parameters
+        ----------
+        path : str
+            Checkpoint path produced by :meth:`save`. If ``.pt`` is not present,
+            it is appended.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint payload format is unrecognized.
 
         Notes
         -----
-        - Loads onto current self.device (map_location=self.device).
-        - If q_target is missing in checkpoint, it is refreshed from online critic.
-        - Target critic is frozen after loading (to prevent optimizer updates).
+        - Loads onto ``self.device`` via ``map_location=self.device``.
+        - If ``critic_target`` is absent in the checkpoint, the target network is
+          refreshed from the online critic via ``hard_update_target()``.
+        - After loading, the target critic is frozen and placed in eval mode to
+          prevent optimizer updates and stabilize target computation.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -259,14 +331,13 @@ class ACERHead(OffPolicyDiscreteActorCriticHead):
         self.actor.load_state_dict(ckpt["actor"])
         self.critic.load_state_dict(ckpt["critic"])
 
-        # If target weights exist, load them; otherwise sync from online critic.
         if ckpt.get("critic_target", None) is not None:
             self.critic_target.load_state_dict(ckpt["critic_target"])
             self.freeze_target(self.critic_target)
         else:
+            # Base head is expected to implement this convenience method.
             self.hard_update_target()
 
-        # Ensure target is in eval mode.
         self.critic_target.eval()
 
     # =============================================================================
@@ -274,14 +345,24 @@ class ACERHead(OffPolicyDiscreteActorCriticHead):
     # =============================================================================
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Return a Ray-friendly policy factory spec (entrypoint + kwargs).
+        Build a Ray-friendly factory spec for policy reconstruction.
+
+        Returns
+        -------
+        PolicyFactorySpec
+            A factory specification containing:
+
+            - ``entrypoint``: importable module-level entrypoint for Ray workers
+            - ``kwargs``: JSON-safe constructor args (see ``_export_kwargs_json_safe``)
 
         Notes
         -----
-        - entrypoint must be importable by Ray workers (module-level function).
-        - kwargs must be JSON-safe, since it is typically serialized across processes.
+        - The entrypoint **must** be module-level for Ray to import it in a
+          separate process.
+        - The kwargs must be JSON-safe because Ray typically serializes this
+          payload for worker creation.
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_acer_head_worker_policy),
-            kwargs=self._export_ctor_kwargs_json_safe(),
+            entrypoint=_make_entrypoint(build_acer_head_worker_policy),
+            kwargs=self._export_kwargs_json_safe(),
         )

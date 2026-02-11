@@ -5,63 +5,143 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 import torch as th
 import torch.nn.functional as F
 
-from model_free.common.utils.common_utils import to_scalar, to_column
+from model_free.common.utils.common_utils import _to_scalar, _to_column
 from model_free.common.policies.base_core import ActorCriticCore
-from model_free.common.utils.policy_utils import get_per_weights
+from model_free.common.utils.policy_utils import _get_per_weights
 
 
 class ACERCore(ActorCriticCore):
     """
-    ACER Update Engine (1-step, discrete) implemented on top of ActorCriticCore.
+    ACER update engine for discrete action spaces (single-step / TD(0) variant).
 
-    Summary
+    This core implements a practical, 1-step ACER-style update on top of
+    :class:`~model_free.common.policies.base_core.ActorCriticCore`.
+
+    The update decomposes into:
+
+    1) **Critic (TD regression)**
+
+       Uses a TD(0)-style target:
+
+       .. math::
+           y = r + \\gamma (1-d) V_\\pi(s')
+
+       where:
+
+       .. math::
+           V_\\pi(s') = \\sum_a \\pi(a\\mid s') Q_{\\text{targ}}(s', a)
+
+       The target critic is used for stability.
+
+    2) **Actor (off-policy policy gradient)**
+
+       Uses truncated importance sampling (IS):
+
+       .. math::
+           \\rho = \\frac{\\pi(a\\mid s)}{\\mu(a\\mid s)}, \\quad
+           c = \\min(\\rho, \\bar c)
+
+       and a sampled-action loss:
+
+       .. math::
+           L_{\\text{main}} = -\\mathbb{E}[c\\, A(s,a)\\, \\log \\pi(a\\mid s)]
+
+       with:
+
+       .. math::
+           A(s,a) = Q(s,a) - V_\\pi(s)
+
+    3) **Optional bias correction (requires behavior probs)**
+
+       If :math:`\\mu(a\\mid s)` is available for *all* actions, a correction term
+       can be added to account for truncation (implementation-specific details).
+
+    4) **Optional entropy regularization**
+
+       Adds:
+
+       .. math::
+           L_{\\text{ent}} = -\\beta\\, \\mathbb{E}[H(\\pi(\\cdot\\mid s))]
+
+    Parameters
+    ----------
+    head : Any
+        Policy head object (duck-typed). Expected to provide at least:
+
+        - ``head.actor`` : ``nn.Module`` producing logits (or compatible API)
+        - ``head.critic`` : critic module (online)
+        - ``head.critic_target`` : critic module (target), or ``head.q_target`` in older naming
+        - ``head.logp(obs, act) -> Tensor`` : log π(a|s), shape (B,1) or (B,)
+        - ``head.probs(obs) -> Tensor`` : π(·|s), shape (B,A)
+        - ``head.q_values(obs, reduce=...) -> Tensor`` : Q(s,·), shape (B,A)
+        - ``head.q_values_target(obs, reduce=...) -> Tensor`` : Q_targ(s,·), shape (B,A)
+
+        Notes
+        -----
+        Your codebase appears to use ``critic`` / ``critic_target`` naming in the head,
+        but this core also checks ``q_target`` once for freezing compatibility.
+
+    gamma : float, default=0.99
+        Discount factor :math:`\\gamma`. Must satisfy ``0 <= gamma < 1``.
+    c_bar : float, default=10.0
+        Truncation threshold :math:`\\bar c` for importance weights. Must be > 0.
+    entropy_coef : float, default=0.0
+        Entropy regularization coefficient. Set to 0 to disable.
+    critic_is : bool, default=False
+        If ``True``, applies truncated IS weights to critic loss as well.
+        (Not always used in ACER variants; keep ``False`` unless you intend it.)
+
+    target_update_interval : int, default=1
+        Update cadence in optimizer steps. If 0, disables target updates.
+    tau : float, default=0.005
+        Soft update coefficient. ``tau=1`` corresponds to a hard copy.
+
+    actor_optim_name, critic_optim_name : str
+        Optimizer identifiers handled by :class:`ActorCriticCore`.
+    actor_lr, critic_lr : float
+        Learning rates.
+    actor_weight_decay, critic_weight_decay : float
+        Weight decay values.
+    actor_sched_name, critic_sched_name : str
+        Scheduler identifiers handled by :class:`ActorCriticCore`.
+    total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones
+        Scheduler configuration forwarded to the base core.
+
+    max_grad_norm : float, default=0.0
+        Global norm clipping threshold. If 0, clipping is disabled.
+    use_amp : bool, default=False
+        Enables torch AMP for mixed precision.
+    per_eps : float, default=1e-6
+        Small epsilon used by PER integrations (core-side proxy only).
+
+    Batch Contract
+    --------------
+    The input ``batch`` must provide:
+
+    - ``batch.observations`` : Tensor (B, obs_dim)
+    - ``batch.actions`` : Tensor (B,) or (B,1)
+    - ``batch.rewards`` : Tensor (B,) or (B,1)
+    - ``batch.next_observations`` : Tensor (B, obs_dim)
+    - ``batch.dones`` : Tensor (B,) or (B,1)
+
+    For off-policy ratios, behavior log-prob is required via:
+
+    - ``batch.behavior_logp`` or fallback ``batch.logp`` : log μ(a|s), (B,) or (B,1)
+
+    Optional bias correction requires:
+
+    - ``batch.behavior_probs`` : μ(·|s), Tensor (B, A)
+
+    Optional PER support:
+    - PER fields as expected by ``_get_per_weights(...)``
+
+    Returns
     -------
-    This core performs a single-step off-policy actor-critic update for discrete
-    actions in the ACER style:
-      - Critic: TD(0) regression toward V_pi(s') computed via target Q and current policy
-      - Actor: truncated importance sampling (IS) policy gradient
-      - Optional: bias-correction term if behavior action probabilities are available
-      - Optional: entropy regularization
-
-    Expected head interface (duck-typed)
-    ------------------------------------
-    Attributes:
-      - head.actor: nn.Module
-          Discrete policy network. Typically supports:
-            - actor(obs) -> logits, or
-            - actor.get_dist(obs) -> categorical distribution
-      - head.q: nn.Module
-          Q-network for Q(s, a). Depending on head, q_values(obs) returns (B, A).
-      - head.q_target: nn.Module
-          Target Q-network Q'(s, a) used to form stable TD targets.
-      - head.device: torch.device
-
-    Methods:
-      - head.logp(obs, action) -> Tensor (B, 1)
-          Log-prob under current policy π of the sampled action.
-      - head.probs(obs) -> Tensor (B, A)
-          Action probabilities π(a|s).
-      - head.q_values(obs) -> Tensor (B, A)
-          Q(s, ·) under the current critic. If double-Q, head may already apply
-          min(Q1, Q2) or a similar aggregation.
-      - head.q_values_target(obs) -> Tensor (B, A)
-          Q'(s, ·) under the target critic (again, head may aggregate if double-Q).
-
-    Off-policy info expected in batch
-    ---------------------------------
-      - batch.behavior_logp or batch.logp : log μ(a|s), shape (B,) or (B,1)
-        (μ is the behavior policy that generated the data)
-
-    Optional for bias correction
-    ----------------------------
-      - batch.behavior_probs : μ(a|s) probabilities, shape (B, A)
-        If present, ACER can include the bias-correction term that accounts for
-        truncation in importance weights across all actions.
-
-    PER support (optional)
-    ----------------------
-      - batch may contain prioritized replay fields (weights/indices/etc.).
-      - get_per_weights(...) returns per-sample weights w (B,1) or None.
+    dict
+        Scalar metrics suitable for logging. This implementation also returns a
+        NumPy array under ``"per/td_errors"`` (useful for PER), which is not a
+        float. If you want strict typing, change the return type to ``Dict[str, Any]``
+        or log only summary statistics here.
     """
 
     def __init__(
@@ -108,11 +188,6 @@ class ACERCore(ActorCriticCore):
         # -----------------------------
         per_eps: float = 1e-6,
     ) -> None:
-        # ActorCriticCore sets up:
-        # - actor_opt / critic_opt
-        # - actor_sched / critic_sched
-        # - AMP scaler if enabled
-        # - self.device from head
         super().__init__(
             head=head,
             use_amp=use_amp,
@@ -133,27 +208,37 @@ class ACERCore(ActorCriticCore):
             milestones=milestones,
         )
 
-        # Store ACER hyperparameters
+        # -----------------------------
+        # ACER hyperparameters
+        # -----------------------------
         self.gamma = float(gamma)
         self.c_bar = float(c_bar)
         self.entropy_coef = float(entropy_coef)
         self.critic_is = bool(critic_is)
 
-        # Target update configuration
+        # -----------------------------
+        # Target update config
+        # -----------------------------
         self.target_update_interval = int(target_update_interval)
         self.tau = float(tau)
 
-        # Gradient clipping / PER
+        # -----------------------------
+        # Grad / PER
+        # -----------------------------
         self.max_grad_norm = float(max_grad_norm)
         self.per_eps = float(per_eps)
 
-        # Defensive validation (fail fast on obvious misconfiguration)
+        # -----------------------------
+        # Defensive validation
+        # -----------------------------
         if not (0.0 <= self.gamma < 1.0):
             raise ValueError(f"gamma must be in [0,1), got {self.gamma}")
         if self.c_bar <= 0.0:
             raise ValueError(f"c_bar must be > 0, got {self.c_bar}")
         if self.target_update_interval < 0:
-            raise ValueError(f"target_update_interval must be >= 0, got {self.target_update_interval}")
+            raise ValueError(
+                f"target_update_interval must be >= 0, got {self.target_update_interval}"
+            )
         if not (0.0 <= self.tau <= 1.0):
             raise ValueError(f"tau must be in [0,1], got {self.tau}")
         if self.max_grad_norm < 0.0:
@@ -161,8 +246,14 @@ class ACERCore(ActorCriticCore):
         if self.per_eps < 0.0:
             raise ValueError(f"per_eps must be >= 0, got {self.per_eps}")
 
-        # Ensure the target critic is frozen once (core owns target-freeze responsibility).
-        q_target = getattr(self.head, "q_target", None)
+        # Freeze target critic once (core owns "target is non-trainable" policy).
+        #
+        # Naming note:
+        # - newer heads: critic_target
+        # - legacy compatibility: q_target
+        q_target = getattr(self.head, "critic_target", None)
+        if q_target is None:
+            q_target = getattr(self.head, "q_target", None)
         if q_target is not None:
             self._freeze_target(q_target)
 
@@ -171,22 +262,37 @@ class ACERCore(ActorCriticCore):
     # =============================================================================
     def _get_behavior_logp(self, batch: Any) -> th.Tensor:
         """
-        Extract behavior log-prob log μ(a|s) from batch and normalize to shape (B, 1).
+        Extract behavior log-probabilities log μ(a|s) and normalize to (B, 1).
 
-        Accepted fields
-        ---------------
-        - batch.behavior_logp
-        - batch.logp (fallback)
+        Parameters
+        ----------
+        batch : Any
+            Batch object providing either ``behavior_logp`` or ``logp``.
+
+            Accepted fields
+            ---------------
+            - ``batch.behavior_logp`` : Tensor (B,) or (B,1)
+            - ``batch.logp`` : Tensor (B,) or (B,1) (fallback)
 
         Returns
         -------
-        th.Tensor
-            Behavior log-prob tensor of shape (B, 1) on self.device.
+        torch.Tensor
+            Behavior log-probabilities on ``self.device`` with shape (B, 1).
 
         Raises
         ------
         ValueError
-            If behavior log-prob is missing or the final shape is not (B,1).
+            If neither behavior log-prob field exists, or if the resulting tensor
+            does not have shape (B, 1).
+
+        Notes
+        -----
+        ACER's importance sampling ratio uses:
+
+        .. math::
+            \\rho = \\exp(\\log \\pi(a\\mid s) - \\log \\mu(a\\mid s))
+
+        Therefore log μ(a|s) is required for the sampled action.
         """
         if hasattr(batch, "behavior_logp"):
             log_mu = batch.behavior_logp
@@ -197,7 +303,7 @@ class ACERCore(ActorCriticCore):
 
         log_mu = log_mu.to(self.device)
 
-        # Normalize (B,) -> (B,1) for consistent arithmetic with log_pi.
+        # Normalize (B,) -> (B,1)
         if log_mu.dim() == 1:
             log_mu = log_mu.unsqueeze(-1)
 
@@ -208,34 +314,42 @@ class ACERCore(ActorCriticCore):
 
     def _get_logits(self, obs_t: th.Tensor) -> th.Tensor:
         """
-        Best-effort logits extraction for stable log-softmax / entropy computations.
+        Retrieve policy logits for stable entropy / log-softmax computations.
+
+        This method is intentionally "best-effort" to support multiple head/actor APIs.
 
         Preference order
         ---------------
-        1) head.dist(obs).logits
-        2) head.logits(obs)              (if head provides a direct logits method)
-        3) head.actor(obs)               (assume actor forward returns logits)
+        1) ``head.dist(obs).logits`` (if ``head.dist`` exists)
+        2) ``head.logits(obs)``      (if head exposes logits directly)
+        3) ``head.actor(obs)``       (assume actor forward returns logits)
 
         Parameters
         ----------
-        obs_t : th.Tensor
-            Batched observations tensor on self.device.
+        obs_t : torch.Tensor
+            Batched observations tensor on ``self.device`` with shape (B, obs_dim).
 
         Returns
         -------
-        th.Tensor
-            Logits tensor of shape (B, A).
+        torch.Tensor
+            Logits tensor with shape (B, A), where A is the number of actions.
+
+        Notes
+        -----
+        - This function does not detach; call-sites should control autograd context.
+        - If your actor returns a distribution object instead of logits, implement
+          ``head.dist`` or ``head.logits`` for clarity.
         """
-        d = getattr(self.head, "dist", None)
-        if callable(d):
-            dist = self.head.dist(obs_t)
+        dist_fn = getattr(self.head, "dist", None)
+        if callable(dist_fn):
+            dist = dist_fn(obs_t)
             logits = getattr(dist, "logits", None)
             if logits is not None:
                 return logits
 
-        fn = getattr(self.head, "logits", None)
-        if callable(fn):
-            return fn(obs_t)
+        logits_fn = getattr(self.head, "logits", None)
+        if callable(logits_fn):
+            return logits_fn(obs_t)
 
         return self.head.actor(obs_t)
 
@@ -244,80 +358,96 @@ class ACERCore(ActorCriticCore):
     # =============================================================================
     def update_from_batch(self, batch: Any) -> Dict[str, float]:
         """
-        Perform one ACER update step from a replay batch.
+        Perform one ACER update using a replay batch.
+
+        Parameters
+        ----------
+        batch : Any
+            Replay batch providing tensors described in the class docstring
+            (observations, actions, rewards, next_observations, dones, behavior_logp).
 
         Returns
         -------
         Dict[str, float]
-            Scalar metrics for logging. (Note: this function currently also returns
-            a NumPy array under "per/td_errors"; strictly speaking that is not float.)
+            Logging metrics. This function also includes ``"per/td_errors"`` as a
+            NumPy array (not a float), despite the annotation. If you want strict
+            typing, change the return type to ``Dict[str, Any]`` or log only scalar
+            summaries for TD errors.
+
+        Raises
+        ------
+        ValueError
+            If required batch fields are missing or have incompatible shapes.
+
+        Notes
+        -----
+        The update order is:
+        1) critic step
+        2) actor step
+        3) scheduler steps (if configured)
+        4) optional target update
+        5) optional TD-error export for PER
         """
-        # Internal update counter (typically used for schedulers/target update cadence).
         self._bump()
 
         # ---------------------------------------------------------------------
         # Move batch tensors to device and normalize shapes
         # ---------------------------------------------------------------------
-        obs = batch.observations.to(self.device)                  # (B, obs_dim)
-        act = batch.actions.to(self.device).long()                # (B,) or (B,1) -> used as indices
-        rew = to_column(batch.rewards.to(self.device))               # (B,1)
-        next_obs = batch.next_observations.to(self.device)        # (B, obs_dim)
-        done = to_column(batch.dones.to(self.device))                # (B,1), 1 if terminal else 0
+        obs = batch.observations.to(self.device)  # (B, obs_dim)
+
+        # Actions are indices for gather; normalize to (B,) long then view(-1,1).
+        act = batch.actions.to(self.device)
+        if act.dim() == 2 and act.shape[1] == 1:
+            act = act.squeeze(1)
+        act = act.long()  # (B,)
+
+        rew = _to_column(batch.rewards.to(self.device))  # (B,1)
+        next_obs = batch.next_observations.to(self.device)  # (B, obs_dim)
+        done = _to_column(batch.dones.to(self.device))  # (B,1)
 
         B = int(obs.shape[0])
 
-        # PER weights (if batch carries PER fields). Returns (B,1) or None.
-        w = get_per_weights(batch, B, device=self.device)
+        # PER weights (if present). Shape (B,1) or None.
+        w = _get_per_weights(batch, B, device=self.device)
 
         # ---------------------------------------------------------------------
-        # Importance sampling ratios between target policy π and behavior μ
+        # Importance sampling ratios: ρ = π(a|s)/μ(a|s)
         # ---------------------------------------------------------------------
-        log_mu = self._get_behavior_logp(batch)                   # log μ(a|s), (B,1)
+        log_mu = self._get_behavior_logp(batch)  # (B,1)
 
-        log_pi = self.head.logp(obs, act)                         # log π(a|s), expected (B,1)
+        log_pi = self.head.logp(obs, act)  # expected (B,1) or (B,)
         if log_pi.dim() == 1:
             log_pi = log_pi.unsqueeze(-1)
         if log_pi.dim() != 2 or log_pi.shape[1] != 1:
             raise ValueError(f"head.logp must return (B,1) or (B,), got {tuple(log_pi.shape)}")
 
-        # ρ = π(a|s) / μ(a|s) = exp(log_pi - log_mu)
-        # Clamp for numerical safety.
-        rho = th.exp(log_pi - log_mu).clamp(max=1e6)              # (B,1)
-
-        # Truncated importance weight c = min(ρ, c_bar).
-        c = th.clamp(rho, max=self.c_bar)                         # (B,1)
+        rho = th.exp(log_pi - log_mu).clamp(max=1e6)  # (B,1)
+        c = th.clamp(rho, max=self.c_bar)  # (B,1)
 
         # ============================================================
-        # 1) Critic target: y = r + γ(1-d) * Vπ(s')
+        # 1) Target for critic: y = r + γ(1-d) * Vπ(s')
         #
-        # Vπ(s') = Σ_a π(a|s') * Q'(s',a)
-        # Uses target critic Q' for stability.
+        # Vπ(s') = Σ_a π(a|s') * Q_target(s',a)
         # ============================================================
         with th.no_grad():
-            pi_next = self.head.probs(next_obs)                             # (B,A)
-            q_next_t = self.head.q_values_target(next_obs, reduce="min")    # (B,A)
-            v_next_t = (pi_next * q_next_t).sum(dim=1, keepdim=True)        # (B,1)
-            target_q = rew + self.gamma * (1.0 - done) * v_next_t           # (B,1)
+            pi_next = self.head.probs(next_obs)  # (B,A)
+            q_next_t = self.head.q_values_target(next_obs, reduce="min")  # (B,A)
+            v_next_t = (pi_next * q_next_t).sum(dim=1, keepdim=True)  # (B,1)
+            target_q = rew + self.gamma * (1.0 - done) * v_next_t  # (B,1)
 
         # ============================================================
-        # 2) Critic update: minimize TD regression error
-        #
-        # loss = E[ 0.5 (y - Q(s,a))^2 ]
-        # Optionally: truncated IS on critic loss (critic_is)
-        # Optionally: multiply PER weights w
+        # 2) Critic update: TD regression (optionally IS-weighted, PER-weighted)
         # ============================================================
         def _critic_loss_and_td() -> Tuple[th.Tensor, th.Tensor]:
-            q_all = self.head.q_values(obs, reduce="min")         # (B,A) (grad-enabled)
-            q_sa = q_all.gather(1, act.view(-1, 1))               # (B,1)
-            td = (target_q - q_sa)                                # (B,1)
+            q_all = self.head.q_values(obs, reduce="min")  # (B,A) (grad-enabled)
+            q_sa = q_all.gather(1, act.view(-1, 1))  # (B,1)
+            td = target_q - q_sa  # (B,1)
 
-            loss_ps = 0.5 * td.pow(2)                             # (B,1)
+            loss_ps = 0.5 * td.pow(2)  # (B,1)
 
-            # Optional: apply truncated IS to the critic (not always used in ACER variants).
             if self.critic_is:
                 loss_ps = loss_ps * th.clamp(rho, max=self.c_bar)
 
-            # Optional: PER weights.
             if w is not None:
                 loss_ps = loss_ps * w
 
@@ -326,7 +456,6 @@ class ACERCore(ActorCriticCore):
         self.critic_opt.zero_grad(set_to_none=True)
 
         if self.use_amp:
-            # AMP branch: compute loss under autocast, scale gradients, then step optimizer.
             with th.cuda.amp.autocast(enabled=True):
                 critic_loss, td = _critic_loss_and_td()
             self.scaler.scale(critic_loss).backward()
@@ -347,32 +476,23 @@ class ACERCore(ActorCriticCore):
             self.critic_sched.step()
 
         # ============================================================
-        # 3) Advantage for actor: A(s,a) = Q(s,a) - V(s)
+        # 3) Advantage for actor: A(s,a) = Q(s,a) - Vπ(s)
         #
-        # Stop-grad Q to avoid backprop through critic during actor update.
+        # Compute under no_grad to avoid actor loss backprop into critic.
         # ============================================================
         with th.no_grad():
-            pi = self.head.probs(obs)                             # (B,A)
-            q_all_ng = self.head.q_values(obs, reduce="min")      # (B,A) (no_grad)
-            v_s = (pi * q_all_ng).sum(dim=1, keepdim=True)        # (B,1)
+            pi = self.head.probs(obs)  # (B,A)
+            q_all_ng = self.head.q_values(obs, reduce="min")  # (B,A)
+            v_s = (pi * q_all_ng).sum(dim=1, keepdim=True)  # (B,1)
 
-            q_sa_ng = q_all_ng.gather(1, act.view(-1, 1))         # (B,1)
-            adv_sa = q_sa_ng - v_s                                # (B,1)
+            q_sa_ng = q_all_ng.gather(1, act.view(-1, 1))  # (B,1)
+            adv_sa = q_sa_ng - v_s  # (B,1)
 
-            # Advantage for all actions (used by bias correction if enabled).
-            adv_all = q_all_ng - v_s                              # (B,A)
+            # Advantage over all actions (for bias correction when enabled).
+            adv_all = q_all_ng - v_s  # (B,A)
 
         # ============================================================
         # 4) Actor loss: truncated IS + optional bias correction + entropy
-        #
-        # Main term (sampled action):
-        #   L_main = - E[ c * A(s,a) * log π(a|s) ]
-        #
-        # Bias correction (requires μ(a|s) probs for all actions):
-        #   Uses weights w_bc = max(ρ(a) - c_bar, 0) and a correction term over actions.
-        #
-        # Entropy regularization:
-        #   L_ent = -entropy_coef * E[ H(π(·|s)) ]
         # ============================================================
         main_term = -(c * adv_sa * log_pi).mean()
 
@@ -380,23 +500,23 @@ class ACERCore(ActorCriticCore):
         correction_on = False
 
         if hasattr(batch, "behavior_probs"):
-            # Behavior policy probabilities μ(a|s) for all actions.
-            mu_probs = batch.behavior_probs.to(self.device)       # (B,A)
-            pi_probs = pi                                         # (B,A)
+            mu_probs = batch.behavior_probs.to(self.device)  # (B,A)
+            pi_probs = pi  # (B,A)
 
-            # ρ(a) for all actions; clamp for safety.
+            # ρ(a) for all actions.
             rho_all = (pi_probs / (mu_probs + 1e-8)).clamp(max=1e6)  # (B,A)
 
-            # Bias correction weights only apply where ρ(a) exceeds truncation threshold.
-            w_bc = th.clamp(rho_all - self.c_bar, min=0.0)        # (B,A)
+            # Weight only where truncation applies.
+            w_bc = th.clamp(rho_all - self.c_bar, min=0.0)  # (B,A)
 
-            # Need log π(a|s) for all actions; obtain stable logits path.
-            logits = self._get_logits(obs)                        # (B,A)
-            log_pi_all = F.log_softmax(logits, dim=-1)            # (B,A)
+            # log π(·|s) for all actions.
+            logits = self._get_logits(obs)  # (B,A)
+            log_pi_all = F.log_softmax(logits, dim=-1)  # (B,A)
 
-            # Correction term over actions (ACER-style):
-            # Negative sign for gradient ascent objective translated into loss minimization.
-            correction = -((w_bc * pi_probs * log_pi_all * adv_all).sum(dim=1, keepdim=True)).mean()
+            # Bias correction term (implementation follows your current convention).
+            correction = -(
+                (w_bc * pi_probs * log_pi_all * adv_all).sum(dim=1, keepdim=True)
+            ).mean()
             correction_on = True
 
         entropy_term = th.zeros((), device=self.device)
@@ -405,7 +525,6 @@ class ACERCore(ActorCriticCore):
             pi_probs2 = F.softmax(logits, dim=-1)
             log_pi_all2 = F.log_softmax(logits, dim=-1)
 
-            # Entropy H(π) = -Σ_a π(a) log π(a)
             entropy = -(pi_probs2 * log_pi_all2).sum(dim=-1, keepdim=True)  # (B,1)
             entropy_term = -self.entropy_coef * entropy.mean()
 
@@ -433,11 +552,7 @@ class ACERCore(ActorCriticCore):
             self.actor_sched.step()
 
         # ============================================================
-        # 5) Target update: Q' <- Q (hard/soft), then freeze remains in effect
-        #
-        # ActorCriticCore typically handles:
-        # - cadence via interval (target_update_interval)
-        # - hard vs soft via tau
+        # 5) Target update: critic_target <- critic (hard/soft)
         # ============================================================
         self._maybe_update_target(
             target=getattr(self.head, "critic_target", None),
@@ -447,23 +562,17 @@ class ACERCore(ActorCriticCore):
         )
 
         # ============================================================
-        # 6) PER priorities (optional): use |TD| as priority signal
+        # 6) TD errors for PER (optional): |TD|
         # ============================================================
         with th.no_grad():
             td_abs = td.abs().view(-1)  # (B,)
 
-        # NOTE:
-        # - This return type annotation says Dict[str, float], but "per/td_errors"
-        #   is a NumPy array. If you want strict typing, either:
-        #     a) drop it from return dict and set it on batch for PER,
-        #     b) change return type to Dict[str, Any],
-        #     c) log only scalar summary stats (mean/max) here.
         return {
-            "loss/critic": float(to_scalar(critic_loss)),
-            "loss/actor": float(to_scalar(actor_loss)),
-            "is/rho_mean": float(to_scalar(rho.mean())),
-            "is/c_mean": float(to_scalar(c.mean())),
-            "adv/mean": float(to_scalar(adv_sa.mean())),
+            "loss/critic": float(_to_scalar(critic_loss)),
+            "loss/actor": float(_to_scalar(actor_loss)),
+            "is/rho_mean": float(_to_scalar(rho.mean())),
+            "is/c_mean": float(_to_scalar(c.mean())),
+            "adv/mean": float(_to_scalar(adv_sa.mean())),
             "lr/actor": float(self.actor_opt.param_groups[0]["lr"]),
             "lr/critic": float(self.critic_opt.param_groups[0]["lr"]),
             "acer/correction_on": float(1.0 if correction_on else 0.0),
@@ -475,17 +584,26 @@ class ACERCore(ActorCriticCore):
     # =============================================================================
     def state_dict(self) -> Dict[str, Any]:
         """
-        Serialize core state.
+        Serialize core state (optimizers, schedulers, counters) plus ACER metadata.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Serializable state mapping.
+
+            The base :class:`ActorCriticCore` typically includes:
+            - actor/critic optimizer state
+            - actor/critic scheduler state (if enabled)
+            - AMP scaler state (if enabled)
+            - internal update counters / step trackers
+
+            This override appends ACER-specific hyperparameters as informational
+            metadata for debugging and inspection.
 
         Notes
         -----
-        ActorCriticCore state_dict typically already contains optimizer/scheduler state,
-        AMP scaler state, and internal update counters. This method appends ACER-specific
-        hyperparameters for inspection/debugging.
-
-        Important
-        ---------
-        Hyperparameters are constructor-owned; storing them here is informational.
+        Hyperparameters are constructor-owned; storing them here does not imply that
+        :meth:`load_state_dict` will override constructor values.
         """
         s = super().state_dict()
         s.update(
@@ -504,13 +622,20 @@ class ACERCore(ActorCriticCore):
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
-        Load core state.
+        Restore core state (optimizers/schedulers/counters) from a serialized mapping.
 
-        Policy
-        ------
-        - Delegates to ActorCriticCore for optimizer/scheduler/counter state restore.
-        - Does NOT silently override ctor-owned hyperparameters (gamma, c_bar, etc.).
-          If you want hyperparameter restore, do it explicitly at construction time.
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State dict produced by :meth:`state_dict`.
+
+        Notes
+        -----
+        - Delegates to :class:`ActorCriticCore` for restoring optimizer/scheduler/counter
+          state.
+        - Does **not** silently override constructor-owned hyperparameters (gamma, c_bar,
+          etc.). If you want hyperparameter restore, reconstruct the core with the desired
+          hyperparameters explicitly.
         """
         super().load_state_dict(state)
         return

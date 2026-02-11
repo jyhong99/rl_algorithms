@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch as th
 import torch.nn as nn
 
 from model_free.common.networks.policy_networks import ContinuousPolicyNetwork
 from model_free.common.networks.value_networks import StateActionValueNetwork
-from model_free.common.utils.ray_utils import PolicyFactorySpec, make_entrypoint, resolve_activation_fn
 from model_free.common.policies.base_head import OffPolicyContinuousActorCriticHead
+from model_free.common.utils.ray_utils import (
+    PolicyFactorySpec,
+    _make_entrypoint,
+    _resolve_activation_fn,
+)
 
 
 # =============================================================================
@@ -16,33 +20,51 @@ from model_free.common.policies.base_head import OffPolicyContinuousActorCriticH
 # =============================================================================
 def build_redq_head_worker_policy(**kwargs: Any) -> nn.Module:
     """
-    Ray worker-side factory: build a REDQHead instance on CPU.
+    Build a :class:`REDQHead` instance on a Ray worker (CPU-only).
 
-    Why this exists
-    ---------------
-    In Ray multi-process/multi-node rollouts, each worker must be able to
-    reconstruct the policy module from an "entrypoint + kwargs" specification.
-    Therefore this factory must be defined at module-level (picklable).
+    In Ray rollouts (multi-process / multi-node), worker processes frequently
+    reconstruct policy modules from a serialized "factory spec" containing:
 
-    Behavior / conventions
-    ----------------------
-    - Forces device="cpu" regardless of incoming kwargs to avoid GPU contention.
-    - Converts activation_fn from a serialized form (string/name) into a torch.nn class.
-    - Returns a fully constructed REDQHead with training mode set to eval-like behavior
-      for rollout usage (set_training(False)).
+    - an importable *module-level* entrypoint (this function)
+    - a JSON-serializable ``kwargs`` mapping
+
+    This function enforces worker-safe defaults and converts serialized fields
+    into their runtime forms.
+
+    Parameters
+    ----------
+    **kwargs : Any
+        Keyword arguments forwarded to :class:`REDQHead`.
+
+        Notes
+        -----
+        - ``device`` is forcibly overridden to ``"cpu"`` to avoid GPU contention
+          and accidental GPU allocation on rollout workers.
+        - ``activation_fn`` may arrive as a string (e.g., ``"relu"``); it is
+          resolved into an activation constructor via :func:`_resolve_activation_fn`.
+
+    Returns
+    -------
+    torch.nn.Module
+        Constructed :class:`REDQHead` placed on CPU and set to inference behavior
+        via ``set_training(False)`` (best-effort; depends on base class semantics).
+
+    See Also
+    --------
+    REDQHead.get_ray_policy_factory_spec :
+        Produces the factory spec that references this entrypoint.
     """
     kwargs = dict(kwargs)
 
-    # Force CPU for rollout workers (stable, cheap, avoids accidental GPU usage)
+    # Force CPU for rollout workers (stable, cheap, avoids accidental GPU usage).
     kwargs["device"] = "cpu"
 
-    # Convert activation spec (e.g. "relu") -> nn.ReLU
-    kwargs["activation_fn"] = resolve_activation_fn(kwargs.get("activation_fn", None))
+    # Convert activation spec (e.g. "relu") -> nn.ReLU.
+    kwargs["activation_fn"] = _resolve_activation_fn(kwargs.get("activation_fn", None))
 
     head = REDQHead(**kwargs).to("cpu")
 
-    # Rollout workers typically should not keep dropout/bn in train mode.
-    # Also target nets should always remain eval mode anyway.
+    # Rollout workers should not keep dropout/bn in train mode; targets are eval anyway.
     head.set_training(False)
     return head
 
@@ -51,39 +73,72 @@ def build_redq_head_worker_policy(**kwargs: Any) -> nn.Module:
 # REDQHead
 # =============================================================================
 class REDQHead(OffPolicyContinuousActorCriticHead):
-    """
-    REDQ Head (Actor + Critic Ensemble + Target Critic Ensemble).
+    r"""
+    REDQ head: stochastic actor + critic ensemble + target critic ensemble.
 
-    REDQ summary
-    ------------
-    REDQ uses:
-      - A stochastic actor (SAC-style squashed Gaussian policy)
-      - An ensemble of Q critics {Q_i} (online critics)
-      - A corresponding ensemble of target critics {Q_i^t}
+    REDQ overview
+    -------------
+    REDQ (Randomized Ensembled Double Q-learning) is an off-policy actor-critic
+    method that combines a SAC-style stochastic actor with an ensemble of Q
+    critics. For target value estimation, REDQ samples a random subset of
+    target critics and takes the minimum over that subset to reduce
+    overestimation bias.
 
-    A key REDQ detail is the target value computation:
-      - randomly sample a subset of target critics
-      - take the minimum over the subset to reduce overestimation bias
+    This head wires:
+    - a squashed Gaussian actor :math:`\pi_\theta(a\mid s)` (SAC-like)
+    - an ensemble of critics :math:`\{Q_{\phi_i}(s,a)\}_{i=1}^N`
+    - an ensemble of target critics :math:`\{Q_{\bar{\phi}_i}(s,a)\}_{i=1}^N`
 
-    Contract (expected by OffPolicyAlgorithm)
-    ----------------------------------------
-    This head exposes the standard OffPolicyActorCritic interface:
-      - device
-      - set_training(training)
-      - act(obs, deterministic=False)
-      - sample_action_and_logp(obs)
-      - q_values_all(obs, action) -> List[Tensor(B,1)]
-      - q_values_target_subset_min(obs, action, subset_size=None) -> Tensor(B,1)
-      - hard_update_target()
-      - soft_update_target(tau)
-      - save(path), load(path)
-      - get_ray_policy_factory_spec()
+    Target reduction (REDQ trick)
+    -----------------------------
+    Let :math:`\mathcal{I}` be a random subset of size :math:`K` drawn uniformly
+    from ``{1, ..., N}``. REDQ forms a target critic value as:
+
+    .. math::
+        Q_{\text{targ}}(s,a) = \min_{i \in \mathcal{I}} Q_{\bar{\phi}_i}(s,a)
+
+    This differs from classic Double-Q (min over 2) by using a larger ensemble and
+    randomized subsets.
+
+    Expected interface
+    ------------------
+    This head follows the project's off-policy continuous actor-critic interface.
+    Typical consumers (e.g., OffPolicyAlgorithm and REDQCore-like update engines)
+    rely on the following:
+
+    Attributes
+    ----------
+    actor : torch.nn.Module
+        Stochastic policy network (squashed Gaussian).
+    critics : torch.nn.ModuleList
+        Online critic ensemble, each mapping (s,a) -> (B,1).
+    critics_target : torch.nn.ModuleList
+        Target critic ensemble, frozen and eval-only.
+    device : torch.device
+        Device used for computation.
+
+    Methods
+    -------
+    set_training(training)
+        Toggle training/eval for online networks while keeping targets eval.
+    act(obs, deterministic=False)
+        Compute actions for rollout/evaluation.
+    q_values_all(obs, action)
+        Evaluate all online critics.
+    q_values_target_all(obs, action)
+        Evaluate all target critics.
+    q_values_target_subset_min(obs, action, subset_size=None)
+        Sample subset of target critics and return min value (REDQ reduction).
+    save(path), load(path)
+        Persist actor and ensembles.
+    get_ray_policy_factory_spec()
+        Provide Ray reconstruction spec (entrypoint + JSON-safe kwargs).
 
     Shapes
     ------
-    - obs:    (B, obs_dim)
-    - action: (B, action_dim)
-    - Q(s,a): (B, 1)
+    - obs:    ``(B, obs_dim)``
+    - action: ``(B, action_dim)``
+    - Q(s,a): ``(B, 1)``
     """
 
     def __init__(
@@ -97,10 +152,10 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         gain: float = 1.0,
         bias: float = 0.0,
         device: Union[str, th.device] = "cuda" if th.cuda.is_available() else "cpu",
-        # actor distribution params (SAC-like)
+        # Actor distribution params (SAC-like).
         log_std_mode: str = "layer",
         log_std_init: float = -0.5,
-        # REDQ ensemble params
+        # REDQ ensemble params.
         num_critics: int = 10,
         num_target_subset: int = 2,
     ) -> None:
@@ -108,39 +163,55 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         Parameters
         ----------
         obs_dim : int
-            Observation dimension.
+            Observation (state) vector dimension.
         action_dim : int
-            Action dimension.
-        hidden_sizes : Sequence[int]
-            Shared MLP hidden sizes for actor and critics.
-        activation_fn : Any
-            Torch activation class (e.g., nn.ReLU).
-        init_type : str
-            Network init scheme used by your network modules.
-        gain : float
-            Init gain multiplier.
-        bias : float
-            Init bias constant.
-        device : Union[str, torch.device]
-            Device for online nets. Target nets are also allocated on this device.
-        log_std_mode : str
-            Policy log-std parameterization (e.g. "layer", "parameter").
-        log_std_init : float
-            Initial value for log standard deviation.
-        num_critics : int
-            Number of critic networks in the ensemble.
-        num_target_subset : int
-            Subset size used for REDQ target min-reduction.
-            Must satisfy: 1 <= num_target_subset <= num_critics
+            Action vector dimension.
+        hidden_sizes : Sequence[int], default=(256, 256)
+            Hidden layer widths used for both actor and critics.
+        activation_fn : Any, default=torch.nn.ReLU
+            Activation constructor used in MLP blocks.
+
+            Notes
+            -----
+            - When reconstructed via Ray, this may be provided as a string name and
+              should be resolved by the worker factory.
+        init_type : str, default="orthogonal"
+            Initialization scheme forwarded to network constructors.
+        gain : float, default=1.0
+            Initialization gain forwarded to network constructors.
+        bias : float, default=0.0
+            Bias initialization forwarded to network constructors.
+        device : str or torch.device, default=("cuda" if available else "cpu")
+            Device for online and target networks.
+        log_std_mode : str, default="layer"
+            Policy log-standard-deviation parameterization mode used by
+            :class:`~model_free.common.networks.policy_networks.ContinuousPolicyNetwork`.
+        log_std_init : float, default=-0.5
+            Initial value for the log standard deviation.
+        num_critics : int, default=10
+            Number of online critics in the ensemble.
+        num_target_subset : int, default=2
+            Subset size ``K`` used for REDQ target min-reduction.
+
+            Must satisfy
+            ------------
+            ``1 <= num_target_subset <= num_critics``.
+
+        Raises
+        ------
+        ValueError
+            If ``num_critics <= 0`` or ``num_target_subset`` violates constraints.
         """
         super().__init__(device=device)
 
+        # ---------------------------------------------------------------------
         # Store architecture/meta parameters
+        # ---------------------------------------------------------------------
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.hidden_sizes = tuple(int(x) for x in hidden_sizes)
 
-        # Store init / activation config
+        # Init / activation config
         self.activation_fn = activation_fn
         self.init_type = str(init_type)
         self.gain = float(gain)
@@ -163,10 +234,8 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
             )
 
         # ---------------------------------------------------------------------
-        # Actor: Squashed Gaussian policy (like SAC)
+        # Actor: squashed Gaussian policy (SAC-like)
         # ---------------------------------------------------------------------
-        # - outputs actions in [-1,1] if squash=True
-        # - supports rsample() for reparameterization trick
         self.actor = ContinuousPolicyNetwork(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
@@ -183,7 +252,6 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         # ---------------------------------------------------------------------
         # Critic ensemble (online): {Q_i}
         # ---------------------------------------------------------------------
-        # Each critic estimates Q(s, a) -> (B,1)
         self.critics = nn.ModuleList(
             [
                 StateActionValueNetwork(
@@ -202,7 +270,6 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         # ---------------------------------------------------------------------
         # Target critic ensemble: {Q_i^t}
         # ---------------------------------------------------------------------
-        # These are lagged copies of online critics.
         self.critics_target = nn.ModuleList(
             [
                 StateActionValueNetwork(
@@ -218,16 +285,15 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
             ]
         )
 
+        # Optional compatibility aliases: some generic cores expect single critic attrs.
         self.critic = self.critics[0]
         self.critic_target = self.critics_target[0]
 
-        # Initialize targets = online critics (hard copy)
+        # Initialize targets from online critics (hard copy).
         for q_t, q in zip(self.critics_target, self.critics):
             self.hard_update(q_t, q)
 
-        # Freeze target params so:
-        # - they are not updated by optimizer
-        # - they are safe from accidental gradient flows
+        # Freeze target params to prevent optimizer updates and accidental grads.
         for q_t in self.critics_target:
             self.freeze_target(q_t)
 
@@ -238,23 +304,23 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         """
         Set training/eval mode for online networks.
 
-        Convention
+        Parameters
         ----------
-        - Online actor/critics follow `training` flag.
-        - Target critics always remain in eval mode (and frozen).
+        training : bool
+            If ``True``, sets online networks to training mode.
+            If ``False``, sets online networks to evaluation mode.
 
         Notes
         -----
-        Even if the user calls set_training(True), target critics are kept in eval.
+        - Online actor and online critics follow the provided ``training`` flag.
+        - Target critics remain in evaluation mode regardless of ``training``
+          and are expected to remain frozen.
         """
-        # Online actor follows training flag
         self.actor.train(training)
-
-        # Online critics follow training flag
         for q in self.critics:
             q.train(training)
 
-        # Targets remain eval always
+        # Targets remain eval always.
         for q_t in self.critics_target:
             q_t.eval()
 
@@ -269,15 +335,18 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         Parameters
         ----------
         obs : Any
-            Observation (np array / torch tensor / list) convertible via _to_tensor_batched.
-        deterministic : bool
-            - True: use mean action (or deterministic path) for evaluation
-            - False: sample from policy distribution (stochastic)
+            Observation batch. Accepts numpy arrays / torch tensors / lists that are
+            convertible via the base head's ``_to_tensor_batched`` helper.
+        deterministic : bool, default=False
+            Action selection mode:
+
+            - ``True``: use the deterministic action (typically the mean of the policy).
+            - ``False``: sample an action from the policy distribution.
 
         Returns
         -------
-        action : torch.Tensor
-            Shape (B, action_dim), on self.device.
+        torch.Tensor
+            Action tensor of shape ``(B, action_dim)`` on ``self.device``.
         """
         s = self._to_tensor_batched(obs)
         action, _info = self.actor.act(s, deterministic=deterministic)
@@ -289,13 +358,20 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
     @th.no_grad()
     def q_values_all(self, obs: Any, action: Any) -> List[th.Tensor]:
         """
-        Compute all online ensemble Q-values.
+        Evaluate all online critics :math:`\\{Q_i(s,a)\\}`.
+
+        Parameters
+        ----------
+        obs : Any
+            Observation batch convertible via ``_to_tensor_batched``.
+        action : Any
+            Action batch convertible via ``_to_tensor_batched``.
 
         Returns
         -------
-        qs : List[torch.Tensor]
-            List length = num_critics
-            Each tensor has shape (B,1)
+        List[torch.Tensor]
+            List of length ``num_critics``.
+            Each element is a tensor of shape ``(B, 1)``.
         """
         s = self._to_tensor_batched(obs)
         a = self._to_tensor_batched(action)
@@ -304,13 +380,20 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
     @th.no_grad()
     def q_values_target_all(self, obs: Any, action: Any) -> List[th.Tensor]:
         """
-        Compute all target ensemble Q-values.
+        Evaluate all target critics :math:`\\{Q_i^t(s,a)\\}`.
+
+        Parameters
+        ----------
+        obs : Any
+            Observation batch convertible via ``_to_tensor_batched``.
+        action : Any
+            Action batch convertible via ``_to_tensor_batched``.
 
         Returns
         -------
-        qs_t : List[torch.Tensor]
-            List length = num_critics
-            Each tensor has shape (B,1)
+        List[torch.Tensor]
+            List of length ``num_critics``.
+            Each element is a tensor of shape ``(B, 1)``.
         """
         s = self._to_tensor_batched(obs)
         a = self._to_tensor_batched(action)
@@ -325,10 +408,14 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         subset_size: Optional[int] = None,
     ) -> th.Tensor:
         """
-        REDQ target: sample a random subset of target critics and return the minimum.
+        Compute the REDQ target value: min over a random subset of target critics.
 
-        This implements the REDQ "min over random subset" trick:
-          Q_target(s,a) = min_{i in subset} Q_i^t(s,a)
+        This implements the REDQ randomized min reduction:
+
+        .. math::
+            Q_{\\text{targ}}(s,a) = \\min_{i \\in \\mathcal{I}} Q_i^t(s,a)
+
+        where :math:`\\mathcal{I}` is a uniformly sampled subset of size ``K``.
 
         Parameters
         ----------
@@ -336,14 +423,23 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
             Observation batch.
         action : Any
             Action batch.
-        subset_size : Optional[int]
-            If None, uses self.num_target_subset.
-            Must satisfy 1 <= subset_size <= num_critics.
+        subset_size : int, optional
+            Subset size ``K``. If ``None``, uses ``self.num_target_subset``.
+
+            Constraints
+            -----------
+            ``1 <= subset_size <= num_critics``.
 
         Returns
         -------
-        q_min : torch.Tensor
-            Shape (B,1)
+        torch.Tensor
+            Tensor of shape ``(B, 1)`` containing the minimum Q-values over the
+            sampled subset.
+
+        Raises
+        ------
+        ValueError
+            If ``subset_size`` violates constraints.
         """
         k = int(self.num_target_subset if subset_size is None else subset_size)
         if k <= 0 or k > self.num_critics:
@@ -352,14 +448,12 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         s = self._to_tensor_batched(obs)
         a = self._to_tensor_batched(action)
 
-        # We sample indices on the same device to keep behavior consistent between CPU/GPU.
-        # randperm is deterministic under torch RNG state if seeds are controlled.
+        # Sample subset indices on the same device for consistent CPU/GPU behavior.
         idx = th.randperm(self.num_critics, device=self.device)[:k].tolist()
 
-        # Collect Q-values from subset -> stack -> min
-        qs = [self.critics_target[i](s, a) for i in idx]   # each: (B,1)
-        q_stack = th.stack(qs, dim=0)                      # (k, B, 1)
-        q_min = th.min(q_stack, dim=0).values              # (B,1)
+        qs = [self.critics_target[i](s, a) for i in idx]  # each: (B,1)
+        q_stack = th.stack(qs, dim=0)  # (k, B, 1)
+        q_min = th.min(q_stack, dim=0).values  # (B,1)
         return q_min
 
     # =============================================================================
@@ -367,13 +461,17 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
     # =============================================================================
     def _export_kwargs_json_safe(self) -> Dict[str, Any]:
         """
-        Export constructor kwargs in a JSON-safe format.
+        Export constructor kwargs in a JSON-serializable format.
 
-        Motivation
-        ----------
-        This enables:
-        - clean checkpointing with enough metadata to rebuild the head
-        - Ray factory specs (kwargs must be serializable)
+        This metadata supports:
+        - checkpoints with sufficient configuration context for debugging
+        - Ray worker reconstruction (kwargs must be JSON-safe)
+
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-safe constructor kwargs. Activation functions are exported as a
+            stable string name; all numeric fields are cast to Python scalars.
         """
         return {
             "obs_dim": int(self.obs_dim),
@@ -392,16 +490,26 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
 
     def save(self, path: str) -> None:
         """
-        Save actor + ensemble critics + ensemble targets into a single checkpoint.
+        Save actor + critic ensembles into a single ``.pt`` checkpoint.
 
-        Format
-        ------
-        {
-          "kwargs": {...json safe...},
-          "actor": state_dict,
-          "critics": [state_dict, ...] length = num_critics,
-          "critics_target": [state_dict, ...] length = num_critics,
-        }
+        Parameters
+        ----------
+        path : str
+            Output checkpoint path. If the path does not end with ``.pt``, the
+            suffix is appended.
+
+        Stored Payload
+        --------------
+        The checkpoint is stored via ``torch.save`` as a dict with keys:
+
+        - ``"kwargs"`` : JSON-safe constructor metadata (see ``_export_kwargs_json_safe``)
+        - ``"actor"`` : ``actor.state_dict()``
+        - ``"critics"`` : list of ``state_dict`` (length = ``num_critics``)
+        - ``"critics_target"`` : list of ``state_dict`` (length = ``num_critics``)
+
+        Notes
+        -----
+        Optimizer state is not stored here; that is typically owned by the core/algorithm.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -416,12 +524,25 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
 
     def load(self, path: str) -> None:
         """
-        Load actor + critic ensembles from a checkpoint.
+        Load actor + critic ensembles from a ``.pt`` checkpoint.
+
+        Parameters
+        ----------
+        path : str
+            Checkpoint path produced by :meth:`save`. If the path does not end
+            with ``.pt``, the suffix is appended.
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint format is not recognized or ensemble sizes mismatch.
 
         Notes
         -----
-        - If target critics are missing in the checkpoint, targets are rebuilt via hard_update_target().
-        - After loading, targets are frozen + set to eval.
+        - Loads tensors onto ``self.device`` via ``map_location=self.device``.
+        - If target critics are missing in the checkpoint, targets are reconstructed
+          by hard-copying online critics.
+        - After loading, target critics are frozen and set to eval.
         """
         if not path.endswith(".pt"):
             path = path + ".pt"
@@ -430,10 +551,10 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         if not isinstance(ckpt, dict) or "actor" not in ckpt or "critics" not in ckpt:
             raise ValueError(f"Unrecognized REDQHead checkpoint format at: {path}")
 
-        # Load actor weights
+        # Actor
         self.actor.load_state_dict(ckpt["actor"])
 
-        # Load online critics weights
+        # Online critics
         critics_sd = ckpt["critics"]
         if len(critics_sd) != len(self.critics):
             raise ValueError(
@@ -442,7 +563,7 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
         for q, sd in zip(self.critics, critics_sd):
             q.load_state_dict(sd)
 
-        # Load target ensemble if present; otherwise reconstruct from online critics
+        # Target critics
         critics_t_sd = ckpt.get("critics_target", None)
         if critics_t_sd is not None:
             if len(critics_t_sd) != len(self.critics_target):
@@ -452,14 +573,12 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
             for q_t, sd in zip(self.critics_target, critics_t_sd):
                 q_t.load_state_dict(sd)
         else:
-            # If targets were not saved, sync them directly from online critics
+            # If targets were not saved, sync directly from online critics.
             for q_t, q in zip(self.critics_target, self.critics):
                 self.hard_update(q_t, q)
 
         for q_t in self.critics_target:
             self.freeze_target(q_t)
-
-        for q_t in self.critics_target:
             q_t.eval()
 
     # =============================================================================
@@ -467,13 +586,21 @@ class REDQHead(OffPolicyContinuousActorCriticHead):
     # =============================================================================
     def get_ray_policy_factory_spec(self) -> PolicyFactorySpec:
         """
-        Return a Ray-serializable spec to reconstruct this REDQHead on workers.
+        Create a Ray-serializable spec for reconstructing this head on workers.
 
-        The spec contains:
-        - entrypoint: module-level function pointer
-        - kwargs: JSON-safe constructor args
+        Returns
+        -------
+        PolicyFactorySpec
+            Spec containing:
+            - ``entrypoint``: module-level function used by Ray workers
+            - ``kwargs``: JSON-safe constructor kwargs
+
+        Notes
+        -----
+        - The worker entrypoint overrides ``device`` to CPU.
+        - ``kwargs`` must remain JSON-serializable.
         """
         return PolicyFactorySpec(
-            entrypoint=make_entrypoint(build_redq_head_worker_policy),
+            entrypoint=_make_entrypoint(build_redq_head_worker_policy),
             kwargs=self._export_kwargs_json_safe(),
         )

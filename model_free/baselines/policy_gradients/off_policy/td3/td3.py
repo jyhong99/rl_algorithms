@@ -5,10 +5,11 @@ from typing import Any, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch as th
 
-from .head import TD3Head
-from .core import TD3Core
 from model_free.common.noises.noise_builder import build_noise
 from model_free.common.policies.off_policy_algorithm import OffPolicyAlgorithm
+
+from .core import TD3Core
+from .head import TD3Head
 
 
 def td3(
@@ -16,9 +17,9 @@ def td3(
     obs_dim: int,
     action_dim: int,
     device: Union[str, th.device] = "cpu",
-    # -----------------------------
-    # Network (head) hyperparams
-    # -----------------------------
+    # -------------------------------------------------------------------------
+    # Network (head) hyperparameters
+    # -------------------------------------------------------------------------
     hidden_sizes: Tuple[int, ...] = (256, 256),
     activation_fn: Any = th.nn.ReLU,
     init_type: str = "orthogonal",
@@ -26,9 +27,9 @@ def td3(
     bias: float = 0.0,
     action_low: Optional[np.ndarray] = None,
     action_high: Optional[np.ndarray] = None,
-    # -----------------------------
-    # Exploration noise (Head-side)
-    # -----------------------------
+    # -------------------------------------------------------------------------
+    # Exploration noise (head-owned)
+    # -------------------------------------------------------------------------
     exploration_noise: Optional[str] = None,
     noise_mu: float = 0.0,
     noise_sigma: float = 0.1,
@@ -39,9 +40,9 @@ def td3(
     action_noise_eps: float = 1e-6,
     action_noise_low: Optional[Union[float, Sequence[float]]] = None,
     action_noise_high: Optional[Union[float, Sequence[float]]] = None,
-    # -----------------------------
-    # TD3 update (core) hyperparams
-    # -----------------------------
+    # -------------------------------------------------------------------------
+    # TD3 update (core) hyperparameters
+    # -------------------------------------------------------------------------
     gamma: float = 0.99,
     tau: float = 0.005,
     policy_noise: float = 0.2,
@@ -50,36 +51,37 @@ def td3(
     target_update_interval: int = 1,
     max_grad_norm: float = 0.0,
     use_amp: bool = False,
-    # -----------------------------
+    # -------------------------------------------------------------------------
     # Optimizers
-    # -----------------------------
+    # -------------------------------------------------------------------------
     actor_optim_name: str = "adamw",
     actor_lr: float = 3e-4,
     actor_weight_decay: float = 0.0,
     critic_optim_name: str = "adamw",
     critic_lr: float = 3e-4,
     critic_weight_decay: float = 0.0,
-    # -----------------------------
+    # -------------------------------------------------------------------------
     # (Optional) schedulers
-    # -----------------------------
+    # -------------------------------------------------------------------------
     actor_sched_name: str = "none",
     critic_sched_name: str = "none",
     total_steps: int = 0,
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.0,
     poly_power: float = 1.0,
-    # -----------------------------
+    # -------------------------------------------------------------------------
     # OffPolicyAlgorithm schedule / replay
-    # -----------------------------
+    # -------------------------------------------------------------------------
     buffer_size: int = 1_000_000,
     batch_size: int = 256,
-    warmup_env_steps: int = 10_000,
     update_after: int = 1_000,
     update_every: int = 1,
     utd: float = 1.0,
     gradient_steps: int = 1,
     max_updates_per_call: int = 1_000,
-    # PER (Prioritized Experience Replay)
+    # -------------------------------------------------------------------------
+    # Prioritized Experience Replay (PER)
+    # -------------------------------------------------------------------------
     use_per: bool = True,
     per_alpha: float = 0.6,
     per_beta: float = 0.4,
@@ -88,40 +90,179 @@ def td3(
     per_beta_anneal_steps: int = 200_000,
 ) -> OffPolicyAlgorithm:
     """
-    Build a complete TD3 OffPolicyAlgorithm (config-free).
+    Build a complete TD3 :class:`~model_free.common.policies.off_policy_algorithm.OffPolicyAlgorithm`.
 
-    Overview
-    --------
-    This factory wires together three layers:
-      1) TD3Head:  actor/critic networks + target networks + exploration noise
-      2) TD3Core:  update rule (critic every step, actor delayed, target updates)
-      3) OffPolicyAlgorithm: replay buffer + scheduling (when to collect/update)
+    This factory function assembles a full TD3 stack by composing:
 
-    Key design choice (important)
-    -----------------------------
-    Exploration noise is owned and applied by the *head* (TD3Head), not by the
-    algorithm driver. This keeps OffPolicyAlgorithm generic across off-policy
-    methods (SAC/TD3/REDQ/etc.).
+    1) :class:`~.head.TD3Head`
+        Owns neural networks and inference utilities:
+          - deterministic actor and twin critics
+          - target actor and target critics
+          - optional action bounds clamping
+          - exploration noise (head-owned), applied during action selection
 
-    Contract
-    --------
-    - Exploration noise is stored inside `TD3Head` (head-side).
-    - OffPolicyAlgorithm should NOT receive action_noise nor sample it.
-    - Episode-boundary reset is requested by OffPolicyAlgorithm via
-      `head.reset_exploration_noise()` when available (enabled by reset_noise_on_done=True).
+    2) :class:`~.core.TD3Core`
+        Owns TD3 update logic:
+          - critic update every step
+          - delayed actor update
+          - TD3 target policy smoothing (Gaussian noise + clipping)
+          - Polyak target updates
+
+    3) :class:`~model_free.common.policies.off_policy_algorithm.OffPolicyAlgorithm`
+        Owns replay and scheduling:
+          - replay buffer management (uniform or PER)
+          - update schedule (update_after, update_every, UTD, gradient_steps)
+          - PER plumbing (sampling weights and priority feedback)
+          - optional episode-boundary noise reset via ``head.reset_exploration_noise()``
+
+    Parameters
+    ----------
+    obs_dim : int
+        Observation dimension of the environment. The factory assumes observations are
+        vectorized to shape ``(B, obs_dim)`` at training time.
+    action_dim : int
+        Action dimension (continuous). TD3 assumes actions are continuous vectors of
+        shape ``(B, action_dim)``.
+    device : Union[str, torch.device], default="cpu"
+        Device used for training (online networks, optimizers, forward/backward passes).
+        Note: Ray worker policies may override to CPU in the head-side factory spec.
+
+    Network (head) hyperparameters
+    ------------------------------
+    hidden_sizes : Tuple[int, ...], default=(256, 256)
+        MLP hidden layer sizes for both actor and critics.
+    activation_fn : Any, default=torch.nn.ReLU
+        Activation class (e.g., ``torch.nn.ReLU``).
+    init_type : str, default="orthogonal"
+        Initialization strategy name forwarded to your network builders.
+    gain : float, default=1.0
+        Gain multiplier for initialization (if supported by your builders).
+    bias : float, default=0.0
+        Bias initialization constant (if supported by your builders).
+    action_low : Optional[np.ndarray], default=None
+        Lower action bounds. If provided, must be shape ``(action_dim,)``.
+        Used by the head to clamp both exploration actions and target-smoothed actions.
+    action_high : Optional[np.ndarray], default=None
+        Upper action bounds. If provided, must be shape ``(action_dim,)`` and paired with
+        ``action_low``.
+
+    Exploration noise (head-owned)
+    ------------------------------
+    exploration_noise : Optional[str], default=None
+        Exploration noise kind. Expected values depend on ``build_noise`` (e.g.,
+        ``"gaussian"``, ``"ou"``, ``"uniform"``). ``None`` disables exploration noise.
+    noise_mu : float, default=0.0
+        Mean for Gaussian/OU noise (if applicable).
+    noise_sigma : float, default=0.1
+        Stddev for Gaussian/OU noise (if applicable).
+    ou_theta : float, default=0.15
+        OU drift parameter (if using OU noise).
+    ou_dt : float, default=1e-2
+        OU time step (if using OU noise).
+    uniform_low : float, default=-1.0
+        Low bound for uniform noise (if using uniform noise).
+    uniform_high : float, default=1.0
+        High bound for uniform noise (if using uniform noise).
+    action_noise_eps : float, default=1e-6
+        Small epsilon used by some action-dependent noise wrappers to avoid degenerate
+        ranges or division by zero.
+    action_noise_low : Optional[Union[float, Sequence[float]]], default=None
+        Optional per-dimension lower clip/range for action-dependent noise modules.
+    action_noise_high : Optional[Union[float, Sequence[float]]], default=None
+        Optional per-dimension upper clip/range for action-dependent noise modules.
+
+    TD3 update (core) hyperparameters
+    --------------------------------
+    gamma : float, default=0.99
+        Discount factor :math:`\\gamma`.
+    tau : float, default=0.005
+        Polyak coefficient for target updates.
+    policy_noise : float, default=0.2
+        Stddev of Gaussian noise used in TD3 target policy smoothing
+        (applied to the *target actor* output inside the core/head).
+    noise_clip : float, default=0.5
+        Clip range for the TD3 target policy smoothing noise.
+    policy_delay : int, default=2
+        Actor update period (in critic update calls).
+    target_update_interval : int, default=1
+        Additional gate for target updates when actor updates.
+    max_grad_norm : float, default=0.0
+        Global gradient norm clip threshold. ``0.0`` disables clipping.
+    use_amp : bool, default=False
+        Enables mixed precision training (AMP) if supported by the device.
+
+    Optimizers / schedulers
+    -----------------------
+    actor_optim_name, critic_optim_name : str
+        Optimizer names forwarded to the optimizer builder used in :class:`TD3Core`.
+    actor_lr, critic_lr : float
+        Learning rates for actor and critic.
+    actor_weight_decay, critic_weight_decay : float
+        Weight decay values for actor and critic optimizers.
+    actor_sched_name, critic_sched_name : str
+        Scheduler names forwarded to the scheduler builder used in :class:`TD3Core`.
+    total_steps, warmup_steps, min_lr_ratio, poly_power : int/float
+        Scheduler hyperparameters forwarded to the scheduler builder.
+
+    Replay / schedule (OffPolicyAlgorithm)
+    --------------------------------------
+    buffer_size : int, default=1_000_000
+        Replay buffer capacity (number of transitions).
+    batch_size : int, default=256
+        Minibatch size for updates.
+    update_after : int, default=1_000
+        Minimum number of environment steps before any update is allowed.
+    update_every : int, default=1
+        Update cadence in environment steps.
+    utd : float, default=1.0
+        Update-to-data ratio: roughly how many updates per environment step.
+    gradient_steps : int, default=1
+        Number of gradient steps per update call.
+    max_updates_per_call : int, default=1_000
+        Upper bound to prevent extremely long update bursts when UTD is large.
+
+    PER configuration
+    -----------------
+    use_per : bool, default=True
+        Enables prioritized replay if True.
+    per_alpha : float, default=0.6
+        Priority exponent (how strongly priorities affect sampling).
+    per_beta : float, default=0.4
+        Importance sampling exponent (initial value).
+    per_eps : float, default=1e-6
+        Small constant added to TD errors to avoid zero priorities.
+    per_beta_final : float, default=1.0
+        Final beta value after annealing.
+    per_beta_anneal_steps : int, default=200_000
+        Number of steps over which beta is annealed from ``per_beta`` to ``per_beta_final``.
+
+    Returns
+    -------
+    algo : OffPolicyAlgorithm
+        A ready-to-use off-policy algorithm instance. Typical workflow::
+
+            algo = td3(obs_dim=..., action_dim=..., device="cuda")
+            algo.setup(env)
+            action = algo.act(obs)
+            algo.on_env_step(transition)
+            if algo.ready_to_update():
+                metrics = algo.update()
+
+    Notes
+    -----
+    Exploration noise ownership is intentionally placed in the head:
+
+    - The algorithm driver remains generic across off-policy methods (SAC/TD3/REDQ/etc.).
+    - The head can manage stateful noise processes (e.g., OU) and reset them on episode
+      boundaries when ``reset_noise_on_done=True`` in :class:`OffPolicyAlgorithm`.
     """
-
-    # ------------------------------------------------------------------
-    # 1) Build exploration noise object (head-side ownership)
-    # ------------------------------------------------------------------
-    # build_noise() is your centralized noise factory. It supports:
-    # - Gaussian / OU / Uniform (depending on `kind`)
-    # - optional action-dependent clipping/range via action_noise_low/high
-    # - dtype/device handling
+    # -------------------------------------------------------------------------
+    # 1) Build exploration noise (head-owned)
+    # -------------------------------------------------------------------------
     noise = build_noise(
-        kind=exploration_noise,       # e.g. "gaussian", "ou", "uniform", or None
-        action_dim=int(action_dim),   # noise dimension must match action dimension
-        device=device,                # keep noise tensors on same device as policy
+        kind=exploration_noise,
+        action_dim=int(action_dim),
+        device=device,
         noise_mu=float(noise_mu),
         noise_sigma=float(noise_sigma),
         ou_theta=float(ou_theta),
@@ -133,14 +274,9 @@ def td3(
         action_noise_high=action_noise_high,
     )
 
-    # ------------------------------------------------------------------
-    # 2) Head: actor/critic networks + target networks + exploration noise
-    # ------------------------------------------------------------------
-    # TD3Head is a deterministic actor-critic head:
-    # - actor(obs) -> action (optionally clamped to bounds)
-    # - critic(obs, act) -> (q1, q2)
-    # - actor_target / critic_target maintained for TD targets
-    # - noise is applied during `act(..., deterministic=False)` (head decides)
+    # -------------------------------------------------------------------------
+    # 2) Head: networks + targets + exploration noise
+    # -------------------------------------------------------------------------
     head = TD3Head(
         obs_dim=int(obs_dim),
         action_dim=int(action_dim),
@@ -150,32 +286,23 @@ def td3(
         gain=float(gain),
         bias=float(bias),
         device=device,
-        # Action bounds:
-        # - If provided: TD3Head will clamp both exploration actions and target actions.
-        # - If None: actions are unbounded (not typical for Box envs, but allowed).
         action_low=action_low,
         action_high=action_high,
-        # Exploration noise lives in the head (NOT in OffPolicyAlgorithm)
         noise=noise,
     )
 
-    # ------------------------------------------------------------------
-    # 3) Core: update rule (TD3)
-    # ------------------------------------------------------------------
-    # TD3Core performs:
-    # - critic update every call
-    # - actor update every `policy_delay` calls
-    # - target updates (Polyak) via tau, optionally gated by target_update_interval
-    # - target policy smoothing via (policy_noise, noise_clip)
+    # -------------------------------------------------------------------------
+    # 3) Core: TD3 update logic
+    # -------------------------------------------------------------------------
     core = TD3Core(
         head=head,
         gamma=float(gamma),
         tau=float(tau),
-        policy_noise=float(policy_noise),     # std for target action smoothing noise
-        noise_clip=float(noise_clip),         # clip for target smoothing noise
-        policy_delay=int(policy_delay),       # delayed policy update
+        policy_noise=float(policy_noise),
+        noise_clip=float(noise_clip),
+        policy_delay=int(policy_delay),
         target_update_interval=int(target_update_interval),
-        # actor/critic optimizer & scheduler settings (reused infra in ActorCriticCore)
+        # optim/sched
         actor_optim_name=str(actor_optim_name),
         actor_lr=float(actor_lr),
         actor_weight_decay=float(actor_weight_decay),
@@ -188,20 +315,14 @@ def td3(
         warmup_steps=int(warmup_steps),
         min_lr_ratio=float(min_lr_ratio),
         poly_power=float(poly_power),
-        # stability knobs
+        # stability
         max_grad_norm=float(max_grad_norm),
         use_amp=bool(use_amp),
     )
 
-    # ------------------------------------------------------------------
-    # 4) Algorithm: replay buffer + scheduling
-    # ------------------------------------------------------------------
-    # OffPolicyAlgorithm responsibilities:
-    # - store transitions into replay
-    # - decide when to start updating (warmup/update_after)
-    # - decide how many updates to run (utd, gradient_steps, max_updates_per_call)
-    # - provide PER sampling + report per/beta metrics (if use_per=True)
-    # - call head.reset_exploration_noise() on episode end (if enabled)
+    # -------------------------------------------------------------------------
+    # 4) Algorithm driver: replay + scheduling (+ PER)
+    # -------------------------------------------------------------------------
     algo = OffPolicyAlgorithm(
         head=head,
         core=core,
@@ -209,8 +330,7 @@ def td3(
         # replay
         buffer_size=int(buffer_size),
         batch_size=int(batch_size),
-        warmup_steps=int(warmup_env_steps),
-        # scheduling
+        # schedule
         update_after=int(update_after),
         update_every=int(update_every),
         utd=float(utd),
@@ -223,9 +343,7 @@ def td3(
         per_eps=float(per_eps),
         per_beta_final=float(per_beta_final),
         per_beta_anneal_steps=int(per_beta_anneal_steps),
-        # IMPORTANT:
-        # Ensure the exploration noise state (e.g., OU process) is reset when an episode ends.
-        # OffPolicyAlgorithm will call head.reset_exploration_noise() if the method exists.
+        # Episode-boundary noise reset (if head implements reset_exploration_noise()).
         reset_noise_on_done=True,
     )
     return algo

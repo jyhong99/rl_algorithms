@@ -5,45 +5,72 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import torch as th
 import torch.nn.functional as F
 
-from model_free.common.utils.common_utils import to_scalar, to_column
 from model_free.common.policies.base_core import ActorCriticCore
+from model_free.common.utils.common_utils import _to_column, _to_scalar
 
 
 class PPODiscreteCore(ActorCriticCore):
     """
-    PPO Discrete Update Engine (PPODiscreteCore)
-    --------------------------------------------
-    Implements PPO's clipped surrogate objective for DISCRETE action spaces.
+    PPO update engine for **discrete** action spaces (categorical policies).
 
-    Design
-    ------
-    - This core performs **exactly one minibatch update** per `update_from_batch()` call.
-    - Higher-level training logic (e.g., looping over epochs/minibatches) is handled
-      by `OnPolicyAlgorithm`, not here.
-    - If `target_kl` is enabled, this core computes an "early stop" flag per minibatch.
+    This core implements PPO-Clip for categorical actors, mirroring the continuous
+    PPO core but with discrete-action conventions:
 
-    Discrete-only assumptions
-    -------------------------
-    - `head.actor.get_dist(obs)` returns a **Categorical-like** distribution.
-    - `dist.log_prob(action)` expects a tensor of dtype long and shape (B,).
-    - `dist.entropy()` typically returns (B,).
+    - Actions are discrete indices (typically ``LongTensor`` of shape ``(B,)``).
+    - The actor produces a ``Categorical``-like distribution via
+      ``head.actor.get_dist(obs)``.
 
-    Expected batch fields
-    ---------------------
-    batch should expose (at minimum):
-      - observations : (B, obs_dim)
-      - actions      : scalar / (B,) / (B,1) discrete action indices
-      - log_probs    : (B,) or (B,1) old action log-prob from behavior policy
-      - values       : (B,) or (B,1) old value estimates (baseline at rollout time)
-      - returns      : (B,) or (B,1) computed returns
-      - advantages   : (B,) or (B,1) computed advantages
+    One-call semantics
+    ------------------
+    :meth:`update_from_batch` performs **exactly one** minibatch update. Looping over
+    epochs/minibatches is the responsibility of the higher-level trainer
+    (e.g., ``OnPolicyAlgorithm``).
+
+    PPO objective (discrete)
+    ------------------------
+    Given rollout-time saved values (old policy and old critic):
+
+    - Policy ratio:
+      ``ratio = exp(new_logp - old_logp)``
+    - Clipped surrogate:
+      ``L_pi = -E[min(ratio * adv, clip(ratio, 1-eps, 1+eps) * adv)]``
+
+    Value loss
+    ----------
+    - If ``clip_vloss=True``:
+      ``v_clipped = old_v + clip(v - old_v, -eps, eps)``
+      ``L_v = 0.5 * E[max((v-ret)^2, (v_clipped-ret)^2)]``
+    - Else:
+      ``L_v = 0.5 * MSE(v, ret)``
+
+    Entropy bonus
+    -------------
+    Entropy is added as a bonus by minimizing the *negative* entropy:
+
+    ``L_ent = -E[H(pi(.|s))]``
+
+    Total loss
+    ----------
+    ``L = L_pi + vf_coef * L_v + ent_coef * L_ent``
+
+    Batch contract
+    --------------
+    The minibatch object is duck-typed and must provide:
+
+    - ``observations`` : Tensor, shape ``(B, obs_dim)``
+    - ``actions``      : Tensor, shape ``(B,)`` or ``(B,1)`` or scalar
+    - ``log_probs``    : old log-prob, shape ``(B,)`` or ``(B,1)``
+    - ``values``       : old values, shape ``(B,)`` or ``(B,1)``
+    - ``returns``      : returns, shape ``(B,)`` or ``(B,1)``
+    - ``advantages``   : advantages, shape ``(B,)`` or ``(B,1)``
 
     Notes
     -----
-    - PPO requires `old_logp` and `old_v` saved from rollout time to compute:
-        * ratio = exp(new_logp - old_logp)
-        * optionally value clipping using old_v
-    - This implementation standardizes vectors to (B,1) via `to_column()`.
+    - This core standardizes key vectors to column shape ``(B, 1)`` via
+      :func:`_to_column`.
+    - If ``target_kl`` is configured, an approximate KL diagnostic is computed per
+      minibatch and an ``early_stop`` flag is returned (the outer loop decides
+      whether to stop).
     """
 
     def __init__(
@@ -70,7 +97,7 @@ class PPODiscreteCore(ActorCriticCore):
         critic_weight_decay: float = 0.0,
         actor_sched_name: str = "none",
         critic_sched_name: str = "none",
-        # sched shared knobs
+        # scheduler shared knobs
         total_steps: int = 0,
         warmup_steps: int = 0,
         min_lr_ratio: float = 0.0,
@@ -80,46 +107,49 @@ class PPODiscreteCore(ActorCriticCore):
         milestones: Sequence[int] = (),
     ) -> None:
         """
-        Initialize PPODiscreteCore.
-
         Parameters
         ----------
         head : Any
-            Actor-critic head that must provide:
-              - head.actor: discrete policy network
-              - head.critic: state-value network
-        clip_range : float
-            PPO clip epsilon (commonly 0.1~0.3).
-        vf_coef : float
-            Weight for value-function loss term in total loss.
-        ent_coef : float
-            Weight for entropy bonus term in total loss.
-        clip_vloss : bool
-            If True, use PPO-style value clipping with old values.
-        target_kl : Optional[float]
-            If set, compute approx KL divergence and mark minibatch early-stop.
-        kl_stop_multiplier : float
-            Stop threshold multiplier: stop if approx_kl > multiplier * target_kl.
-        max_grad_norm : float
-            Gradient clipping max norm. Must be >= 0.
-        use_amp : bool
-            Enable automatic mixed precision (cuda amp).
-        actor_optim_name / critic_optim_name : str
-            Optimizer names passed into your build_optimizer().
-        actor_lr / critic_lr : float
+            Discrete actor-critic head providing:
+            - ``head.actor.get_dist(obs)`` -> categorical-like distribution
+            - ``head.critic(obs)`` -> value tensor
+            - ``head._normalize_discrete_action(action)`` -> LongTensor (B,)
+        clip_range : float, default=0.2
+            PPO clip epsilon :math:`\\epsilon`.
+        vf_coef : float, default=0.5
+            Coefficient for value loss.
+        ent_coef : float, default=0.0
+            Coefficient for entropy bonus (implemented via negative entropy loss).
+        clip_vloss : bool, default=True
+            Whether to apply PPO value clipping around rollout-time values.
+        target_kl : float | None, default=None
+            If provided, enable minibatch-level KL early-stop signal.
+        kl_stop_multiplier : float, default=1.0
+            Early-stop threshold multiplier. Stop if
+            ``approx_kl > kl_stop_multiplier * target_kl``.
+        max_grad_norm : float, default=0.5
+            Global gradient norm clipping threshold. Must be ``>= 0``.
+        use_amp : bool, default=False
+            Enable CUDA AMP (best-effort).
+
+        actor_optim_name, critic_optim_name : str, default="adamw"
+            Optimizer names for the base core optimizer builder.
+        actor_lr, critic_lr : float, default=3e-4
             Learning rates.
-        actor_weight_decay / critic_weight_decay : float
-            Weight decay.
-        actor_sched_name / critic_sched_name : str
-            Scheduler names.
-        total_steps / warmup_steps / min_lr_ratio / poly_power / step_size / sched_gamma / milestones
-            Scheduler parameters forwarded to build_scheduler().
+        actor_weight_decay, critic_weight_decay : float, default=0.0
+            Weight decay values.
+
+        actor_sched_name, critic_sched_name : str, default="none"
+            Scheduler names for the base core scheduler builder.
+        total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones
+            Scheduler parameters forwarded to the base core.
+
+        Raises
+        ------
+        ValueError
+            If invalid hyperparameters are provided (negative grad norm, non-positive
+            target_kl, non-positive kl_stop_multiplier).
         """
-        # ActorCriticCore will:
-        # - set device
-        # - create actor_opt / critic_opt
-        # - create actor_sched / critic_sched
-        # - create AMP scaler if enabled
         super().__init__(
             head=head,
             use_amp=use_amp,
@@ -140,24 +170,19 @@ class PPODiscreteCore(ActorCriticCore):
             milestones=milestones,
         )
 
-        # PPO hyperparameters
         self.clip_range = float(clip_range)
         self.vf_coef = float(vf_coef)
         self.ent_coef = float(ent_coef)
         self.clip_vloss = bool(clip_vloss)
 
-        # Target KL control (optional)
         self.target_kl = None if target_kl is None else float(target_kl)
         self.kl_stop_multiplier = float(kl_stop_multiplier)
 
-        # Gradient clipping
         self.max_grad_norm = float(max_grad_norm)
         if self.max_grad_norm < 0.0:
             raise ValueError(f"max_grad_norm must be >= 0, got {self.max_grad_norm}")
-
-        # Safety checks for KL early-stopping
         if self.target_kl is not None and self.target_kl <= 0.0:
-            raise ValueError(f"target_kl must be > 0 when provided, got: {self.target_kl}")
+            raise ValueError(f"target_kl must be > 0 when provided, got {self.target_kl}")
         if self.kl_stop_multiplier <= 0.0:
             raise ValueError(f"kl_stop_multiplier must be > 0, got {self.kl_stop_multiplier}")
 
@@ -166,43 +191,40 @@ class PPODiscreteCore(ActorCriticCore):
     # =============================================================================
     def update_from_batch(self, batch: Any) -> Dict[str, float]:
         """
-        Perform one PPO minibatch update (DISCRETE).
+        Perform **one** PPO minibatch update for discrete actions.
 
-        Core PPO computation
-        --------------------
-        ratio = exp(new_logp - old_logp)
-        policy_loss = -E[min(ratio * adv, clip(ratio, 1-eps, 1+eps) * adv)]
-
-        Value loss
+        Parameters
         ----------
-        - If clip_vloss=True:
-            V_clipped = old_v + clip(V - old_v, -eps, eps)
-            value_loss = 0.5 * mean(max((V-ret)^2, (V_clipped-ret)^2))
-        - Else:
-            value_loss = 0.5 * MSE(V, ret)
+        batch : Any
+            Rollout minibatch with required fields documented in the class docstring.
 
-        Entropy loss
-        ------------
-        ent_loss = -mean(entropy)
-        total_loss = policy_loss + vf_coef * value_loss + ent_coef * ent_loss
+        Returns
+        -------
+        Dict[str, float]
+            Scalar metrics suitable for logging. Keys include:
+            - ``loss/policy``, ``loss/value``, ``loss/entropy``, ``loss/total``
+            - ``stats/approx_kl``, ``stats/clip_frac``, ``stats/entropy``, ``stats/value_mean``
+            - ``train/early_stop``, ``train/target_kl``
+            - ``lr/actor``, ``lr/critic``
         """
-        # Increment update counter, etc. (BaseCore/ActorCriticCore utility)
         self._bump()
 
         # ------------------------------------------------------------------
-        # Move tensors to device
+        # Move tensors to device + normalize shapes/dtypes
         # ------------------------------------------------------------------
         obs = batch.observations.to(self.device)
+
+        # Discrete actions must be LongTensor of shape (B,)
         act_raw = batch.actions.to(self.device)
         act = self.head._normalize_discrete_action(act_raw)
 
-        # Old rollout-time statistics
-        old_logp = to_column(batch.log_probs.to(self.device))   # (B,1)
-        old_v = to_column(batch.values.to(self.device))         # (B,1)
+        # Rollout-time (behavior policy) stats
+        old_logp = _to_column(batch.log_probs.to(self.device))  # (B,1)
+        old_v = _to_column(batch.values.to(self.device))        # (B,1)
 
-        # Targets from rollout/GAE
-        ret = to_column(batch.returns.to(self.device))          # (B,1)
-        adv = to_column(batch.advantages.to(self.device))       # (B,1)
+        # Targets
+        ret = _to_column(batch.returns.to(self.device))         # (B,1)
+        adv = _to_column(batch.advantages.to(self.device))      # (B,1)
 
         clip_eps = self.clip_range
 
@@ -210,40 +232,44 @@ class PPODiscreteCore(ActorCriticCore):
             th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor
         ]:
             """
-            Forward pass + compute PPO losses for one minibatch.
+            Compute PPO losses/diagnostics for the current minibatch.
 
             Returns
             -------
-            total_loss, policy_loss, value_loss, ent_loss, approx_kl, clip_frac, ent_mean, v_mean
+            total_loss : torch.Tensor
+            policy_loss : torch.Tensor
+            value_loss : torch.Tensor
+            ent_loss : torch.Tensor
+            approx_kl : torch.Tensor
+            clip_frac : torch.Tensor
+            ent_mean : torch.Tensor
+            v_mean : torch.Tensor
             """
-            # Distribution π(.|s) from actor
+            # Current policy π(.|s)
             dist = self.head.actor.get_dist(obs)
 
-            # New log prob and entropy (convert (B,) -> (B,1))
-            new_logp = to_column(dist.log_prob(act))
-            entropy = to_column(dist.entropy())
+            # Categorical log_prob/entropy are typically (B,)
+            new_logp = _to_column(dist.log_prob(act))
+            entropy = _to_column(dist.entropy())
 
-            # Current value estimates V(s)
-            v = to_column(self.head.critic(obs))
+            # Current value V(s)
+            v = _to_column(self.head.critic(obs))
 
             # PPO ratio
             log_ratio = new_logp - old_logp
             ratio = th.exp(log_ratio)
 
-            # Clipped surrogate objective
+            # Clipped policy surrogate
             surr1 = ratio * adv
             surr2 = th.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
             policy_loss = -th.min(surr1, surr2).mean()
 
-            # Approx KL divergence estimate (common PPO diagnostic)
+            # Diagnostics
             approx_kl = (ratio - 1.0 - log_ratio).mean()
-
-            # Clip fraction (what fraction was clipped)
             clip_frac = (th.abs(ratio - 1.0) > clip_eps).float().mean()
 
-            # Value function loss
+            # Value loss (optional clipping)
             if self.clip_vloss:
-                # PPO value clipping uses old values as anchor
                 v_clipped = old_v + th.clamp(v - old_v, -clip_eps, clip_eps)
                 v_loss_unclipped = (v - ret).pow(2)
                 v_loss_clipped = (v_clipped - ret).pow(2)
@@ -251,12 +277,10 @@ class PPODiscreteCore(ActorCriticCore):
             else:
                 value_loss = 0.5 * F.mse_loss(v, ret)
 
-            # Entropy bonus (negative sign because we minimize the loss)
+            # Entropy bonus as a loss term (negative sign)
             ent_loss = -entropy.mean()
 
-            # Total loss
             total_loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * ent_loss
-
             return (
                 total_loss,
                 policy_loss,
@@ -275,7 +299,6 @@ class PPODiscreteCore(ActorCriticCore):
         self.critic_opt.zero_grad(set_to_none=True)
 
         if self.use_amp:
-            # AMP forward/backward
             with th.cuda.amp.autocast(enabled=True):
                 (
                     total_loss,
@@ -290,16 +313,14 @@ class PPODiscreteCore(ActorCriticCore):
 
             self.scaler.scale(total_loss).backward()
 
-            # Clip gradients across both actor+critic parameters
+            # One global clip across actor + critic parameters
             params = list(self.head.actor.parameters()) + list(self.head.critic.parameters())
             self._clip_params(params, max_grad_norm=self.max_grad_norm, optimizer=None)
 
-            # Step optimizer via scaler
             self.scaler.step(self.actor_opt)
             self.scaler.step(self.critic_opt)
             self.scaler.update()
         else:
-            # Standard fp32 path
             (
                 total_loss,
                 policy_loss,
@@ -313,40 +334,35 @@ class PPODiscreteCore(ActorCriticCore):
 
             total_loss.backward()
 
-            # Clip gradients across both networks
             params = list(self.head.actor.parameters()) + list(self.head.critic.parameters())
             self._clip_params(params, max_grad_norm=self.max_grad_norm)
 
-            # Apply parameter updates
             self.actor_opt.step()
             self.critic_opt.step()
 
-        # Step schedulers (if enabled in ActorCriticCore)
+        # Step schedulers (if configured in base core)
         self._step_scheds()
 
         # ------------------------------------------------------------------
-        # target_kl early-stop signal (per minibatch)
+        # target_kl early-stop (per minibatch)
         # ------------------------------------------------------------------
-        # NOTE:
-        # This does not stop inside core. It returns a scalar flag so the outer
-        # loop (OnPolicyAlgorithm) can break out of epoch/minibatch iteration.
         early_stop = 0.0
         if self.target_kl is not None:
-            if float(to_scalar(approx_kl)) > self.kl_stop_multiplier * self.target_kl:
+            if float(_to_scalar(approx_kl)) > self.kl_stop_multiplier * self.target_kl:
                 early_stop = 1.0
 
         # ------------------------------------------------------------------
-        # Return metrics for logging
+        # Metrics
         # ------------------------------------------------------------------
         return {
-            "loss/policy": float(to_scalar(policy_loss)),
-            "loss/value": float(to_scalar(value_loss)),
-            "loss/entropy": float(to_scalar(ent_loss)),
-            "loss/total": float(to_scalar(total_loss)),
-            "stats/approx_kl": float(to_scalar(approx_kl)),
-            "stats/clip_frac": float(to_scalar(clip_frac)),
-            "stats/entropy": float(to_scalar(ent_mean)),
-            "stats/value_mean": float(to_scalar(v_mean)),
+            "loss/policy": float(_to_scalar(policy_loss)),
+            "loss/value": float(_to_scalar(value_loss)),
+            "loss/entropy": float(_to_scalar(ent_loss)),
+            "loss/total": float(_to_scalar(total_loss)),
+            "stats/approx_kl": float(_to_scalar(approx_kl)),
+            "stats/clip_frac": float(_to_scalar(clip_frac)),
+            "stats/entropy": float(_to_scalar(ent_mean)),
+            "stats/value_mean": float(_to_scalar(v_mean)),
             "train/early_stop": float(early_stop),
             "train/target_kl": float(self.target_kl) if self.target_kl is not None else 0.0,
             "lr/actor": float(self.actor_opt.param_groups[0]["lr"]),
@@ -358,15 +374,14 @@ class PPODiscreteCore(ActorCriticCore):
     # =============================================================================
     def state_dict(self) -> Dict[str, Any]:
         """
-        Extend ActorCriticCore state_dict with PPO-discrete specific hyperparameters.
+        Extend :meth:`ActorCriticCore.state_dict` with PPO-discrete hyperparameters.
 
-        Returned dict includes:
-          - base (ActorCriticCore) state:
-              * update counter
-              * actor optimizer/scheduler state
-              * critic optimizer/scheduler state
-              * AMP scaler (if enabled)
-          - PPO-specific config under key "ppo_discrete"
+        Returns
+        -------
+        Dict[str, Any]
+            State dictionary including:
+            - base core state (optimizers, schedulers, AMP scaler, update counter)
+            - PPO-discrete hyperparameters under ``state["ppo_discrete"]``
         """
         s = super().state_dict()
         s.update(
@@ -386,26 +401,35 @@ class PPODiscreteCore(ActorCriticCore):
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """
-        Restore optimizer/scheduler state AND PPO-discrete hyperparameters.
+        Restore base state and PPO-discrete hyperparameters.
+
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State mapping produced by :meth:`state_dict`.
 
         Notes
         -----
-        - Optimizer/scheduler/scaler restore is handled by ActorCriticCore.
-        - PPO hyperparameters are restored from state["ppo_discrete"] if present.
+        - The base class restores optimizer/scheduler/scaler state.
+        - PPO-discrete hyperparameters are restored from ``state["ppo_discrete"]``
+          if present, otherwise this method falls back to top-level keys for
+          backward compatibility with older checkpoints.
         """
         super().load_state_dict(state)
-        
-        if "clip_range" in state:
-            self.clip_range = float(state["clip_range"])
-        if "vf_coef" in state:
-            self.vf_coef = float(state["vf_coef"])
-        if "ent_coef" in state:
-            self.ent_coef = float(state["ent_coef"])
-        if "clip_vloss" in state:
-            self.clip_vloss = bool(state["clip_vloss"])
-        if "target_kl" in state:
-            self.target_kl = None if state["target_kl"] is None else float(state["target_kl"])
-        if "kl_stop_multiplier" in state:
-            self.kl_stop_multiplier = float(state["kl_stop_multiplier"])
-        if "max_grad_norm" in state:
-            self.max_grad_norm = float(state["max_grad_norm"])
+
+        ppo_state: Mapping[str, Any] = state.get("ppo_discrete", state)  # backward-compatible
+
+        if "clip_range" in ppo_state:
+            self.clip_range = float(ppo_state["clip_range"])
+        if "vf_coef" in ppo_state:
+            self.vf_coef = float(ppo_state["vf_coef"])
+        if "ent_coef" in ppo_state:
+            self.ent_coef = float(ppo_state["ent_coef"])
+        if "clip_vloss" in ppo_state:
+            self.clip_vloss = bool(ppo_state["clip_vloss"])
+        if "target_kl" in ppo_state:
+            self.target_kl = None if ppo_state["target_kl"] is None else float(ppo_state["target_kl"])
+        if "kl_stop_multiplier" in ppo_state:
+            self.kl_stop_multiplier = float(ppo_state["kl_stop_multiplier"])
+        if "max_grad_norm" in ppo_state:
+            self.max_grad_norm = float(ppo_state["max_grad_norm"])

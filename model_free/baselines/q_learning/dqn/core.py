@@ -5,68 +5,109 @@ from typing import Any, Dict, Mapping, Sequence
 import torch as th
 import torch.nn.functional as F
 
-from model_free.common.utils.common_utils import to_scalar, to_column
+from model_free.common.utils.common_utils import _to_scalar, _to_column
 from model_free.common.policies.base_core import QLearningCore
-from model_free.common.utils.policy_utils import get_per_weights
+from model_free.common.utils.policy_utils import _get_per_weights
 
 
 class DQNCore(QLearningCore):
     """
-    DQN Update Engine (DQNCore)
+    DQN / Double DQN update engine built on top of :class:`QLearningCore`.
 
-    Summary
-    -------
-    Implements the standard DQN / Double DQN update on top of the shared
-    `QLearningCore` infrastructure (optimizer/scheduler/AMP/target updates).
+    This core implements the standard temporal-difference (TD) update used by
+    DQN-style algorithms for **discrete action** spaces. It relies on the shared
+    :class:`QLearningCore` base class for optimizer/scheduler management, AMP
+    support, update counters, and target-network update utilities.
 
-    What this core owns
-    -------------------
-    - TD hyperparameters: gamma, target update schedule (interval/tau)
-    - Variant toggles: Double DQN, Huber vs MSE
-    - Gradient clipping and PER-related logging
+    Algorithm
+    ---------
+    Let :math:`Q_\\theta` be the online network and :math:`Q_{\\bar\\theta}` the
+    target network.
 
-    What `QLearningCore` provides (inherited)
-    ----------------------------------------
-    - `self.opt` / `self.sched` (optimizer + optional scheduler for Q network)
-    - `self.device` (resolved from head)
-    - AMP scaler + update counter via `_bump()`
-    - `_clip_params()` helper for gradient norm clipping
-    - `_maybe_update_target()` helper for periodic hard/soft target updates
+    Online estimate:
 
-    Expected head (duck-typed)
-    --------------------------
-    - head.q: nn.Module
-        Online Q-network. Forward: q(obs) -> (B, A).
-    - head.q_target: nn.Module
-        Target Q-network. Forward: q_target(obs) -> (B, A).
-    - head.device: torch.device
-        Device used by the head (and thus by the core).
-    - optional: head.hard_update / head.soft_update / head.freeze_target
-        Common utilities exposed by a BaseHead implementation.
+    .. math::
+        Q_\\theta(s, a)
+
+    Target:
+
+    - Vanilla DQN:
+      .. math::
+          y = r + \\gamma (1-d) \\max_{a'} Q_{\\bar\\theta}(s', a')
+
+    - Double DQN:
+      .. math::
+          a^* = \\arg\\max_{a'} Q_{\\theta}(s', a'), \\quad
+          y = r + \\gamma (1-d) Q_{\\bar\\theta}(s', a^*)
+
+    Loss (per-sample):
+
+    - Huber (Smooth L1) if ``huber=True`` else MSE.
+    - If PER weights ``w_i`` are provided, the loss is importance-weighted.
+
+    Target updates
+    --------------
+    Target updates are delegated to ``_maybe_update_target`` from the base class:
+
+    - Hard update every ``target_update_interval`` steps (typical DQN) when ``tau=0``.
+    - Soft/Polyak update when ``tau>0`` (if supported by base implementation).
+
+    Expected head interface (duck-typed)
+    ------------------------------------
+    The head must provide:
+
+    - ``head.q`` : torch.nn.Module
+        Online Q-network.
+    - ``head.q_target`` : torch.nn.Module
+        Target Q-network.
+    - ``head.q_values(obs) -> Tensor`` of shape (B, A)
+        Online Q-values.
+    - ``head.q_values_target(obs) -> Tensor`` of shape (B, A)
+        Target Q-values.
+    - ``head.freeze_target(module) -> None``
+        Utility to freeze/eval the target network (recommended).
+
+    Notes
+    -----
+    - This core returns a NumPy vector ``per/td_errors`` as a priority proxy for PER.
+      The core itself does not update priorities; the replay buffer is expected to
+      consume these values.
+    - ``per_eps`` is stored as metadata for reproducibility / buffer-side use. It is
+      not directly applied in the loss here.
     """
 
     def __init__(
         self,
         *,
         head: Any,
+        # ---------------------------------------------------------------------
         # TD / target update
+        # ---------------------------------------------------------------------
         gamma: float = 0.99,
         target_update_interval: int = 1000,
         tau: float = 0.0,
-        # variants / loss
+        # ---------------------------------------------------------------------
+        # Variants / loss
+        # ---------------------------------------------------------------------
         double_dqn: bool = True,
         huber: bool = True,
-        # grad / amp
+        # ---------------------------------------------------------------------
+        # Stability / AMP
+        # ---------------------------------------------------------------------
         max_grad_norm: float = 0.0,
         use_amp: bool = False,
-        # PER epsilon for priorities output (core-side proxy only)
+        # ---------------------------------------------------------------------
+        # PER metadata (core-side only)
+        # ---------------------------------------------------------------------
         per_eps: float = 1e-6,
-        # optimizer/scheduler (inherited)
+        # ---------------------------------------------------------------------
+        # Optimizer / scheduler (handled by QLearningCore)
+        # ---------------------------------------------------------------------
         optim_name: str = "adamw",
         lr: float = 3e-4,
         weight_decay: float = 0.0,
         sched_name: str = "none",
-        # scheduler shared knobs
+        # Scheduler knobs (shared)
         total_steps: int = 0,
         warmup_steps: int = 0,
         min_lr_ratio: float = 0.0,
@@ -75,7 +116,54 @@ class DQNCore(QLearningCore):
         sched_gamma: float = 0.99,
         milestones: Sequence[int] = (),
     ) -> None:
-        # Delegate optimizer/scheduler/AMP wiring to QLearningCore.
+        """
+        Parameters
+        ----------
+        head : Any
+            Q-learning head that provides online/target Q networks and helper methods.
+            See class docstring for the expected interface.
+        gamma : float, default=0.99
+            Discount factor. Must satisfy ``0 <= gamma < 1``.
+        target_update_interval : int, default=1000
+            Interval (in gradient updates) for target-network updates.
+            - If 0: base implementation may interpret as "always update" or "never";
+              follow your ``_maybe_update_target`` semantics.
+        tau : float, default=0.0
+            Soft-update coefficient for Polyak averaging.
+            - ``tau = 0`` typically corresponds to hard updates only.
+            - ``0 < tau <= 1`` enables soft updates (if base supports it).
+
+        double_dqn : bool, default=True
+            If True, use Double DQN target computation (action selection from online net).
+        huber : bool, default=True
+            If True, use Huber loss (Smooth L1). Else use MSE.
+
+        max_grad_norm : float, default=0.0
+            Global gradient clipping threshold.
+            - 0.0 typically means "no clipping" (depending on BaseCore implementation).
+        use_amp : bool, default=False
+            Enable AMP autocast + GradScaler (handled by base class).
+
+        per_eps : float, default=1e-6
+            PER epsilon metadata for priority computation on the replay-buffer side.
+            This core returns TD errors; the buffer may compute priorities as
+            ``(|td_error| + per_eps)``.
+        optim_name : str, default="adamw"
+            Optimizer name for online Q parameters.
+        lr : float, default=3e-4
+            Learning rate.
+        weight_decay : float, default=0.0
+            Weight decay.
+        sched_name : str, default="none"
+            Scheduler name (optional).
+        total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones
+            Scheduler knobs passed to the base class.
+
+        Raises
+        ------
+        ValueError
+            If any hyperparameter is out of range.
+        """
         super().__init__(
             head=head,
             use_amp=use_amp,
@@ -92,24 +180,22 @@ class DQNCore(QLearningCore):
             milestones=milestones,
         )
 
-        # Store TD / target-update hyperparameters.
         self.gamma = float(gamma)
         self.target_update_interval = int(target_update_interval)
         self.tau = float(tau)
 
-        # Algorithm variants.
         self.double_dqn = bool(double_dqn)
         self.huber = bool(huber)
 
-        # Training stability knobs.
         self.max_grad_norm = float(max_grad_norm)
         self.per_eps = float(per_eps)
 
-        # Basic validation (fail fast for invalid configs).
         if not (0.0 <= self.gamma < 1.0):
             raise ValueError(f"gamma must be in [0,1), got {self.gamma}")
         if self.target_update_interval < 0:
-            raise ValueError(f"target_update_interval must be >= 0, got {self.target_update_interval}")
+            raise ValueError(
+                f"target_update_interval must be >= 0, got {self.target_update_interval}"
+            )
         if not (0.0 <= self.tau <= 1.0):
             raise ValueError(f"tau must be in [0,1], got {self.tau}")
         if self.max_grad_norm < 0.0:
@@ -117,6 +203,7 @@ class DQNCore(QLearningCore):
         if self.per_eps < 0.0:
             raise ValueError(f"per_eps must be >= 0, got {self.per_eps}")
 
+        # Enforce common invariant: target net is frozen/eval.
         self.head.freeze_target(self.head.q_target)
 
     # =============================================================================
@@ -124,113 +211,137 @@ class DQNCore(QLearningCore):
     # =============================================================================
     def update_from_batch(self, batch: Any) -> Dict[str, float]:
         """
-        Perform one gradient update using a replay batch.
+        Perform one DQN-style TD update from a replay batch.
 
-        Batch contract
-        --------------
-        batch must provide (tensors):
-          - observations:      (B, obs_dim)
-          - actions:           (B,) or (B,1) (discrete action indices)
-          - rewards:           (B,) or (B,1)
-          - next_observations: (B, obs_dim)
-          - dones:             (B,) or (B,1)
-          - (optional) PER weights via `get_per_weights(batch, ...)`
+        Parameters
+        ----------
+        batch : Any
+            Replay batch container providing (tensors):
+            observations : torch.Tensor
+                Shape (B, obs_dim).
+            actions : torch.Tensor
+                Discrete action indices. Shape (B,) or (B,1).
+            rewards : torch.Tensor
+                Shape (B,) or (B,1).
+            next_observations : torch.Tensor
+                Shape (B, obs_dim).
+            dones : torch.Tensor
+                Terminal flags (0/1). Shape (B,) or (B,1).
+
+            PER integration (optional)
+            --------------------------
+            If your replay buffer supports prioritized replay, ``_get_per_weights``
+            should be able to extract importance-sampling weights from the batch.
+            The returned ``w`` must be broadcastable to (B,1).
 
         Returns
         -------
-        metrics : Dict[str, float] (plus a numpy vector for PER td_errors)
-            Logging scalars and PER priority feedback.
+        metrics : Dict[str, float]
+            Logging scalars plus a NumPy TD-error vector used for PER updates:
+
+            - ``loss/q`` : float
+                Scalar TD loss.
+            - ``q/mean`` : float
+                Mean Q(s,a) on the batch.
+            - ``target/mean`` : float
+                Mean TD target y on the batch.
+            - ``lr`` : float
+                Current learning rate.
+            - ``per/td_errors`` : np.ndarray
+                Absolute TD error per sample, shape (B,).
+
+        Notes
+        -----
+        - Target computation is wrapped in ``torch.no_grad()`` to prevent gradients
+          through the target path.
+        - For Double DQN, the argmax action is selected using the online network.
+        - Shape normalization is done via ``_to_column`` to unify to (B,1).
         """
-        # Bump internal update counter; manages AMP bookkeeping in base core.
         self._bump()
 
-        # Move batch to device and normalize shapes.
-        obs = batch.observations.to(self.device)                 # (B, obs_dim)
-        act = batch.actions.to(self.device).long()               # (B,) or (B,1)
-        rew = to_column(batch.rewards.to(self.device))           # -> (B,1)
-        next_obs = batch.next_observations.to(self.device)       # (B, obs_dim)
-        done = to_column(batch.dones.to(self.device))            # -> (B,1)
+        # ------------------------------------------------------------------
+        # Move batch to device and normalize shapes
+        # ------------------------------------------------------------------
+        obs = batch.observations.to(self.device)                      # (B, obs_dim)
+        act = batch.actions.to(self.device).long()                    # (B,) or (B,1)
+        rew = _to_column(batch.rewards.to(self.device))               # (B,1)
+        next_obs = batch.next_observations.to(self.device)            # (B, obs_dim)
+        done = _to_column(batch.dones.to(self.device))                # (B,1)
 
         B = int(obs.shape[0])
-        w = get_per_weights(batch, B, device=self.device)
+        w = _get_per_weights(batch, B, device=self.device)            # None or (B,1)/(B,)
 
         # ------------------------------------------------------------------
         # Online estimate: Q(s,a)
         # ------------------------------------------------------------------
-        # Compute all action values Q(s, ·) then gather Q(s,a) for chosen actions.
-        q_all = self.head.q_values(obs)                           # (B, A)
-        q_sa = q_all.gather(1, act.view(-1, 1))                   # (B, 1)
+        q_all = self.head.q_values(obs)                               # (B, A)
+        q_sa = q_all.gather(1, act.view(-1, 1))                       # (B, 1)
 
         # ------------------------------------------------------------------
-        # Bootstrapped target:
-        #   y = r + gamma * (1-done) * Q_target(s', a*)
-        #
-        # Double DQN:
-        #   a* = argmax_a Q_online(s',a)
-        #   Q_target evaluated only at that action
+        # Bootstrapped target
         # ------------------------------------------------------------------
         with th.no_grad():
-            q_next_target_all = self.head.q_values_target(next_obs)      # (B, A)
+            q_next_target_all = self.head.q_values_target(next_obs)   # (B, A)
 
             if self.double_dqn:
-                # Action selection from online net (reduces overestimation bias).
-                a_star = th.argmax(self.head.q_values(next_obs), dim=-1, keepdim=True)  # (B,1)
-                q_next = q_next_target_all.gather(1, a_star)                     # (B,1)
+                # Action selection from online net; evaluation from target net.
+                a_star = th.argmax(
+                    self.head.q_values(next_obs), dim=-1, keepdim=True
+                )                                                    # (B,1)
+                q_next = q_next_target_all.gather(1, a_star)          # (B,1)
             else:
-                # Vanilla DQN target: max over target net directly.
-                q_next = q_next_target_all.max(dim=1, keepdim=True).values       # (B,1)
+                q_next = q_next_target_all.max(dim=1, keepdim=True).values  # (B,1)
 
-            target = rew + self.gamma * (1.0 - done) * q_next     # (B, 1)
+            target = rew + self.gamma * (1.0 - done) * q_next         # (B,1)
 
         # ------------------------------------------------------------------
-        # Loss
+        # TD loss (elementwise -> supports PER weighting)
         # ------------------------------------------------------------------
-        # Compute elementwise TD loss to support PER weighting.
         if self.huber:
-            # Smooth L1 is typically more robust to outliers than MSE.
-            per_sample = F.smooth_l1_loss(q_sa, target, reduction="none")        # (B,1)
+            per_sample = F.smooth_l1_loss(q_sa, target, reduction="none")    # (B,1)
         else:
-            per_sample = F.mse_loss(q_sa, target, reduction="none")              # (B,1)
+            per_sample = F.mse_loss(q_sa, target, reduction="none")          # (B,1)
 
-        # If PER is enabled, weight each sample by its importance weight.
-        loss = per_sample.mean() if w is None else (per_sample * w).mean()
+        if w is None:
+            loss = per_sample.mean()
+        else:
+            # Ensure (B,1) broadcast
+            w_col = _to_column(w) if isinstance(w, th.Tensor) else w
+            loss = (per_sample * w_col).mean()  # type: ignore[operator]
 
         # ------------------------------------------------------------------
-        # Optim step (online Q network only)
+        # Optimizer step (online network only)
         # ------------------------------------------------------------------
         self.opt.zero_grad(set_to_none=True)
 
         if self.use_amp:
-            # AMP branch: scale gradients and step via GradScaler.
             with th.cuda.amp.autocast(enabled=True):
                 loss_amp = loss
             self.scaler.scale(loss_amp).backward()
-            self._clip_params(self.head.q.parameters(), max_grad_norm=self.max_grad_norm, optimizer=self.opt)
+            self._clip_params(
+                self.head.q.parameters(),
+                max_grad_norm=self.max_grad_norm,
+                optimizer=self.opt,
+            )
             self.scaler.step(self.opt)
             self.scaler.update()
         else:
-            # FP32 branch.
             loss.backward()
             self._clip_params(self.head.q.parameters(), max_grad_norm=self.max_grad_norm)
             self.opt.step()
 
-        # Step scheduler after optimizer step (if configured).
         if self.sched is not None:
             self.sched.step()
 
         # ------------------------------------------------------------------
-        # PER priorities (TD error proxy)
+        # PER priority proxy: |TD error|
         # ------------------------------------------------------------------
-        # Provide per-sample TD error magnitude as priority signal.
         with th.no_grad():
-            td_error = (target - q_sa).abs().view(-1)             # (B,)
+            td_error = (target - q_sa).abs().view(-1)                 # (B,)
 
         # ------------------------------------------------------------------
-        # Target update
+        # Target update (hard/soft depending on base helper)
         # ------------------------------------------------------------------
-        # Uses base helper which can implement:
-        # - hard updates every `interval` steps (tau=0 or explicit hard copy)
-        # - soft/Polyak updates when tau>0
         self._maybe_update_target(
             target=getattr(self.head, "q_target", None),
             source=self.head.q,
@@ -238,15 +349,11 @@ class DQNCore(QLearningCore):
             tau=self.tau,
         )
 
-        # ------------------------------------------------------------------
-        # Logging
-        # ------------------------------------------------------------------
         return {
-            "loss/q": float(to_scalar(loss)),
-            "q/mean": float(to_scalar(q_sa.mean())),
-            "target/mean": float(to_scalar(target.mean())),
+            "loss/q": float(_to_scalar(loss)),
+            "q/mean": float(_to_scalar(q_sa.mean())),
+            "target/mean": float(_to_scalar(target.mean())),
             "lr": float(self.opt.param_groups[0]["lr"]),
-            # Numpy vector used by PER buffer to update priorities.
             "per/td_errors": td_error.detach().cpu().numpy(),
         }
 
@@ -255,13 +362,22 @@ class DQNCore(QLearningCore):
     # =============================================================================
     def state_dict(self) -> Dict[str, Any]:
         """
-        Extend base core state with DQN-specific hyperparameters.
+        Serialize core state including DQN-specific hyperparameters.
 
-        Base `QLearningCore.state_dict()` typically includes:
-          - update_calls
-          - optimizer state (+ scheduler state if present)
+        Returns
+        -------
+        state : Dict[str, Any]
+            Serializable state dict.
 
-        This core adds hyperparameters for reproducibility/debugging.
+        Notes
+        -----
+        Base :class:`QLearningCore.state_dict` is expected to include:
+        - update counters / bookkeeping
+        - optimizer state
+        - scheduler state (if configured)
+
+        This method extends the base state with DQN hyperparameters to support
+        reproducibility and debugging.
         """
         s = super().state_dict()
         s.update(
@@ -281,10 +397,17 @@ class DQNCore(QLearningCore):
         """
         Restore base core state (optimizer/scheduler/update counters).
 
-        Note
-        ----
-        Hyperparameters are constructor-owned. We intentionally do not override
-        them from the checkpoint to avoid silently changing runtime behavior.
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State dictionary produced by :meth:`state_dict`.
+
+        Notes
+        -----
+        - Hyperparameters are constructor-owned in this implementation and are
+          intentionally not overridden from the checkpoint to avoid silently
+          changing runtime behavior.
+        - If you want hyperparameter restoration, implement it explicitly and
+          validate compatibility (e.g., gamma, double_dqn, etc.).
         """
         super().load_state_dict(state)
-        return

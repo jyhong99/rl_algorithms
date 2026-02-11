@@ -7,7 +7,6 @@ import torch as th
 
 from .head import VPGDiscreteHead
 from .core import VPGDiscreteCore
-
 from model_free.common.policies.on_policy_algorithm import OnPolicyAlgorithm
 
 
@@ -16,34 +15,34 @@ def vpg_discrete(
     obs_dim: int,
     n_actions: int,
     device: Union[str, th.device] = "cpu",
-    # -----------------------------
-    # Network (head) hyperparams
-    # -----------------------------
+    # ---------------------------------------------------------------------
+    # Network (head) hyperparameters
+    # ---------------------------------------------------------------------
     use_baseline: bool = True,
     hidden_sizes: Tuple[int, ...] = (64, 64),
     activation_fn: Any = th.nn.ReLU,
     init_type: str = "orthogonal",
     gain: float = 1.0,
     bias: float = 0.0,
-    # -----------------------------
-    # VPG update (core) hyperparams
-    # -----------------------------
+    # ---------------------------------------------------------------------
+    # VPG update (core) hyperparameters
+    # ---------------------------------------------------------------------
     vf_coef: float = 0.5,
     ent_coef: float = 0.0,
     max_grad_norm: float = 0.5,
     use_amp: bool = False,
-    # -----------------------------
+    # ---------------------------------------------------------------------
     # Optimizers
-    # -----------------------------
+    # ---------------------------------------------------------------------
     actor_optim_name: str = "adamw",
     actor_lr: float = 3e-4,
     actor_weight_decay: float = 0.0,
     critic_optim_name: str = "adamw",
     critic_lr: float = 3e-4,
     critic_weight_decay: float = 0.0,
-    # -----------------------------
+    # ---------------------------------------------------------------------
     # (Optional) schedulers
-    # -----------------------------
+    # ---------------------------------------------------------------------
     actor_sched_name: str = "none",
     critic_sched_name: str = "none",
     total_steps: int = 0,
@@ -53,58 +52,151 @@ def vpg_discrete(
     step_size: int = 1000,
     sched_gamma: float = 0.99,
     milestones: Tuple[int, ...] = (),
-    # -----------------------------
+    # ---------------------------------------------------------------------
     # OnPolicyAlgorithm rollout / schedule
-    # -----------------------------
+    # ---------------------------------------------------------------------
     rollout_steps: int = 2048,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     update_epochs: int = 1,
     minibatch_size: Optional[int] = None,
     dtype_obs: Any = np.float32,
-    dtype_act: Any = np.int64,  # Discrete actions are typically stored as int64
+    dtype_act: Any = np.int64,
     normalize_advantages: bool = False,
     adv_eps: float = 1e-8,
 ) -> OnPolicyAlgorithm:
     """
-    Build a DISCRETE-action VPG OnPolicyAlgorithm (config-free style).
+    Build a discrete-action VPG :class:`OnPolicyAlgorithm` instance (builder function).
 
-    What this builder constructs
-    ----------------------------
-    - Head: VPGDiscreteHead
-        * Actor: categorical policy π(a|s)
-        * Critic (optional): value baseline V(s)
+    This function wires together three components into a ready-to-use algorithm:
 
-    - Core: VPGDiscreteCore
-        * Policy gradient update
-        * Optional critic regression update (if baseline enabled)
+    1) **VPGDiscreteHead**
+       - Actor: categorical policy :math:`\\pi(a\\mid s)` over ``n_actions``
+       - Critic (optional): baseline :math:`V(s)` controlled by ``use_baseline``
 
-    - Algorithm: OnPolicyAlgorithm
-        * Rollout collection
-        * GAE / return computation
-        * Update scheduling (when ready_to_update triggers)
+    2) **VPGDiscreteCore**
+       - Performs one update per call using:
+         * policy-gradient loss (always),
+         * optional entropy regularization (``ent_coef``),
+         * optional value regression (``vf_coef``) when baseline is enabled.
+       - Baseline behavior strictly follows the head configuration.
+
+    3) **OnPolicyAlgorithm**
+       - Collects rollouts from the environment,
+       - Computes returns and advantages (typically via GAE),
+       - Calls ``core.update_from_batch(...)`` according to scheduling parameters.
 
     Baseline contract
     -----------------
-    - `use_baseline` controls whether the head creates a critic:
-        * use_baseline=False => REINFORCE-style (actor-only)
-        * use_baseline=True  => actor + value baseline (variance reduction)
-    - The core does NOT decide baseline usage independently.
-      It follows the head settings and builds critic optimizer/scheduler only
-      if the critic exists.
+    ``use_baseline`` controls whether the head constructs a critic, and the core
+    follows the head configuration:
+
+    - baseline OFF:
+        Actor-only REINFORCE-style updates (no value loss, no critic optimizer).
+    - baseline ON:
+        Actor + critic updates (recommended).
 
     Notes
     -----
-    - For VPG, the common setting is:
-        update_epochs = 1
-        minibatch_size = None (full-batch update)
-    - `gae_lambda` is included for consistency with the shared OnPolicyAlgorithm.
-      Whether "true VPG" uses GAE is your design choice; in practice GAE is often
-      used even for simple policy gradient implementations.
-    """
+    - Typical VPG settings are one update per rollout:
+      ``update_epochs=1`` and ``minibatch_size=None`` (full-batch).
+    - ``gae_lambda`` is included for consistency with a shared on-policy driver.
+      Whether you use GAE for "pure VPG" is a design choice; in practice it is
+      often used to reduce variance.
+    - Discrete actions are typically stored as ``int64`` (PyTorch categorical
+      distributions expect integer class indices).
 
+    Parameters
+    ----------
+    obs_dim : int
+        Observation (state) dimension.
+    n_actions : int
+        Number of discrete actions.
+    device : Union[str, torch.device], default="cpu"
+        Torch device used by head/core/algo.
+
+    use_baseline : bool, default=True
+        Whether to include a value baseline network :math:`V(s)`.
+    hidden_sizes : Tuple[int, ...], default=(64, 64)
+        Hidden layer sizes for actor and critic MLPs.
+    activation_fn : Any, default=torch.nn.ReLU
+        Activation function **class** used by the MLP builders.
+    init_type : str, default="orthogonal"
+        Weight initialization scheme identifier (primarily used by the critic builder).
+    gain : float, default=1.0
+        Initialization gain multiplier.
+    bias : float, default=0.0
+        Bias initialization value.
+
+    vf_coef : float, default=0.5
+        Value-loss coefficient (only applies when baseline is enabled).
+    ent_coef : float, default=0.0
+        Entropy regularization coefficient.
+    max_grad_norm : float, default=0.5
+        Global norm gradient clipping threshold (core-side).
+    use_amp : bool, default=False
+        Enable AMP for updates if supported by the core/BaseCore.
+
+    actor_optim_name : str, default="adamw"
+        Actor optimizer name (resolved by ``build_optimizer``).
+    actor_lr : float, default=3e-4
+        Actor learning rate.
+    actor_weight_decay : float, default=0.0
+        Actor weight decay.
+    critic_optim_name : str, default="adamw"
+        Critic optimizer name (only used if baseline is enabled).
+    critic_lr : float, default=3e-4
+        Critic learning rate (only used if baseline is enabled).
+    critic_weight_decay : float, default=0.0
+        Critic weight decay (only used if baseline is enabled).
+
+    actor_sched_name : str, default="none"
+        Actor LR scheduler name.
+    critic_sched_name : str, default="none"
+        Critic LR scheduler name (only used if baseline is enabled).
+    total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones
+        Scheduler knobs passed through to the core and resolved by ``build_scheduler``.
+
+    rollout_steps : int, default=2048
+        Number of environment steps collected per update.
+    gamma : float, default=0.99
+        Discount factor.
+    gae_lambda : float, default=0.95
+        GAE lambda for advantage estimation.
+    update_epochs : int, default=1
+        Number of update epochs per rollout (VPG typically uses 1).
+    minibatch_size : Optional[int], default=None
+        Minibatch size used by the on-policy algorithm update loop. ``None`` is
+        interpreted as full-batch in most implementations.
+    dtype_obs : Any, default=np.float32
+        Observation dtype used by rollout buffer / preprocessing.
+    dtype_act : Any, default=np.int64
+        Action dtype used by rollout buffer / preprocessing (discrete indices).
+    normalize_advantages : bool, default=False
+        Whether to normalize advantages before the policy update (algorithm-side).
+    adv_eps : float, default=1e-8
+        Epsilon used for advantage normalization: ``std + adv_eps``.
+
+    Returns
+    -------
+    algo : OnPolicyAlgorithm
+        Fully constructed discrete-action VPG algorithm instance.
+
+    Examples
+    --------
+    >>> algo = vpg_discrete(obs_dim=8, n_actions=4, device="cpu", use_baseline=True)
+    >>> algo.setup(env)
+    >>> obs = env.reset()
+    >>> while True:
+    ...     action = algo.act(obs)
+    ...     next_obs, reward, done, info = env.step(action)
+    ...     algo.on_env_step(obs=obs, action=action, reward=reward, done=done, info=info)
+    ...     if algo.ready_to_update():
+    ...         metrics = algo.update()
+    ...     obs = next_obs
+    """
     # ------------------------------------------------------------------
-    # Head: networks (actor + optional value baseline critic)
+    # 1) Head: networks (actor + optional value baseline critic)
     # ------------------------------------------------------------------
     head = VPGDiscreteHead(
         obs_dim=int(obs_dim),
@@ -119,7 +211,7 @@ def vpg_discrete(
     )
 
     # ------------------------------------------------------------------
-    # Core: update engine (baseline behavior follows head)
+    # 2) Core: update engine (baseline behavior follows head)
     # ------------------------------------------------------------------
     core = VPGDiscreteCore(
         head=head,
@@ -148,10 +240,8 @@ def vpg_discrete(
     )
 
     # ------------------------------------------------------------------
-    # Algorithm: rollout + update scheduling
+    # 3) Algorithm: rollout collection + update scheduling
     # ------------------------------------------------------------------
-    # OnPolicyAlgorithm owns the rollout buffer and triggers core updates once
-    # enough transitions are collected.
     algo = OnPolicyAlgorithm(
         head=head,
         core=core,
@@ -159,7 +249,6 @@ def vpg_discrete(
         gamma=float(gamma),
         gae_lambda=float(gae_lambda),
         update_epochs=int(update_epochs),
-        # None => "full batch" if your OnPolicyAlgorithm supports it
         minibatch_size=None if minibatch_size is None else int(minibatch_size),
         device=device,
         dtype_obs=dtype_obs,

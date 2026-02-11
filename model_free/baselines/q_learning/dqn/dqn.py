@@ -4,8 +4,8 @@ from typing import Any, Tuple, Union
 
 import torch as th
 
-from .head import DQNHead
 from .core import DQNCore
+from .head import DQNHead
 from model_free.common.policies.off_policy_algorithm import OffPolicyAlgorithm
 
 
@@ -14,36 +14,36 @@ def dqn(
     obs_dim: int,
     n_actions: int,
     device: Union[str, th.device] = "cpu",
-    # -----------------------------
-    # Network (head) hyperparams
-    # -----------------------------
+    # -------------------------------------------------------------------------
+    # Network (head) hyperparameters
+    # -------------------------------------------------------------------------
     hidden_sizes: Tuple[int, ...] = (256, 256),
     activation_fn: Any = th.nn.ReLU,
     dueling_mode: bool = False,
     init_type: str = "orthogonal",
     gain: float = 1.0,
     bias: float = 0.0,
-    # -----------------------------
-    # DQN update (core) hyperparams
-    # -----------------------------
+    # -------------------------------------------------------------------------
+    # DQN update (core) hyperparameters
+    # -------------------------------------------------------------------------
     gamma: float = 0.99,
     double_dqn: bool = True,
     huber: bool = True,
-    # target update
-    target_update_interval: int = 1000,  # hard update every N updates (if tau<=0)
-    tau: float = 0.0,                    # if >0, Polyak at update_interval steps
+    # Target update knobs
+    target_update_interval: int = 1000,
+    tau: float = 0.0,
     max_grad_norm: float = 0.0,
     use_amp: bool = False,
     per_eps: float = 1e-6,
-    # -----------------------------
+    # -------------------------------------------------------------------------
     # Optimizer
-    # -----------------------------
+    # -------------------------------------------------------------------------
     optim_name: str = "adamw",
     lr: float = 3e-4,
     weight_decay: float = 0.0,
-    # -----------------------------
+    # -------------------------------------------------------------------------
     # (Optional) scheduler
-    # -----------------------------
+    # -------------------------------------------------------------------------
     sched_name: str = "none",
     total_steps: int = 0,
     warmup_steps: int = 0,
@@ -52,12 +52,11 @@ def dqn(
     step_size: int = 1000,
     sched_gamma: float = 0.99,
     milestones: Tuple[int, ...] = (),
-    # -----------------------------
+    # -------------------------------------------------------------------------
     # OffPolicyAlgorithm schedule / replay
-    # -----------------------------
+    # -------------------------------------------------------------------------
     buffer_size: int = 1_000_000,
     batch_size: int = 256,
-    warmup_env_steps: int = 10_000,
     update_after: int = 1_000,
     update_every: int = 1,
     utd: float = 1.0,
@@ -69,127 +68,157 @@ def dqn(
     per_beta: float = 0.4,
     per_beta_final: float = 1.0,
     per_beta_anneal_steps: int = 200_000,
-    # -----------------------------
+    # -------------------------------------------------------------------------
     # Exploration (epsilon-greedy)
-    # -----------------------------
+    # -------------------------------------------------------------------------
     exploration_eps: float = 0.1,
     exploration_eps_final: float = 0.05,
     exploration_eps_anneal_steps: int = 200_000,
     exploration_eval_eps: float = 0.0,
-    # ... existing ...
 ) -> OffPolicyAlgorithm:
     """
-    Build a complete DQN OffPolicyAlgorithm (discrete action space).
+    Build a complete DQN algorithm (head + core + off-policy driver).
 
-    This is a high-level convenience factory that composes:
-      1) DQNHead : the neural networks (online Q and target Q)
-      2) DQNCore : the gradient update logic (TD loss, target updates, AMP, etc.)
-      3) OffPolicyAlgorithm : replay buffer + scheduling + update loop wrapper
+    This is a convenience builder that wires together:
+
+    1) :class:`~.head.DQNHead`
+        Owns the **online** and **target** Q-networks.
+
+    2) :class:`~.core.DQNCore`
+        Implements the TD update (DQN or Double DQN), loss selection (Huber/MSE),
+        optimizer step, scheduler step, PER weighting, and target-network updates.
+
+    3) :class:`model_free.common.policies.off_policy_algorithm.OffPolicyAlgorithm`
+        Owns the replay buffer and update schedule, and calls ``core.update_from_batch``
+        according to the off-policy training loop.
 
     Parameters
     ----------
     obs_dim : int
-        Observation dimension (flattened vector form).
+        Dimension of the observation/state vector (flattened).
     n_actions : int
         Number of discrete actions.
-    device : Union[str, torch.device]
-        Device used for training (e.g., "cpu", "cuda", torch.device(...)).
+    device : Union[str, torch.device], default="cpu"
+        Device used for training (e.g., ``"cpu"``, ``"cuda"``).
 
-    Network (Head) hyperparams
-    -------------------------
-    hidden_sizes : Tuple[int, ...]
-        MLP hidden layer sizes for Q networks.
-    activation_fn : Any
-        Activation function class (e.g., nn.ReLU, nn.SiLU).
-    dueling_mode : bool
-        If True, use dueling architecture in QNetwork.
-    init_type : str
-        Initialization strategy name (e.g., "orthogonal", "xavier", ...).
-    gain : float
-        Gain parameter for weight initialization.
-    bias : float
-        Bias initialization value.
+    Network hyperparameters
+    -----------------------
+    hidden_sizes : Tuple[int, ...], default=(256, 256)
+        Hidden layer sizes of the Q-network MLP.
+    activation_fn : Any, default=torch.nn.ReLU
+        Activation function **class** used by the Q-network builder.
+    dueling_mode : bool, default=False
+        If True, enable dueling architecture in the Q-network.
+    init_type : str, default="orthogonal"
+        Initialization scheme identifier (interpreted by your network builder).
+    gain : float, default=1.0
+        Gain multiplier used by the initializer.
+    bias : float, default=0.0
+        Bias initialization constant.
 
-    Core (Update) hyperparams
-    ------------------------
-    gamma : float
+    Core hyperparameters (TD update)
+    --------------------------------
+    gamma : float, default=0.99
         Discount factor.
-    double_dqn : bool
-        If True, use Double DQN target:
-          a* = argmax Q_online(s', a)
-          Q_target(s', a*)
-        This helps reduce overestimation bias.
-    huber : bool
-        If True, use smooth L1 (Huber) loss; else use MSE.
-    target_update_interval : int
-        How often to update target network (in core update calls).
-    tau : float
-        Target update blending factor:
-          - tau <= 0: treated as hard update (copy parameters)
-          - tau > 0 : Polyak averaging (soft update)
-    max_grad_norm : float
-        Max gradient norm for clipping (0 disables clipping).
-    use_amp : bool
-        Whether to use torch.cuda.amp mixed precision.
-    per_eps : float
-        Small epsilon used for PER priority stabilization.
+    double_dqn : bool, default=True
+        If True, use Double DQN target computation (online selects action,
+        target evaluates it) to reduce overestimation bias.
+    huber : bool, default=True
+        If True, use Smooth L1 (Huber) TD loss. Else use MSE.
+    target_update_interval : int, default=1000
+        Target update interval measured in **core update calls**.
+        Exact semantics depend on your ``QLearningCore._maybe_update_target``.
+    tau : float, default=0.0
+        Soft-update coefficient for target updates.
+        - ``tau <= 0`` typically corresponds to hard updates only.
+        - ``tau > 0`` enables Polyak averaging (if supported by base core).
+    max_grad_norm : float, default=0.0
+        Global gradient clipping threshold. ``0.0`` typically disables clipping.
+    use_amp : bool, default=False
+        Enable automatic mixed precision (AMP) for the update step.
+    per_eps : float, default=1e-6
+        Small epsilon used by PER pipelines when computing priorities from TD errors
+        (often: ``priority = |td_error| + per_eps``). The core may store this as metadata.
 
-    Optimizer / Scheduler
+    Optimizer / scheduler
     ---------------------
-    optim_name, lr, weight_decay:
-        Optimizer selection + hyperparameters.
-    sched_name, total_steps, warmup_steps, ...:
-        Optional LR scheduler configuration.
+    optim_name : str, default="adamw"
+        Optimizer name for online Q parameters.
+    lr : float, default=3e-4
+        Learning rate.
+    weight_decay : float, default=0.0
+        Weight decay.
+    sched_name : str, default="none"
+        Scheduler name (optional). If ``"none"``, no scheduler is used.
+    total_steps, warmup_steps, min_lr_ratio, poly_power, step_size, sched_gamma, milestones
+        Scheduler knobs passed through to your scheduler builder implementation.
 
-    OffPolicyAlgorithm scheduling / replay
-    --------------------------------------
-    buffer_size : int
+    Off-policy schedule / replay
+    ----------------------------
+    buffer_size : int, default=1_000_000
         Replay buffer capacity (number of transitions).
-    batch_size : int
+    batch_size : int, default=256
         Batch size sampled from replay per gradient step.
-    warmup_env_steps : int
-        Initial number of environment steps collected before training starts.
-        (This is passed to OffPolicyAlgorithm as warmup_steps.)
-    update_after : int
-        Start updating only after at least this many env steps.
-        (Often same or close to warmup_env_steps; you expose both for flexibility.)
-    update_every : int
-        Perform an update attempt every N environment steps.
-    utd : float
-        Update-To-Data ratio (how many gradient updates per env step).
-        Some frameworks interpret this as multiplier.
-    gradient_steps : int
-        Number of gradient steps per update call.
-    max_updates_per_call : int
-        Safety cap for how many updates a single algo.update() may perform.
+    update_after : int, default=1000
+        Updates are disabled until at least this many environment steps are collected.
+    update_every : int, default=1
+        Attempt updates every N environment steps.
+    utd : float, default=1.0
+        Update-to-data ratio. Interpretation is implementation-dependent; typically
+        scales how many gradient updates occur per environment step.
+    gradient_steps : int, default=1
+        Number of gradient steps per update call (before caps).
+    max_updates_per_call : int, default=1000
+        Safety cap limiting the number of gradient updates performed by a single
+        ``algo.update()`` call.
 
-    PER (Prioritized Experience Replay)
-    ----------------------------------
-    use_per : bool
+    Prioritized Experience Replay (PER)
+    -----------------------------------
+    use_per : bool, default=True
         Enable prioritized replay.
-    per_alpha : float
-        Priority exponent (how strongly prioritization is used).
-    per_beta : float
-        Initial importance-sampling correction exponent.
-    per_beta_final : float
-        Final beta value after annealing (typically 1.0).
-    per_beta_anneal_steps : int
-        Number of env steps over which beta is annealed from per_beta -> per_beta_final.
+    per_alpha : float, default=0.6
+        Priority exponent controlling how strongly prioritization is applied.
+    per_beta : float, default=0.4
+        Initial importance-sampling exponent.
+    per_beta_final : float, default=1.0
+        Final beta value after annealing (commonly 1.0).
+    per_beta_anneal_steps : int, default=200000
+        Number of environment steps over which beta is annealed from ``per_beta``
+        to ``per_beta_final``.
+
+    Exploration (epsilon-greedy)
+    ----------------------------
+    exploration_eps : float, default=0.1
+        Initial epsilon for epsilon-greedy action selection during training.
+    exploration_eps_final : float, default=0.05
+        Final epsilon after annealing.
+    exploration_eps_anneal_steps : int, default=200000
+        Number of environment steps over which epsilon is annealed from
+        ``exploration_eps`` to ``exploration_eps_final``.
+    exploration_eval_eps : float, default=0.0
+        Evaluation-time epsilon (typically 0.0 for greedy evaluation).
 
     Returns
     -------
     algo : OffPolicyAlgorithm
-        A fully constructed algorithm instance ready for:
-          algo.setup(env)
-          action = algo.act(obs, epsilon=eps)   (if your wrapper forwards epsilon)
-          algo.on_env_step(transition)
-          if algo.ready_to_update(): algo.update()
+        Fully constructed algorithm instance. Typical usage:
+
+        >>> algo = dqn(obs_dim=8, n_actions=4, device="cuda")
+        >>> algo.setup(env)  # depends on your OffPolicyAlgorithm interface
+        >>> obs = env.reset()
+        >>> action = algo.act(obs)  # epsilon handled by algo/head depending on your design
+
+    Notes
+    -----
+    - This builder does not validate environment compatibility. Ensure your environment
+      provides discrete actions compatible with ``n_actions``.
+    - Target update semantics (hard vs soft) are implemented in the base core
+      (:class:`QLearningCore`) and/or your core; this builder only passes knobs through.
     """
 
-    # -----------------------------
-    # Head: build online/target Q-networks
-    # -----------------------------
-    # The head is responsible for model definition + (optionally) action selection.
+    # -------------------------------------------------------------------------
+    # 1) Head: online + target Q networks
+    # -------------------------------------------------------------------------
     head = DQNHead(
         obs_dim=int(obs_dim),
         n_actions=int(n_actions),
@@ -202,10 +231,9 @@ def dqn(
         device=device,
     )
 
-    # -----------------------------
-    # Core: build update engine (loss + optimization step)
-    # -----------------------------
-    # DQNCore owns the TD target computation and optimizer steps.
+    # -------------------------------------------------------------------------
+    # 2) Core: TD update engine (loss + optimization + target updates)
+    # -------------------------------------------------------------------------
     core = DQNCore(
         head=head,
         gamma=float(gamma),
@@ -213,11 +241,14 @@ def dqn(
         tau=float(tau),
         double_dqn=bool(double_dqn),
         huber=bool(huber),
-        # optimizer settings (handled by QLearningCore infrastructure)
+        max_grad_norm=float(max_grad_norm),
+        use_amp=bool(use_amp),
+        per_eps=float(per_eps),
+        # optimizer
         optim_name=str(optim_name),
         lr=float(lr),
         weight_decay=float(weight_decay),
-        # scheduler settings (optional)
+        # scheduler
         sched_name=str(sched_name),
         total_steps=int(total_steps),
         warmup_steps=int(warmup_steps),
@@ -226,46 +257,36 @@ def dqn(
         step_size=int(step_size),
         sched_gamma=float(sched_gamma),
         milestones=tuple(int(m) for m in milestones),
-        # gradient stability / performance
-        max_grad_norm=float(max_grad_norm),
-        use_amp=bool(use_amp),
-        # PER feedback epsilon (used for priority stability in some pipelines)
-        per_eps=float(per_eps),
     )
 
-    # -----------------------------
-    # Algorithm: replay + scheduling wrapper
-    # -----------------------------
-    # OffPolicyAlgorithm coordinates:
-    # - replay buffer storage/sampling
-    # - warmup collection
-    # - deciding when to call core.update_from_batch(...)
-    # - PER beta annealing (if enabled)
+    # -------------------------------------------------------------------------
+    # 3) Off-policy driver: replay buffer + scheduling + epsilon schedule
+    # -------------------------------------------------------------------------
     algo = OffPolicyAlgorithm(
         head=head,
         core=core,
         device=device,
+        # replay
         buffer_size=int(buffer_size),
         batch_size=int(batch_size),
-        # warmup_steps: how many env steps before updates begin (buffer fill)
-        warmup_steps=int(warmup_env_steps),
-        # update schedule knobs
+        # update schedule
         update_after=int(update_after),
         update_every=int(update_every),
         utd=float(utd),
         gradient_steps=int(gradient_steps),
         max_updates_per_call=int(max_updates_per_call),
-        # PER configuration
+        # PER
         use_per=bool(use_per),
         per_alpha=float(per_alpha),
         per_beta=float(per_beta),
         per_eps=float(per_eps),
         per_beta_final=float(per_beta_final),
         per_beta_anneal_steps=int(per_beta_anneal_steps),
-        # NEW
+        # exploration (epsilon-greedy schedule)
         exploration_eps=float(exploration_eps),
         exploration_eps_final=float(exploration_eps_final),
         exploration_eps_anneal_steps=int(exploration_eps_anneal_steps),
         exploration_eval_eps=float(exploration_eval_eps),
     )
+
     return algo

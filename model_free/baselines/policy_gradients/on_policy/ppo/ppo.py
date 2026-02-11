@@ -6,14 +6,12 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 
-from .head import PPOHead
-from .core import PPOCore
 from model_free.common.policies.on_policy_algorithm import OnPolicyAlgorithm
 
+from .core import PPOCore
+from .head import PPOHead
 
-# =============================================================================
-# Builder (config-free): same style as your acktr() / a2c() builders
-# =============================================================================
+
 def ppo(
     *,
     # -------------------------------------------------------------------------
@@ -81,37 +79,132 @@ def ppo(
     adv_eps: float = 1e-8,
 ) -> OnPolicyAlgorithm:
     """
-    Build a complete PPO OnPolicyAlgorithm (config-free).
+    Build a PPO :class:`~model_free.common.policies.on_policy_algorithm.OnPolicyAlgorithm`
+    for **continuous** action spaces (Gaussian policy).
 
-    This factory wires together the three core components:
-      1) PPOHead  : actor/critic networks (Gaussian actor + V(s) critic)
-      2) PPOCore  : PPO update rule (clipped objective, value loss, entropy bonus)
-      3) OnPolicyAlgorithm : rollout collection + batching + update scheduling
+    This is a config-free builder in the same style as your ``a2c()`` / ``acktr()``
+    factories. It wires together the three layers of the on-policy stack:
+
+    1) **Head** (:class:`PPOHead`)
+       - Actor: diagonal Gaussian policy :math:`\\pi(a\\mid s)` (unsquashed)
+       - Critic: state-value baseline :math:`V(s)`
+
+    2) **Core** (:class:`PPOCore`)
+       - PPO-Clip objective on each minibatch
+       - optional value clipping (``clip_vloss``)
+       - entropy bonus
+       - optimizer steps for actor and critic
+       - optional minibatch-level early-stop signal based on target KL
+
+    3) **Algorithm** (:class:`OnPolicyAlgorithm`)
+       - rollout collection of length ``rollout_steps``
+       - return / advantage computation (e.g., GAE-λ)
+       - minibatch iteration over multiple epochs
+
+    Parameters
+    ----------
+    obs_dim : int
+        Dimension of flattened observations.
+    action_dim : int
+        Dimension of continuous actions.
+    device : str | torch.device, default="cpu"
+        Device used by the learner (head + core). Rollout workers (if any) may
+        still run on CPU depending on your infrastructure.
+
+    hidden_sizes : tuple[int, ...], default=(64, 64)
+        MLP hidden sizes used for both actor and critic networks.
+    activation_fn : Any, default=torch.nn.ReLU
+        Activation function class for MLP layers (e.g., ``nn.ReLU``, ``nn.Tanh``).
+    init_type : str, default="orthogonal"
+        Weight initialization scheme identifier understood by your network builders.
+    gain : float, default=1.0
+        Optional initialization gain passed through to network builders.
+    bias : float, default=0.0
+        Optional initialization bias passed through to network builders.
+    log_std_mode : str, default="param"
+        Gaussian log-standard-deviation parameterization mode used by the actor.
+    log_std_init : float, default=-0.5
+        Initial log-std value.
+
+    clip_range : float, default=0.2
+        PPO clipping parameter :math:`\\epsilon`.
+    vf_coef : float, default=0.5
+        Value-loss coefficient.
+    ent_coef : float, default=0.0
+        Entropy coefficient (implemented as ``ent_loss = -entropy.mean()``, so a
+        positive ``ent_coef`` encourages exploration).
+    clip_vloss : bool, default=True
+        If True, apply PPO-style value clipping around old value predictions.
+
+    target_kl : float | None, default=None
+        Target KL threshold for early stopping. If set, the core reports
+        ``train/early_stop=1.0`` when the minibatch KL exceeds
+        ``kl_stop_multiplier * target_kl``.
+    kl_stop_multiplier : float, default=1.0
+        Multiplier used with ``target_kl`` for early stopping.
+
+    max_grad_norm : float, default=0.5
+        Global gradient norm clipping threshold (0 disables clipping, depending on core).
+    use_amp : bool, default=False
+        Enable CUDA AMP for forward/backward (best-effort).
+
+    actor_optim_name, critic_optim_name : str, default="adamw"
+        Optimizer identifiers for the optimizer builder used by :class:`ActorCriticCore`.
+    actor_lr, critic_lr : float, default=3e-4
+        Learning rates.
+    actor_weight_decay, critic_weight_decay : float, default=0.0
+        Weight decay values.
+
+    actor_sched_name, critic_sched_name : str, default="none"
+        Scheduler identifiers (if supported).
+    total_steps : int, default=0
+        Total training steps used by certain schedules.
+    warmup_steps : int, default=0
+        Warmup steps for schedules that support warmup.
+    min_lr_ratio : float, default=0.0
+        Minimum LR ratio for decay schedules.
+    poly_power : float, default=1.0
+        Power for polynomial LR decay.
+    step_size : int, default=1000
+        Step size for step-based schedules.
+    sched_gamma : float, default=0.99
+        Gamma/decay for exponential or step schedules.
+    milestones : tuple[int, ...], default=()
+        Milestones for multi-step schedules.
+
+    rollout_steps : int, default=2048
+        Number of environment steps collected per rollout iteration.
+    gamma : float, default=0.99
+        Discount factor.
+    gae_lambda : float, default=0.95
+        GAE-λ parameter for advantage estimation.
+    update_epochs : int, default=10
+        Number of epochs over the rollout buffer per iteration.
+    minibatch_size : int, default=64
+        Minibatch size used when iterating the rollout buffer.
+    dtype_obs : Any, default=numpy.float32
+        Numpy dtype used to store observations in the rollout buffer.
+    dtype_act : Any, default=numpy.float32
+        Numpy dtype used to store actions in the rollout buffer.
+    normalize_advantages : bool, default=False
+        Whether to normalize advantages before updates (typically in algorithm/buffer).
+    adv_eps : float, default=1e-8
+        Epsilon used when normalizing advantages.
 
     Returns
     -------
-    algo : OnPolicyAlgorithm
-        Typical usage:
-            algo.setup(env)
-            a = algo.act(obs)
-            algo.on_env_step(transition)
-            if algo.ready_to_update():
-                metrics = algo.update()
+    OnPolicyAlgorithm
+        Fully constructed on-policy algorithm instance configured for PPO training.
 
     Notes
     -----
-    - This builder targets continuous action spaces only (Gaussian policy).
-    - Advantage normalization is typically handled by OnPolicyAlgorithm/buffer,
-      not inside PPOCore.
+    - This builder is **continuous-only** (Gaussian actor).
+    - If you want advantage normalization, prefer doing it in the buffer/algorithm
+      for consistency across cores.
     """
-
     # -------------------------------------------------------------------------
-    # 1) Head: build actor+critic networks
+    # 1) Head: actor + critic networks
     # -------------------------------------------------------------------------
-    # PPOHead is responsible for:
-    # - constructing actor (Gaussian distribution policy)
-    # - constructing critic (state-value V(s))
-    # - providing act(...) and evaluate_actions(...) APIs expected by OnPolicyAlgorithm
     head = PPOHead(
         obs_dim=int(obs_dim),
         action_dim=int(action_dim),
@@ -126,22 +219,18 @@ def ppo(
     )
 
     # -------------------------------------------------------------------------
-    # 2) Core: build PPO update engine (one minibatch step per call)
+    # 2) Core: PPO minibatch update engine
     # -------------------------------------------------------------------------
-    # PPOCore handles:
-    # - clipped policy loss
-    # - value loss (+ optional value clipping)
-    # - entropy bonus
-    # - optimizer steps for actor/critic
-    # - optional target-KL early-stop signal
     core = PPOCore(
         head=head,
         clip_range=float(clip_range),
         vf_coef=float(vf_coef),
         ent_coef=float(ent_coef),
         clip_vloss=bool(clip_vloss),
-        target_kl=(None if target_kl is None else float(target_kl)),
+        target_kl=None if target_kl is None else float(target_kl),
         kl_stop_multiplier=float(kl_stop_multiplier),
+        max_grad_norm=float(max_grad_norm),
+        use_amp=bool(use_amp),
         # Optimizers
         actor_optim_name=str(actor_optim_name),
         actor_lr=float(actor_lr),
@@ -159,19 +248,11 @@ def ppo(
         step_size=int(step_size),
         sched_gamma=float(sched_gamma),
         milestones=tuple(int(m) for m in milestones),
-        # Gradient clipping + AMP
-        max_grad_norm=float(max_grad_norm),
-        use_amp=bool(use_amp),
     )
 
     # -------------------------------------------------------------------------
-    # 3) Algorithm: rollout collection + update scheduling
+    # 3) Algorithm: rollout collection + batching + update schedule
     # -------------------------------------------------------------------------
-    # OnPolicyAlgorithm is responsible for:
-    # - storing rollouts (obs/action/reward/done)
-    # - computing returns/advantages (e.g., via GAE)
-    # - slicing into minibatches over multiple epochs
-    # - calling core.update_from_batch(...) repeatedly
     algo = OnPolicyAlgorithm(
         head=head,
         core=core,
@@ -186,5 +267,4 @@ def ppo(
         normalize_advantages=bool(normalize_advantages),
         adv_eps=float(adv_eps),
     )
-
     return algo
