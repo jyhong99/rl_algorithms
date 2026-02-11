@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -13,45 +13,61 @@ except Exception:  # pragma: no cover
 import torch as th
 
 from ..utils.common_utils import (
-    to_action_np,
-    to_scalar,
-    to_cpu_state_dict,
-    obs_to_cpu_tensor,
+    _to_action_np,
+    _to_scalar,
+    _to_cpu_state_dict,
+    _obs_to_cpu_tensor,
 )
 
-from ..utils.train_utils import(
-    set_random_seed,
-    env_reset,
-    unpack_step,
+from ..utils.train_utils import (
+    _set_random_seed,
+    _env_reset,
+    _unpack_step,
 )
 
 from ..utils.ray_utils import (
     PolicyFactorySpec,
-    build_policy_from_spec,
-    require_ray
+    _build_policy_from_spec,
+    _require_ray,
 )
 
 
 class RayEnvRunner:
     """
-    CPU environment runner for collecting rollouts.
+    CPU environment runner for collecting rollout transitions.
 
-    Contract
-    --------
-    The policy must implement:
-        policy.act(obs_t, deterministic=..., return_info=...) -> action
-        policy.act(...) -> (action, info)   # optional
+    This class is intended to run *inside* a Ray actor (worker process) and
+    provides a simple message-driven API:
+      - set_policy_weights(...)
+      - set_env_state(...), get_env_state(...)
+      - rollout(n_steps, deterministic)
 
-    If want_onpolicy_extras=True, the worker will request return_info=True and
-    will record, when available:
-        - "log_prob" (from "logp" or "log_prob")
-        - "value"
+    Policy contract (duck-typed)
+    ----------------------------
+    The policy object must implement:
+        act(obs_t, deterministic=..., return_info=...) -> action
+    and may optionally return:
+        (action, info_dict)
 
-    Notes
-    -----
-    - This runner is designed to be robust across Gym/Gymnasium variants.
-    - Environment state sync (state_dict/load_state_dict) is supported best-effort,
-      typically for NormalizeWrapper running statistics.
+    If `want_onpolicy_extras=True`, the runner will request `return_info=True`
+    and will record (when present in `info_dict`):
+      - log_prob  : from "logp" or "log_prob"
+      - value     : from "value"
+
+    Environment contract (duck-typed)
+    ---------------------------------
+    The environment must implement:
+      - reset(...) and step(action)
+    and may optionally implement:
+      - state_dict() / load_state_dict(...)  (e.g., normalization running stats)
+      - set_training(bool)                   (freeze running stats updates)
+      - action_space with Gym-like attributes: `.n` for discrete, `.shape` for Box
+
+    Robustness notes
+    ----------------
+    - Gym/Gymnasium step/reset variants are handled via `_env_reset` and `_unpack_step`.
+    - All optional interfaces are called best-effort: failures are ignored to keep
+      rollout collection robust in heterogeneous environments/wrappers.
     """
 
     def __init__(
@@ -70,26 +86,40 @@ class RayEnvRunner:
         Parameters
         ----------
         env_make_fn : Callable[[], Any]
-            Callable that builds a fresh environment instance.
+            Factory that builds a fresh environment instance on this worker.
+            Must be Ray-serializable (picklable).
         policy_spec : PolicyFactorySpec
             Serializable spec for constructing a policy on the worker.
-        seed : int
-            Base seed for worker RNG and env reset seeding (best-effort).
+        seed : int, default=0
+            Base seed for this worker:
+              - seeds Python/NumPy/Torch RNGs via `_set_random_seed`
+              - seeds environment reset best-effort
         max_episode_steps : int, optional
-            Fallback episode length cap when env/wrappers do not provide truncation.
-        want_onpolicy_extras : bool
-            If True, request policy info and record log_prob/value when available.
-        flatten_obs : bool
-            Forwarded to unpack_step(...). If True, flattens observations.
-        obs_dtype : Any
-            Forwarded to unpack_step(...). Cast/convert observation dtype.
+            Fallback episode-length cap used ONLY when the env does not signal
+            termination/truncation. This runner synthesizes:
+                done = True
+                info["TimeLimit.truncated"] = True
+            when the step count hits the cap.
+        want_onpolicy_extras : bool, default=False
+            If True, request policy info (`return_info=True`) and attempt to record
+            "log_prob" and "value" from the returned policy info dict.
+        flatten_obs : bool, default=False
+            Forwarded to `_unpack_step(...)`. If True, flattens observations.
+        obs_dtype : Any, default=np.float32
+            Forwarded to `_unpack_step(...)`. Cast/convert observation dtype.
+
+        Notes
+        -----
+        - The policy is built locally on the worker and forced into eval mode.
+        - The environment is created locally; seeding is best-effort to cover
+          different Gym/Gymnasium versions.
         """
-        set_random_seed(int(seed), deterministic=True, verbose=False)
+        _set_random_seed(int(seed), deterministic=True, verbose=False)
 
         self.env = env_make_fn()
         self._seed_env_best_effort(self.env, int(seed))
 
-        self.policy = build_policy_from_spec(policy_spec)
+        self.policy = _build_policy_from_spec(policy_spec)
         self.policy.eval()
 
         self.want_onpolicy_extras = bool(want_onpolicy_extras)
@@ -100,11 +130,12 @@ class RayEnvRunner:
         self.flatten_obs = bool(flatten_obs)
         self.obs_dtype = obs_dtype
 
-        self.obs = env_reset(self.env)
+        # Initialize rollout state.
+        self.obs = _env_reset(self.env)
         self.ep_len = 0
 
     # ------------------------------------------------------------------
-    # Public API (called by Ray actor messages)
+    # Public API (Ray actor methods)
     # ------------------------------------------------------------------
     def set_policy_weights(self, state_dict: Mapping[str, Any]) -> None:
         """
@@ -113,9 +144,10 @@ class RayEnvRunner:
         Parameters
         ----------
         state_dict : Mapping[str, Any]
-            Policy state dict. Will be converted to CPU tensors.
+            Policy state dict. Can contain CPU/GPU tensors; will be normalized to
+            CPU tensors via `_to_cpu_state_dict` before loading.
         """
-        sd = to_cpu_state_dict(state_dict)
+        sd = _to_cpu_state_dict(state_dict)
         self.policy.load_state_dict(sd, strict=True)
         self.policy.eval()
 
@@ -127,6 +159,12 @@ class RayEnvRunner:
         ----------
         state : Mapping[str, Any]
             Environment state dict payload (typically produced by env.state_dict()).
+
+        Notes
+        -----
+        - If `env.load_state_dict` exists, it is called best-effort.
+        - If `env.set_training` exists, we set it to False to avoid drifting
+          running statistics while the learner is controlling the state.
         """
         env = self.env
 
@@ -137,7 +175,6 @@ class RayEnvRunner:
             except Exception:
                 pass
 
-        # Workers should not update running stats if we are syncing from learner.
         set_train_fn = getattr(env, "set_training", None)
         if callable(set_train_fn):
             try:
@@ -151,8 +188,8 @@ class RayEnvRunner:
 
         Returns
         -------
-        state : Optional[Dict[str, Any]]
-            Dict from env.state_dict() if available; otherwise None.
+        state : dict[str, Any] or None
+            A dict from env.state_dict() if available and successful; otherwise None.
         """
         state_fn = getattr(self.env, "state_dict", None)
         if callable(state_fn):
@@ -171,23 +208,36 @@ class RayEnvRunner:
         ----------
         n_steps : int
             Number of environment steps to collect.
-        deterministic : bool
+        deterministic : bool, default=False
             If True, request deterministic actions from policy.
 
         Returns
         -------
-        traj : List[Dict[str, Any]]
-            A list of transitions with keys:
-              - obs, action, reward, next_obs, done, info
-            Plus optional extras if want_onpolicy_extras:
-              - log_prob, value
+        traj : list[dict[str, Any]]
+            A list of transition dicts with keys:
+              - "obs"      : observation *before* the action
+              - "action"   : action passed to env.step(...)
+              - "reward"   : float reward
+              - "next_obs" : observation after the step
+              - "done"     : episode termination flag
+              - "info"     : info dict returned from env (normalized to dict)
+            If `want_onpolicy_extras=True`, may also include:
+              - "log_prob" : float (from policy info)
+              - "value"    : float (from policy info)
+
+        Notes
+        -----
+        - This runner maintains internal state (`self.obs`, `self.ep_len`) across calls.
+          When `done=True`, it resets the env and continues collecting until n_steps.
+        - Action formatting uses env.action_space when available to coerce discrete/box.
         """
         traj: List[Dict[str, Any]] = []
         env = self.env
         action_space = getattr(env, "action_space", None)
 
         for _ in range(int(n_steps)):
-            obs_t = obs_to_cpu_tensor(self.obs)
+            obs_prev = self.obs  # keep the "pre-step" obs for the transition
+            obs_t = _obs_to_cpu_tensor(obs_prev)
 
             action_t, info_pol = self._policy_act(obs_t, deterministic=bool(deterministic))
             action_env = self._format_action_for_env(action_t, action_space)
@@ -195,7 +245,7 @@ class RayEnvRunner:
             next_obs, reward, done, info_out = self._env_step(action_env)
 
             tr: Dict[str, Any] = {
-                "obs": self.obs,
+                "obs": obs_prev,
                 "action": action_env,
                 "reward": float(reward),
                 "next_obs": next_obs,
@@ -211,7 +261,7 @@ class RayEnvRunner:
 
             self.obs = next_obs
             if done:
-                self.obs = env_reset(env)
+                self.obs = _env_reset(env)
                 self.ep_len = 0
 
         return traj
@@ -221,7 +271,22 @@ class RayEnvRunner:
     # ------------------------------------------------------------------
     @staticmethod
     def _seed_env_best_effort(env: Any, seed: int) -> None:
-        """Best-effort environment seeding for Gym/Gymnasium variants."""
+        """
+        Best-effort environment seeding across Gym/Gymnasium variants.
+
+        Parameters
+        ----------
+        env : Any
+            Environment instance.
+        seed : int
+            Seed to apply.
+
+        Notes
+        -----
+        Attempts, in order:
+          1) env.reset(seed=seed)  (Gymnasium/newer Gym)
+          2) env.seed(seed)        (older Gym)
+        """
         try:
             env.reset(seed=int(seed))
             return
@@ -232,9 +297,28 @@ class RayEnvRunner:
         except Exception:
             pass
 
-    def _policy_act(self, obs_t: th.Tensor, *, deterministic: bool) -> tuple[Any, Dict[str, Any]]:
+    def _policy_act(self, obs_t: th.Tensor, *, deterministic: bool) -> Tuple[Any, Dict[str, Any]]:
         """
-        Call policy.act and normalize output to (action, info_dict).
+        Call policy.act(...) and normalize output to (action, info_dict).
+
+        Parameters
+        ----------
+        obs_t : torch.Tensor
+            Observation tensor on CPU (batching handled by the policy).
+        deterministic : bool
+            Whether to request deterministic action selection.
+
+        Returns
+        -------
+        action : Any
+            Raw action output from the policy.
+        info_pol : dict[str, Any]
+            Policy info dict if provided; otherwise an empty dict.
+
+        Notes
+        -----
+        - If `want_onpolicy_extras=True`, calls policy.act(..., return_info=True).
+        - If the policy returns (action, info), we validate `info` is a dict-like.
         """
         if self.want_onpolicy_extras:
             out = self.policy.act(obs_t, deterministic=deterministic, return_info=True)
@@ -252,19 +336,39 @@ class RayEnvRunner:
         """
         Convert policy output into an env-compatible action.
 
-        Discrete
-        --------
-        If action_space.n exists, coerce to int using the first element.
+        Parameters
+        ----------
+        action_t : Any
+            Action returned by policy.act(...). Can be tensor/ndarray/list/scalar.
+        action_space : Any
+            Environment action space (Gym-like). Used only for inference:
+              - discrete if hasattr(action_space, "n")
+              - continuous shape from getattr(action_space, "shape", None)
 
-        Continuous / Unknown
-        --------------------
-        Use action_space.shape if available; convert to float32 numpy; drop a leading
-        batch dimension if present (shape[0] == 1).
+        Returns
+        -------
+        action_env : Any
+            Action formatted for env.step(...):
+              - Discrete: int
+              - Continuous/unknown: numpy.ndarray (float32)
+
+        Discrete behavior
+        -----------------
+        If action_space has attribute `n`, we interpret it as a Discrete space and:
+          - convert to numpy
+          - flatten
+          - take first element and cast to int
+
+        Continuous / unknown behavior
+        -----------------------------
+        - Use action_space.shape when available to shape-check or reshape in `_to_action_np`.
+        - Convert to float32 numpy.
+        - If policy outputs with a leading batch dim (1, act_dim, ...), drop it.
         """
         is_discrete = bool(action_space is not None and hasattr(action_space, "n"))
 
         if is_discrete:
-            a = to_action_np(action_t, action_shape=None)
+            a = _to_action_np(action_t, action_shape=None)
             a = np.asarray(a).reshape(-1)
             return int(a[0])
 
@@ -272,24 +376,43 @@ class RayEnvRunner:
         if not isinstance(action_shape, tuple):
             action_shape = None
 
-        a = to_action_np(action_t, action_shape=action_shape).astype(np.float32, copy=False)
+        a = _to_action_np(action_t, action_shape=action_shape).astype(np.float32, copy=False)
         if isinstance(a, np.ndarray) and a.ndim >= 2 and a.shape[0] == 1:
             a = a[0]
         return a
 
-    def _env_step(self, action_env: Any) -> tuple[Any, float, bool, Dict[str, Any]]:
+    def _env_step(self, action_env: Any) -> Tuple[Any, float, bool, Dict[str, Any]]:
         """
-        Step the environment and apply optional fallback TimeLimit synthesis.
+        Step the environment and apply fallback TimeLimit synthesis if requested.
+
+        Parameters
+        ----------
+        action_env : Any
+            Action passed into env.step(action_env).
 
         Returns
         -------
         next_obs : Any
+            Next observation.
         reward : float
+            Reward as float.
         done : bool
-        info : Dict[str, Any]
+            Episode termination flag.
+        info : dict[str, Any]
+            Info dict (guaranteed to be a dict, possibly empty).
+
+        Notes
+        -----
+        - The raw step output is normalized by `_unpack_step(...)` to handle
+          Gym/Gymnasium (terminated/truncated) variants.
+        - If `max_episode_steps` is set, we *synthesize* termination when the
+          step count reaches the limit **only if the env has not already ended**
+          the episode. In that case, we also set:
+              info["TimeLimit.truncated"] = True
+          if the env didn't already provide it.
         """
         step_out = self.env.step(action_env)
-        next_obs, reward, done, info_env = unpack_step(
+        next_obs, reward, done, info_env = _unpack_step(
             step_out,
             flatten_obs=self.flatten_obs,
             obs_dtype=self.obs_dtype,
@@ -298,7 +421,6 @@ class RayEnvRunner:
         self.ep_len += 1
         info_out: Dict[str, Any] = dict(info_env) if isinstance(info_env, Mapping) else {}
 
-        # Fallback TimeLimit synthesis ONLY if env didn't provide it.
         if self.max_episode_steps is not None and self.ep_len >= int(self.max_episode_steps):
             if not bool(done):
                 done = True
@@ -311,10 +433,23 @@ class RayEnvRunner:
         """
         Extract on-policy extras from policy info dict.
 
+        Parameters
+        ----------
+        info_pol : dict[str, Any]
+            Policy info dict returned from policy.act(..., return_info=True).
+
         Returns
         -------
-        extras : Dict[str, Any]
-            Possibly empty dict containing "log_prob" and/or "value".
+        extras : dict[str, Any]
+            Possibly empty dict containing:
+              - "log_prob": float
+              - "value": float
+
+        Notes
+        -----
+        - "log_prob" is read from keys: "logp" or "log_prob".
+        - "value" is read from key: "value".
+        - `_to_scalar` is used to robustly convert tensors/arrays to Python scalars.
         """
         if not self.want_onpolicy_extras:
             return {}
@@ -325,15 +460,15 @@ class RayEnvRunner:
 
         lp = None
         if "logp" in info_pol:
-            lp = to_scalar(info_pol["logp"])
+            lp = _to_scalar(info_pol["logp"])
         elif "log_prob" in info_pol:
-            lp = to_scalar(info_pol["log_prob"])
+            lp = _to_scalar(info_pol["log_prob"])
         if lp is not None:
             extras["log_prob"] = float(lp)
 
         v = None
         if "value" in info_pol:
-            v = to_scalar(info_pol["value"])
+            v = _to_scalar(info_pol["value"])
         if v is not None:
             extras["value"] = float(v)
 
@@ -341,7 +476,7 @@ class RayEnvRunner:
 
 
 # =============================================================================
-# Learner-side driver (non-remote orchestrator)
+# Ray actor export
 # =============================================================================
 
 # Expose a Ray actor class only when Ray is available.
@@ -355,10 +490,21 @@ class RayLearner:
     """
     Learner-side orchestrator that manages RayEnvWorker actors.
 
-    This class:
-      - creates N RayEnvRunner actors
-      - broadcasts policy weights (and optional env state) to all workers
-      - collects rollout chunks and flattens them into a single list
+    This class lives on the learner process and coordinates multiple environment
+    workers to collect experience in parallel.
+
+    Responsibilities
+    ----------------
+    - Create N RayEnvRunner actors (workers).
+    - Broadcast policy weights to workers.
+    - Optionally broadcast environment state (e.g., NormalizeWrapper stats).
+    - Request rollout chunks and flatten them into a single transition list.
+
+    Notes
+    -----
+    - This orchestrator is intentionally lightweight: it does not own replay buffers
+      or optimization logic; it only coordinates data collection.
+    - Ray must be installed; otherwise `_require_ray()` raises.
     """
 
     def __init__(
@@ -381,29 +527,36 @@ class RayLearner:
         env_make_fn : Callable[[], Any]
             Environment factory. Must be serializable by Ray.
         policy_spec : PolicyFactorySpec
-            Serializable policy construction spec. Sent to workers via ray.put.
+            Serializable policy construction spec. Broadcast to workers via ray.put.
         n_workers : int
             Number of Ray workers.
         steps_per_worker : int
-            Steps collected per worker per collect() call.
-        base_seed : int
-            Base seed for per-worker seeding (seed = base_seed + i).
+            Steps collected per worker per `collect()` call (default chunk size).
+        base_seed : int, default=0
+            Base seed for per-worker seeding:
+                worker_seed_i = base_seed + i
         max_episode_steps : int, optional
-            Fallback episode length cap when env/wrappers do not provide truncation.
-        want_onpolicy_extras : bool
+            Fallback episode-length cap in workers when env doesn't provide truncation.
+        want_onpolicy_extras : bool, default=False
             If True, workers request policy extras (log_prob/value).
-        flatten_obs : bool
-            Forwarded to worker unpack_step(...).
-        obs_dtype : Any
-            Forwarded to worker unpack_step(...).
+        flatten_obs : bool, default=False
+            Forwarded to workers' `_unpack_step(...)`.
+        obs_dtype : Any, default=np.float32
+            Forwarded to workers' `_unpack_step(...)`.
+
+        Raises
+        ------
+        RuntimeError
+            If Ray is not installed or Ray actor class is unavailable.
         """
-        require_ray()
+        _require_ray()
         if RayEnvWorker is None:  # pragma: no cover
             raise RuntimeError("RayEnvWorker is unavailable because Ray is not installed.")
 
         self.n_workers = int(n_workers)
         self.steps_per_worker = int(steps_per_worker)
 
+        # Avoid shipping the full spec repeatedly; store once in the object store.
         spec_ref = ray.put(policy_spec)
 
         self.workers = [
@@ -426,20 +579,20 @@ class RayLearner:
         Parameters
         ----------
         policy_state_dict_cpu : Mapping[str, Any]
-            CPU state dict. Will be normalized to CPU tensors before ray.put.
+            State dict payload. It will be normalized to CPU tensors before ray.put.
         """
-        sd = to_cpu_state_dict(policy_state_dict_cpu)
+        sd = _to_cpu_state_dict(policy_state_dict_cpu)
         sd_ref = ray.put(sd)
         ray.get([w.set_policy_weights.remote(sd_ref) for w in self.workers])
 
     def broadcast_env_state(self, env_state: Mapping[str, Any]) -> None:
         """
-        Broadcast env/wrapper state (e.g., NormalizeWrapper running stats) to all workers.
+        Broadcast env/wrapper state (e.g., normalization running stats) to all workers.
 
         Parameters
         ----------
         env_state : Mapping[str, Any]
-            Environment state dict payload from learner environment.
+            Environment state payload produced on learner side (e.g., env.state_dict()).
         """
         st = dict(env_state)
         st_ref = ray.put(st)
@@ -451,15 +604,16 @@ class RayLearner:
 
         Parameters
         ----------
-        deterministic : bool
-            If True, collect deterministic actions from workers.
+        deterministic : bool, default=False
+            If True, request deterministic actions from workers.
         n_steps : int, optional
-            Override steps_per_worker for this call only.
+            Override `steps_per_worker` for this call only.
 
         Returns
         -------
-        transitions : List[Dict[str, Any]]
-            Flattened list of transitions from all workers.
+        transitions : list[dict[str, Any]]
+            Flattened list of transitions from all workers. The transition schema
+            is the same as returned by RayEnvRunner.rollout(...).
         """
         steps = self.steps_per_worker if n_steps is None else int(n_steps)
         futs = [w.rollout.remote(steps, deterministic=bool(deterministic)) for w in self.workers]

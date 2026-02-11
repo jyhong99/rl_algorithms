@@ -1,55 +1,73 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 from .base_callback import BaseCallback
-from ..utils.callback_utils import coerce_scalar_mapping
+from ..utils.callback_utils import _coerce_scalar_mapping
 
 
 class RayReportCallback(BaseCallback):
     """
-    Report training/evaluation metrics to Ray Tune (Ray AIR session or legacy tune).
+    Report metrics to Ray Tune / Ray AIR (best-effort).
 
-    Motivation
-    ----------
-    When running experiments with Ray Tune/AIR, metrics must be reported through Ray's
-    reporting API so the tuner can:
-      - record results (progress, scores, losses)
-      - drive schedulers (ASHA/PBT) and early stopping
-      - select best trials / checkpoint policies
+    This callback bridges a framework-agnostic Trainer loop to Ray's reporting APIs.
+    When running trials under Ray Tune/AIR, you must call Ray's reporting function so
+    the driver can:
 
-    Behavior
-    --------
-    - on_update(): reports update metrics (default prefix: "train/...")
-    - on_eval_end(): reports evaluation metrics (default prefix: "eval/...")
-    - Optionally adds global step counters (env/update) if present on trainer.
-    - Optionally drops non-scalar values (Ray sinks usually expect scalars).
+    - record progress curves and scalar results
+    - drive schedulers (e.g., ASHA/PBT) and early stopping decisions
+    - select best trials and manage checkpoint policies
+
+    Reporting hooks
+    ---------------
+    - ``on_update(trainer, metrics)``:
+        Reports update-time metrics (typically "train/*") if enabled.
+    - ``on_eval_end(trainer, metrics)``:
+        Reports evaluation metrics (typically "eval/*") if enabled.
 
     Ray backends (preference order)
     -------------------------------
-    1) ray.air.session.report   (Ray AIR / newer API)
-    2) ray.tune.report          (legacy Tune API)
+    1) ``ray.air.session.report`` (Ray AIR / newer API)
+    2) ``ray.tune.report``        (legacy Tune API)
+
+    If Ray is not importable or no reporting API is available, the callback becomes a no-op.
 
     Parameters
     ----------
-    report_on_update : bool, default=True
-        Whether to report metrics in on_update().
-    report_on_eval : bool, default=True
-        Whether to report metrics in on_eval_end().
-    prefix_update : str, default="train"
-        Prefix applied to update metrics.
+    report_on_update:
+        If True, report metrics provided to ``on_update``.
+    report_on_eval:
+        If True, report metrics provided to ``on_eval_end``.
+    prefix_update:
+        Prefix applied to update metrics keys. Typical: "train".
         Example: {"loss": 1.2} -> {"train/loss": 1.2}
-    prefix_eval : str, default="eval"
-        Prefix applied to evaluation metrics.
+    prefix_eval:
+        Prefix applied to eval metrics keys. Typical: "eval".
         Example: {"return_mean": 100} -> {"eval/return_mean": 100}
-    include_steps : bool, default=True
-        If True, include additional counters if present:
-          - sys/global_env_step
-          - sys/global_update_step
-        These are helpful for aligning curves and scheduler decisions.
-    drop_non_scalars : bool, default=True
-        If True, keep only scalar-like values using `coerce_scalar_mapping()`.
-        This prevents Ray report failures due to non-serializable objects.
+    include_steps:
+        If True, attach global step counters (if present on trainer) into the payload:
+          - "sys/global_env_step"
+          - "sys/global_update_step"
+        This helps Ray align progress curves and scheduler decisions.
+    drop_non_scalars:
+        If True, keep only scalar-like values (and stringify keys) using
+        ``coerce_scalar_mapping``. This reduces the chance of Ray reporting failures
+        due to non-serializable objects.
+
+    Notes
+    -----
+    Trainer contract (duck-typed)
+    -----------------------------
+    This callback may read:
+      - trainer.global_env_step (optional)
+      - trainer.global_update_step (optional)
+
+    It does *not* require a concrete Trainer implementation.
+
+    Robustness policy
+    -----------------
+    - Never raises exceptions (best-effort reporting must not crash training).
+    - If metrics are missing/empty or coercion produces an empty mapping, it does nothing.
     """
 
     def __init__(
@@ -62,7 +80,6 @@ class RayReportCallback(BaseCallback):
         include_steps: bool = True,
         drop_non_scalars: bool = True,
     ) -> None:
-        # User configuration
         self.report_on_update = bool(report_on_update)
         self.report_on_eval = bool(report_on_eval)
         self.prefix_update = str(prefix_update)
@@ -70,11 +87,9 @@ class RayReportCallback(BaseCallback):
         self.include_steps = bool(include_steps)
         self.drop_non_scalars = bool(drop_non_scalars)
 
-        # Ray runtime state:
-        # - _ray_available indicates whether importing/reporting is possible
-        # - _report_fn is the chosen reporting function (session.report or tune.report)
+        # Runtime state for Ray reporting.
         self._ray_available: bool = False
-        self._report_fn: Any = None  # session.report or tune.report
+        self._report_fn: Optional[Any] = None  # session.report or tune.report
 
         # Initialize Ray reporting backend immediately (best-effort).
         self._try_init_ray()
@@ -85,21 +100,26 @@ class RayReportCallback(BaseCallback):
     @staticmethod
     def _maybe_add_global_steps(trainer: Any, payload: Dict[str, Any]) -> None:
         """
-        Add global step counters if present on trainer.
+        Attach global step counters to the payload if present on the trainer.
 
-        Keys are intentionally explicit and sink-agnostic:
-          - sys/global_env_step
-          - sys/global_update_step
+        Parameters
+        ----------
+        trainer:
+            Trainer-like object that may expose step counters.
+        payload:
+            Mutable dict to be augmented in-place.
 
         Notes
         -----
-        - Uses setdefault to avoid overwriting user-provided keys.
-        - Any attribute access failure is silently ignored.
+        - Uses ``setdefault`` so user-provided keys are not overwritten.
+        - Values are cast to float for consistency with typical Ray scalar sinks.
+        - All attribute-access errors are swallowed (best-effort).
         """
         try:
             payload.setdefault("sys/global_env_step", float(getattr(trainer, "global_env_step", 0)))
         except Exception:
             pass
+
         try:
             payload.setdefault("sys/global_update_step", float(getattr(trainer, "global_update_step", 0)))
         except Exception:
@@ -108,19 +128,35 @@ class RayReportCallback(BaseCallback):
     @staticmethod
     def _add_prefix(metrics: Mapping[str, Any], prefix: str) -> Dict[str, Any]:
         """
-        Add a string prefix to metric keys in "train/loss" style.
+        Add a prefix to metric keys in "prefix/key" format.
 
-        Rules
+        Parameters
+        ----------
+        metrics:
+            Input metrics mapping.
+        prefix:
+            Prefix string. If empty/falsey, keys are not prefixed.
+
+        Returns
+        -------
+        Dict[str, Any]
+            New dict with stringified keys and optional "prefix/" prepended.
+
+        Notes
         -----
-        - If prefix is empty/None -> do not modify keys.
-        - Ensures prefix ends with "/".
-        - Always stringifies keys to avoid non-string key issues downstream.
+        - Ensures the prefix ends with "/" if non-empty.
+        - Always stringifies keys to avoid downstream issues with non-string keys.
 
         Examples
         --------
-        prefix="train", metrics={"loss": 1.0}  -> {"train/loss": 1.0}
-        prefix="train/", metrics={"loss": 1.0} -> {"train/loss": 1.0}
-        prefix="", metrics={"loss": 1.0}       -> {"loss": 1.0}
+        >>> RayReportCallback._add_prefix({"loss": 1.0}, "train")
+        {'train/loss': 1.0}
+
+        >>> RayReportCallback._add_prefix({"loss": 1.0}, "train/")
+        {'train/loss': 1.0}
+
+        >>> RayReportCallback._add_prefix({"loss": 1.0}, "")
+        {'loss': 1.0}
         """
         p = str(prefix) if prefix else ""
         if not p:
@@ -134,13 +170,14 @@ class RayReportCallback(BaseCallback):
     # =========================================================================
     def _try_init_ray(self) -> None:
         """
-        Detect Ray reporting API and store a reporting function.
+        Detect a Ray reporting backend and store the chosen report function.
 
-        Preference order:
-        - ray.air.session.report (newer)
-        - ray.tune.report        (legacy)
+        Preference order
+        ----------------
+        1) ``ray.air.session.report``
+        2) ``ray.tune.report``
 
-        If neither import succeeds, reporting is disabled (no-op).
+        If neither is importable, reporting is disabled and this callback becomes a no-op.
         """
         # Preferred: Ray AIR session.report
         try:
@@ -170,27 +207,40 @@ class RayReportCallback(BaseCallback):
         """
         Normalize metrics into a Ray-friendly mapping.
 
-        If drop_non_scalars=True:
-          - Keep only scalar-like values
-          - Convert keys to strings
-          - Filter out invalid values (implementation-dependent in coerce_scalar_mapping)
+        Parameters
+        ----------
+        metrics:
+            Raw metrics mapping.
 
-        If drop_non_scalars=False:
-          - Keep values as-is (stringify keys only)
-          - May still fail in Ray if values are not serializable
-        """
-        if not self.drop_non_scalars:
-            return {str(k): v for k, v in metrics.items()}
-        return coerce_scalar_mapping(metrics)
-
-    def _report(self, payload: Dict[str, Any]) -> None:
-        """
-        Best-effort reporting to Ray.
+        Returns
+        -------
+        Dict[str, Any]
+            A dict with string keys that is intended to be safe for Ray reporting.
 
         Notes
         -----
-        - Never raises exceptions (callback must not crash training).
-        - No-op if Ray is not available or payload is empty.
+        - If ``drop_non_scalars=True``, the output contains scalar-like values only,
+          as decided by ``coerce_scalar_mapping``.
+        - If ``drop_non_scalars=False``, values are passed through unchanged, which
+          may still fail at report-time if values are not serializable.
+        """
+        if not self.drop_non_scalars:
+            return {str(k): v for k, v in metrics.items()}
+        return _coerce_scalar_mapping(metrics)
+
+    def _report(self, payload: Dict[str, Any]) -> None:
+        """
+        Report payload to Ray (best-effort).
+
+        Parameters
+        ----------
+        payload:
+            Final payload dict to be reported.
+
+        Notes
+        -----
+        - No-op if Ray is unavailable or payload is empty.
+        - Swallows all exceptions so reporting can never crash training.
         """
         if not self._ray_available or self._report_fn is None or not payload:
             return
@@ -206,13 +256,26 @@ class RayReportCallback(BaseCallback):
         """
         Report update-time metrics to Ray.
 
-        Flow
-        ----
-        1) Check feature flag + metrics exist
-        2) Coerce metrics (optionally drop non-scalars)
-        3) Add prefix (train/...)
-        4) Optionally add global steps
-        5) Report to Ray
+        Parameters
+        ----------
+        trainer:
+            Trainer-like object (duck-typed). Used for optional step counters.
+        metrics:
+            Update metrics dictionary (typically produced after one optimizer update).
+
+        Returns
+        -------
+        bool
+            Always True (this callback never requests early stop).
+
+        Notes
+        -----
+        Flow:
+          1) Check feature flag and that metrics exist
+          2) Coerce metrics (optionally drop non-scalars)
+          3) Add prefix (e.g., "train/*")
+          4) Optionally attach global step counters
+          5) Report to Ray
         """
         if not self.report_on_update or not metrics:
             return True
@@ -223,7 +286,6 @@ class RayReportCallback(BaseCallback):
 
         payload = self._add_prefix(coerced, self.prefix_update)
 
-        # Add global counters so Ray dashboards/schedulers can align progress.
         if self.include_steps:
             self._maybe_add_global_steps(trainer, payload)
 
@@ -234,7 +296,21 @@ class RayReportCallback(BaseCallback):
         """
         Report evaluation-time metrics to Ray.
 
-        Same policy as on_update(), but uses prefix_eval (eval/...).
+        Parameters
+        ----------
+        trainer:
+            Trainer-like object (duck-typed). Used for optional step counters.
+        metrics:
+            Evaluation metrics dictionary.
+
+        Returns
+        -------
+        bool
+            Always True (this callback never requests early stop).
+
+        Notes
+        -----
+        Same policy as ``on_update`` but uses ``prefix_eval`` (e.g., "eval/*").
         """
         if not self.report_on_eval or not metrics:
             return True

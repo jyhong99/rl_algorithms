@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+import math
 
 import numpy as np
 import torch as th
@@ -10,27 +11,32 @@ import torch.nn.functional as F
 # =============================================================================
 # NumPy / Torch conversion utilities
 # =============================================================================
-
-def to_numpy(x: Any, *, ensure_1d: bool = False) -> np.ndarray:
+def _to_numpy(x: Any, *, ensure_1d: bool = False) -> np.ndarray:
     """
-    Convert an input to a NumPy array (CPU).
+    Convert an input to a NumPy array on CPU.
 
     Parameters
     ----------
     x : Any
-        Input object. Common cases: np.ndarray, torch.Tensor, python scalar/list.
+        Input object. Common cases include:
+        - ``np.ndarray``
+        - ``torch.Tensor``
+        - Python scalars, lists, tuples
     ensure_1d : bool, default=False
-        If True and the result is a scalar (0-d), convert to shape (1,).
+        If True and the resulting array is a scalar (0-d), it is converted to a
+        1D array of shape (1,). This is often useful for Gym-style APIs that
+        expect actions/observations to be at least 1D.
 
     Returns
     -------
     arr : np.ndarray
-        NumPy array on CPU.
+        NumPy array on CPU. Dtype is not forced.
 
     Notes
     -----
-    - torch.Tensor is detached and moved to CPU.
-    - This function does not enforce dtype.
+    - If ``x`` is a ``torch.Tensor``, it is detached and moved to CPU before
+      converting via ``.numpy()``.
+    - For non-array inputs, ``np.asarray`` is used (may create a view).
     """
     if isinstance(x, np.ndarray):
         arr = x
@@ -45,7 +51,7 @@ def to_numpy(x: Any, *, ensure_1d: bool = False) -> np.ndarray:
     return arr
 
 
-def to_tensor(
+def _to_tensor(
     x: Any,
     device: Union[str, th.device],
     dtype: th.dtype = th.float32,
@@ -56,22 +62,27 @@ def to_tensor(
     Parameters
     ----------
     x : Any
-        Input object. Common cases: np.ndarray, torch.Tensor, python scalar/list.
+        Input object. Common cases include:
+        - ``np.ndarray`` (CPU)
+        - ``torch.Tensor``
+        - Python scalars / lists
     device : Union[str, torch.device]
-        Target device.
+        Target device (e.g., "cpu", "cuda:0").
     dtype : torch.dtype, default=torch.float32
-        Target dtype.
+        Target dtype. Applied even if ``x`` is already a tensor.
 
     Returns
     -------
     t : torch.Tensor
-        Tensor on `device` with dtype `dtype`.
+        Tensor placed on ``device`` with dtype ``dtype``.
 
     Notes
     -----
-    - If `x` is a torch.Tensor, `.to(device=..., dtype=...)` is applied.
-      If you want to preserve dtype for tensors, consider adding a flag
-      like `preserve_dtype_for_tensor=True`.
+    - If ``x`` is a tensor, this calls ``x.to(device=..., dtype=...)``.
+      If you want to preserve an existing tensor dtype, add a flag like
+      ``preserve_tensor_dtype=True`` and branch accordingly.
+    - If ``x`` is a NumPy array, ``torch.from_numpy`` is used first (CPU sharing),
+      and then moved to the target device.
     """
     dev = th.device(device)
 
@@ -79,13 +90,12 @@ def to_tensor(
         return x.to(device=dev, dtype=dtype)
 
     if isinstance(x, np.ndarray):
-        # from_numpy shares CPU memory; then moved to target device
         return th.from_numpy(x).to(device=dev, dtype=dtype)
 
     return th.as_tensor(x, dtype=dtype, device=dev)
 
 
-def to_flat_np(x: Any, *, dtype: Optional[np.dtype] = np.float32) -> np.ndarray:
+def _to_flat_np(x: Any, *, dtype: Optional[np.dtype] = np.float32) -> np.ndarray:
     """
     Convert input to a flattened (1D) NumPy array.
 
@@ -94,16 +104,21 @@ def to_flat_np(x: Any, *, dtype: Optional[np.dtype] = np.float32) -> np.ndarray:
     x : Any
         Input object.
     dtype : Optional[np.dtype], default=np.float32
-        If not None, cast output to this dtype.
+        If not None, cast output to this dtype (without copy when possible).
 
     Returns
     -------
-    arr : np.ndarray
-        Flattened array of shape (D,).
+    arr : np.ndarray, shape (D,)
+        Flattened NumPy array.
+
+    Notes
+    -----
+    - Torch tensors are detached and moved to CPU.
+    - The returned array is always contiguous only if the underlying representation
+      is contiguous; otherwise NumPy may return a view.
     """
     if th.is_tensor(x):
-        t = x.detach().cpu()
-        arr = t.numpy()
+        arr = x.detach().cpu().numpy()
     else:
         arr = np.asarray(x)
 
@@ -113,9 +128,9 @@ def to_flat_np(x: Any, *, dtype: Optional[np.dtype] = np.float32) -> np.ndarray:
     return arr
 
 
-def to_scalar(x: Any) -> Optional[float]:
+def _to_scalar(x: Any) -> Optional[float]:
     """
-    Convert a scalar-like input to Python float.
+    Convert a scalar-like input to a Python float.
 
     Parameters
     ----------
@@ -124,15 +139,20 @@ def to_scalar(x: Any) -> Optional[float]:
 
     Returns
     -------
-    s : Optional[float]
-        float if convertible, else None.
+    s : float or None
+        Python float if convertible, else None.
 
     Accepted inputs
     ---------------
     - Python scalars: int/float/bool
-    - NumPy scalars
-    - 0-d / 1-element NumPy arrays
-    - 0-d / 1-element torch tensors
+    - NumPy scalars (np.number)
+    - 0-d NumPy arrays or 1-element arrays
+    - 0-d torch tensors or 1-element tensors
+
+    Notes
+    -----
+    This is intentionally conservative: tensors/arrays with more than one element
+    return None to avoid silently discarding data.
     """
     if th.is_tensor(x):
         if x.numel() == 1:
@@ -152,36 +172,81 @@ def to_scalar(x: Any) -> Optional[float]:
     return None
 
 
-def is_scalar_like(x: Any) -> bool:
-    """Return True if `x` can be converted by `to_scalar`."""
-    return to_scalar(x) is not None
-
-
-def require_scalar_like(x: Any, *, name: str) -> float:
+def _is_scalar_like(x: Any) -> bool:
     """
-    Require scalar-like input and return float.
+    Return True if ``x`` can be safely converted by `_to_scalar`.
+
+    Parameters
+    ----------
+    x : Any
+        Input.
+
+    Returns
+    -------
+    ok : bool
+        True if `_to_scalar(x)` would return a float (not None).
+    """
+    return _to_scalar(x) is not None
+
+
+def _is_sequence(x: Any) -> bool:
+    """
+    Return True if ``x`` is a list/tuple (a light-weight "sequence" check).
+
+    Parameters
+    ----------
+    x : Any
+        Input.
+
+    Returns
+    -------
+    is_seq : bool
+        True if x is an instance of (list, tuple).
+    """
+    return isinstance(x, (list, tuple))
+
+
+def _require_scalar_like(x: Any, *, name: str) -> float:
+    """
+    Require scalar-like input and return a Python float.
+
+    Parameters
+    ----------
+    x : Any
+        Input expected to be scalar-like (see `_to_scalar`).
+    name : str
+        Name used in error messages.
+
+    Returns
+    -------
+    s : float
+        Converted scalar value.
 
     Raises
     ------
     TypeError
         If `x` is not scalar-like.
     """
-    s = to_scalar(x)
+    s = _to_scalar(x)
     if s is None:
         raise TypeError(f"{name} must be scalar-like, got: {type(x)}")
     return float(s)
 
 
-def to_action_np(action: Any, *, action_shape: Optional[Tuple[int, ...]] = None) -> np.ndarray:
+def _to_action_np(action: Any, *, action_shape: Optional[Tuple[int, ...]] = None) -> np.ndarray:
     """
-    Convert an agent action to a NumPy array suitable for env.step().
+    Convert a policy action into a NumPy array suitable for ``env.step(...)``.
 
     Parameters
     ----------
     action : Any
-        Action output from a policy (scalar, np.ndarray, torch.Tensor, list, ...).
+        Action output from a policy. Common cases:
+        - scalar
+        - ``np.ndarray``
+        - ``torch.Tensor``
+        - list/tuple
     action_shape : Optional[Tuple[int, ...]], default=None
-        If given, reshape output exactly to this shape.
+        If provided, reshape the output to exactly this shape.
 
     Returns
     -------
@@ -190,11 +255,12 @@ def to_action_np(action: Any, *, action_shape: Optional[Tuple[int, ...]] = None)
 
     Notes
     -----
-    - If policy returns a scalar, Gym/Gymnasium often expects shape (1,),
-      so `ensure_1d=True` is applied.
-    - Reshape errors are surfaced unless shape fallback can fix it.
+    - Scalar actions are converted to shape (1,) (via ``ensure_1d=True``) because
+      many Gym-style APIs prefer/expect at least 1D arrays.
+    - If reshaping fails due to non-matching shapes, we fall back to flatten-then-reshape.
+      Reshape errors are still surfaced if the total number of elements is incompatible.
     """
-    a = to_numpy(action, ensure_1d=True)
+    a = _to_numpy(action, ensure_1d=True)
     a = np.asarray(a)
 
     if action_shape is not None:
@@ -206,12 +272,9 @@ def to_action_np(action: Any, *, action_shape: Optional[Tuple[int, ...]] = None)
     return a
 
 
-def to_column(x: th.Tensor) -> th.Tensor:
+def _to_column(x: th.Tensor) -> th.Tensor:
     """
     Ensure a 1D batch tensor becomes a column tensor.
-
-    This is a small shape-normalization utility frequently used when you want
-    "per-sample scalars" to have explicit feature dimension = 1.
 
     Parameters
     ----------
@@ -223,28 +286,22 @@ def to_column(x: th.Tensor) -> th.Tensor:
     Returns
     -------
     y : torch.Tensor
-        Output tensor.
+        Output tensor with normalized shape.
         - (B,)   -> (B, 1)
         - (B, 1) -> (B, 1)
         - (B, A) -> (B, A)
 
     Notes
     -----
-    - This function assumes the first dimension is the batch dimension.
-    - It is typically used to make broadcasting / concatenation consistent.
+    This is a small shape-normalization helper for consistent broadcasting and
+    concatenation when you conceptually have "per-sample scalars".
     """
-    # If x is (B,), add a feature dimension so it becomes (B, 1).
     return x.unsqueeze(1) if x.dim() == 1 else x
 
 
-def reduce_joint(x: th.Tensor) -> th.Tensor:
+def _reduce_joint(x: th.Tensor) -> th.Tensor:
     """
-    Reduce "joint" per-sample values into a single scalar per batch element.
-
-    This is useful when:
-    - you have a vector action space and store per-dimension values (B, A),
-      but later want a single score/value per sample (B,)
-    - you have a column tensor (B, 1) and want to squeeze it to (B,)
+    Reduce per-sample "joint" values into a single scalar per batch element.
 
     Parameters
     ----------
@@ -252,12 +309,12 @@ def reduce_joint(x: th.Tensor) -> th.Tensor:
         Input tensor expected to be either:
         - (B,)   : already reduced
         - (B, 1) : column tensor
-        - (B, A) : per-action(or per-component) tensor
+        - (B, A) : per-component tensor
 
     Returns
     -------
-    y : torch.Tensor
-        Reduced tensor of shape (B,).
+    y : torch.Tensor, shape (B,)
+        Reduced tensor.
 
     Shape Rules
     -----------
@@ -267,87 +324,103 @@ def reduce_joint(x: th.Tensor) -> th.Tensor:
 
     Notes
     -----
-    - Using sum(dim=-1) is a design choice.
-      If you want mean or other reductions, create a separate function
-      (e.g., reduce_joint_mean).
+    Reduction uses `sum(dim=-1)` by design. If you want mean/max/etc.,
+    create separate helpers for explicitness.
     """
-    # If x has a feature/action dimension, collapse it into one scalar per sample.
     if x.dim() == 2:
         return x.sum(dim=-1)
-    # Already (B,) (or more generally not 2D) -> return as-is.
     return x
 
-    
+
 # =============================================================================
 # CPU-safe serialization helpers
 # =============================================================================
-
-def to_cpu(obj: Any) -> Any:
+def _to_cpu(obj: Any) -> Any:
     """
-    Recursively move tensors to CPU and detach.
+    Recursively move tensors to CPU and detach (serialization-friendly).
 
     Parameters
     ----------
     obj : Any
-        Tensor / nested structure.
+        A tensor or a nested structure containing tensors.
+        Supported containers:
+        - Mapping (dict-like)
+        - list / tuple
 
     Returns
     -------
     out : Any
-        Same structure with tensors converted to CPU tensors.
+        Same structure where all tensors are replaced with ``tensor.detach().cpu()``.
+
+    Notes
+    -----
+    This is useful for:
+    - storing snapshots in replay buffers / checkpoints
+    - JSON-friendly logging (after additional scalar coercion)
+    - avoiding GPU tensor references in long-lived python objects
     """
     if th.is_tensor(obj):
         return obj.detach().cpu()
 
     if isinstance(obj, Mapping):
-        return {k: to_cpu(v) for k, v in obj.items()}
+        return {k: _to_cpu(v) for k, v in obj.items()}
 
     if isinstance(obj, (list, tuple)):
-        vals = [to_cpu(v) for v in obj]
+        vals = [_to_cpu(v) for v in obj]
         return type(obj)(vals)
 
     return obj
 
 
-def to_cpu_state_dict(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+def _to_cpu_state_dict(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
     """
-    Convert a module state_dict to a pure-CPU form.
+    Convert a module state_dict to a pure-CPU, detached form.
 
     Parameters
     ----------
     state_dict : Mapping[str, Any]
-        State dict.
+        State dict mapping parameter/buffer names to tensors (or tensor-like).
 
     Returns
     -------
     cpu_state : Dict[str, Any]
-        CPU / detached version of the state dict.
+        A dict with the same keys where tensors are CPU+detached.
+
+    Notes
+    -----
+    - This is typically used prior to checkpointing when you want CPU-only artifacts.
+    - If the incoming mapping is not a plain dict, it is first copied to dict.
     """
-    return to_cpu(dict(state_dict))
+    return _to_cpu(dict(state_dict))
 
 
 # =============================================================================
 # Observation formatting
 # =============================================================================
-
-def obs_to_cpu_tensor(obs: Any) -> th.Tensor:
+def _obs_to_cpu_tensor(obs: Any) -> th.Tensor:
     """
-    Convert an observation to a CPU float32 tensor with batch dimension.
+    Convert an observation to a CPU float32 tensor with a batch dimension.
 
     Parameters
     ----------
     obs : Any
-        Observation. Common shapes:
-        - (obs_dim,) -> returns (1, obs_dim)
-        - (B, obs_dim) -> returns (B, obs_dim)
-        - scalar -> returns (1, 1)
+        Observation input. Common shapes:
+        - scalar                    -> returns (1, 1)
+        - (obs_dim,)                -> returns (1, obs_dim)
+        - (B, obs_dim)              -> returns (B, obs_dim)
+        - higher-rank (B, ...)      -> preserved as (B, ...)
 
     Returns
     -------
     t : torch.Tensor
         CPU float32 tensor with batch dimension.
+
+    Notes
+    -----
+    - This function standardizes "single observation" inputs to be batched.
+    - No normalization (mean/std) is applied here; it's purely a shape/device cast.
     """
-    t = to_tensor(obs, device="cpu", dtype=th.float32)
+    t = _to_tensor(obs, device="cpu", dtype=th.float32)
 
     # Normalize to (B, ...)
     if t.dim() == 0:
@@ -362,25 +435,33 @@ def obs_to_cpu_tensor(obs: Any) -> th.Tensor:
 # Target network / EMA utilities
 # =============================================================================
 @th.no_grad()
-def polyak_update(target: th.Tensor, source: th.Tensor, tau: float) -> None:
+def _polyak_update(target: th.Tensor, source: th.Tensor, tau: float) -> None:
     """
-    In-place Polyak update (source-weight convention):
-        target <- (1 - tau) * target + tau * source
+    In-place Polyak update (source-weight convention).
+
+    Performs:
+        ``target <- (1 - tau) * target + tau * source``
 
     Parameters
     ----------
     target : torch.Tensor
-        Tensor to update in-place (e.g., target parameter).
+        Tensor updated in-place (e.g., target network parameter).
     source : torch.Tensor
-        Tensor providing new values (e.g., online parameter).
+        Tensor providing new values (e.g., online network parameter).
     tau : float
-        Source interpolation factor in [0, 1].
-        Typical for target networks: 0.005.
+        Interpolation factor in [0, 1].
+        Typical values for target networks: 0.005, 0.01.
+
+    Raises
+    ------
+    ValueError
+        If ``tau`` is outside [0, 1].
 
     Notes
     -----
-    - tau close to 0.0: very slow update (keeps target).
-    - tau close to 1.0: fast copy from source.
+    - ``tau -> 0``: very slow update (target changes little).
+    - ``tau -> 1``: immediate copy from source.
+    - Assumes `target` and `source` are shape-compatible.
     """
     tau = float(tau)
     if not (0.0 <= tau <= 1.0):
@@ -390,10 +471,12 @@ def polyak_update(target: th.Tensor, source: th.Tensor, tau: float) -> None:
 
 
 @th.no_grad()
-def ema_update(old: th.Tensor, new: th.Tensor, beta: float) -> None:
+def _ema_update(old: th.Tensor, new: th.Tensor, beta: float) -> None:
     """
-    In-place EMA update (keep-ratio convention):
-        old <- beta * old + (1 - beta) * new
+    In-place exponential moving average (EMA) update (keep-ratio convention).
+
+    Performs:
+        ``old <- beta * old + (1 - beta) * new``
 
     Parameters
     ----------
@@ -402,12 +485,17 @@ def ema_update(old: th.Tensor, new: th.Tensor, beta: float) -> None:
     new : torch.Tensor
         Freshly computed statistic.
     beta : float
-        Keep ratio in [0, 1]. Typical: 0.95, 0.99, 0.999 depending on smoothing.
+        Keep ratio in [0, 1]. Typical values: 0.95, 0.99, 0.999.
+
+    Raises
+    ------
+    ValueError
+        If ``beta`` is outside [0, 1].
 
     Notes
     -----
-    - beta close to 1.0: slow update (heavily keeps old).
-    - beta close to 0.0: fast replace with new.
+    - ``beta -> 1``: heavy smoothing, slow adaptation.
+    - ``beta -> 0``: fast tracking (nearly overwrite with new).
     """
     beta = float(beta)
     if not (0.0 <= beta <= 1.0):
@@ -416,12 +504,72 @@ def ema_update(old: th.Tensor, new: th.Tensor, beta: float) -> None:
 
 
 # =============================================================================
+# Simple stats helpers (pure Python)
+# =============================================================================
+def _mean(xs: Sequence[float]) -> float:
+    """
+    Compute mean for a sequence, returning 0.0 for empty sequences.
+
+    Parameters
+    ----------
+    xs : Sequence[float]
+        Input sequence.
+
+    Returns
+    -------
+    m : float
+        Mean of xs, or 0.0 if xs is empty.
+    """
+    if not xs:
+        return 0.0
+    return float(sum(xs) / len(xs))
+
+
+def _std(xs: Sequence[float]) -> float:
+    """
+    Compute population standard deviation (ddof=0).
+
+    Parameters
+    ----------
+    xs : Sequence[float]
+        Input sequence.
+
+    Returns
+    -------
+    s : float
+        Population standard deviation.
+        Returns 0.0 for n <= 1 to avoid divide-by-zero.
+
+    Notes
+    -----
+    For short windows in logging, population std is typically stable and sufficient.
+    """
+    n = len(xs)
+    if n <= 1:
+        return 0.0
+    m = sum(xs) / n
+    var = sum((x - m) * (x - m) for x in xs) / n
+    return float(math.sqrt(var))
+
+
+# =============================================================================
 # Type / shape helpers
 # =============================================================================
-
-def require_mapping(x: Any, *, name: str) -> Mapping[str, Any]:
+def _require_mapping(x: Any, *, name: str) -> Mapping[str, Any]:
     """
     Require `x` to be a Mapping[str, Any].
+
+    Parameters
+    ----------
+    x : Any
+        Input object.
+    name : str
+        Name used in error messages.
+
+    Returns
+    -------
+    m : Mapping[str, Any]
+        Same object, typed as a mapping.
 
     Raises
     ------
@@ -433,14 +581,24 @@ def require_mapping(x: Any, *, name: str) -> Mapping[str, Any]:
     return x
 
 
-def infer_shape(space: Any, *, name: str) -> Tuple[int, ...]:
+def _infer_shape(space: Any, *, name: str) -> Tuple[int, ...]:
     """
-    Infer tensor shape from a Gym/Gymnasium-like space.
+    Infer a tensor shape from a Gym/Gymnasium-like space.
 
-    Supported
-    ---------
-    - Box-like spaces: `space.shape` exists and is not None
-    - Discrete-like spaces: `space.n` exists, mapped to shape (1,)
+    Parameters
+    ----------
+    space : Any
+        Space-like object.
+        Supported patterns:
+        - Box-like: attribute ``space.shape`` exists and is not None
+        - Discrete-like: attribute ``space.n`` exists, mapped to shape (1,)
+    name : str
+        Name used in error messages (e.g., "obs_space", "act_space").
+
+    Returns
+    -------
+    shape : Tuple[int, ...]
+        Inferred shape tuple.
 
     Raises
     ------
@@ -455,50 +613,72 @@ def infer_shape(space: Any, *, name: str) -> Tuple[int, ...]:
 
 
 # =============================================================================
-# (Optional) Vision / Conv helpers (consider moving to a separate module)
+# (Optional) Vision / Conv helpers
 # =============================================================================
-
-def img2col(
+def _img2col(
     x: th.Tensor,
     kernel_size: Tuple[int, int],
     stride: Tuple[int, int],
     padding: Tuple[int, int],
 ) -> th.Tensor:
     """
-    Convert Conv2d input tensor into a 2D patch matrix (im2col).
+    Convert a Conv2d input tensor into a 2D patch matrix (im2col).
 
     Parameters
     ----------
-    x : torch.Tensor
-        Input tensor of shape (N, C, H, W).
+    x : torch.Tensor, shape (N, C, H, W)
+        Input tensor.
     kernel_size : Tuple[int, int]
-        (kH, kW).
+        Kernel size (kH, kW).
     stride : Tuple[int, int]
-        (sH, sW).
+        Stride (sH, sW).
     padding : Tuple[int, int]
-        (pH, pW), symmetric padding.
+        Symmetric padding (pH, pW) applied to (H, W).
 
     Returns
     -------
-    cols : torch.Tensor
-        Patch matrix of shape (N * H_out * W_out, C * kH * kW).
+    cols : torch.Tensor, shape (N * H_out * W_out, C * kH * kW)
+        Unfolded patch matrix.
+
+    Raises
+    ------
+    ValueError
+        If `x` is not 4D (N, C, H, W).
 
     Notes
     -----
-    PyTorch provides `torch.nn.functional.unfold` which can replace this.
-    Keeping this only if you want explicit unfolding logic.
+    - This is functionally similar to ``torch.nn.functional.unfold``:
+        ``F.unfold(x, kernel_size, dilation=1, padding=padding, stride=stride)``
+      followed by reshaping/transposing.
+    - Keep this function only if you want explicit unfolding logic or custom
+      behavior; otherwise prefer `F.unfold` for clarity and maintenance.
+
+    Shape details
+    -------------
+    Let:
+      H_out = floor((H + 2*pH - kH) / sH) + 1
+      W_out = floor((W + 2*pW - kW) / sW) + 1
+
+    Then each row in `cols` corresponds to one spatial location across the batch.
     """
     if x.dim() != 4:
         raise ValueError(f"x must be (N,C,H,W), got shape: {tuple(x.shape)}")
 
     pH, pW = padding
     if pH > 0 or pW > 0:
+        # F.pad uses (left, right, top, bottom) for 2D spatial padding
         x = F.pad(x, (pW, pW, pH, pH))
 
     kH, kW = kernel_size
     sH, sW = stride
 
-    x = x.unfold(2, kH, sH).unfold(3, kW, sW)          # (N,C,H_out,W_out,kH,kW)
-    x = x.permute(0, 2, 3, 1, 4, 5).contiguous()       # (N,H_out,W_out,C,kH,kW)
-    cols = x.view(-1, x.size(3) * x.size(4) * x.size(5))
+    # Unfold H then W -> (N, C, H_out, W_out, kH, kW)
+    patches = x.unfold(2, kH, sH).unfold(3, kW, sW)
+
+    # Move patch dims to the end, and channels before them:
+    # (N, H_out, W_out, C, kH, kW)
+    patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+
+    # Flatten per-patch features -> (N*H_out*W_out, C*kH*kW)
+    cols = patches.view(-1, patches.size(3) * patches.size(4) * patches.size(5))
     return cols

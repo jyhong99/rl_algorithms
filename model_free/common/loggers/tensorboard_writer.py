@@ -3,96 +3,110 @@ from __future__ import annotations
 from typing import Dict
 
 from .base_writer import Writer
-from ..utils.log_utils import split_meta, get_step
+from ..utils.logger_utils import _get_step, _split_meta
 
-# TensorBoard is optional; keep import best-effort so the package
-# can be used without torch / tensorboard installed.
 try:
-    from torch.utils.tensorboard import SummaryWriter
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
 except Exception:  # pragma: no cover
-    SummaryWriter = None
+    SummaryWriter = None  # type: ignore[assignment]
 
 
 class TensorBoardWriter(Writer):
     """
-    TensorBoard writer backend.
+    TensorBoard writer backend for scalar metrics.
 
-    This writer consumes a flat metric row (Dict[str, float]) and logs
-    scalar values to TensorBoard using `add_scalar`.
+    This writer consumes a flat metric row (typically produced by `Logger.log`)
+    and emits each metric as a TensorBoard scalar via :meth:`SummaryWriter.add_scalar`.
 
-    Design notes
-    ------------
-    - Assumes the input row may contain *meta fields* (e.g., step, time),
-      which are separated via `split_meta`.
-    - Uses `get_step(row)` to determine the global_step consistently with
-      other writers/sinks.
-    - Best-effort flush/close to avoid breaking training loops.
+    The input row may include metadata fields (e.g., ``step``, ``wall_time``,
+    ``timestamp``). These are separated from metric keys using `_split_meta`,
+    and the step is determined using `_get_step` to remain consistent across
+    backends (CSV/JSONL/TensorBoard).
+
+    Parameters
+    ----------
+    run_dir : str
+        Directory where TensorBoard event files will be written.
+
+    Attributes
+    ----------
+    _tb : SummaryWriter
+        Underlying TensorBoard summary writer.
+
+    Raises
+    ------
+    RuntimeError
+        If TensorBoard support is not available (i.e., `torch.utils.tensorboard`
+        cannot be imported).
+
+    Notes
+    -----
+    - This class is intentionally minimal and does not implement custom naming
+      policies beyond `str(key)` conversion.
+    - Exceptions from `flush()` and `close()` are swallowed to avoid interrupting
+      training loops. (Write failures are expected to be handled by the outer
+      `Logger` or `SafeWriter` depending on your architecture.)
     """
 
     def __init__(self, run_dir: str) -> None:
-        """
-        Parameters
-        ----------
-        run_dir : str
-            Directory where TensorBoard event files will be written.
-
-        Raises
-        ------
-        RuntimeError
-            If torch.utils.tensorboard is not available.
-        """
         if SummaryWriter is None:
-            raise RuntimeError(
-                "TensorBoard is not available (torch.utils.tensorboard missing)."
-            )
-
-        # Create TensorBoard SummaryWriter bound to run directory
+            raise RuntimeError("TensorBoard is not available (torch.utils.tensorboard missing).")
         self._tb = SummaryWriter(log_dir=run_dir)
 
     def write(self, row: Dict[str, float]) -> None:
         """
-        Write a single metric row to TensorBoard.
+        Write one metric row to TensorBoard.
 
         Parameters
         ----------
         row : Dict[str, float]
-            Metric mapping. May include meta keys (e.g., step).
+            Flat mapping of keys to scalar floats. May include meta keys such as
+            ``step``, ``wall_time``, and ``timestamp``.
 
-        Behavior
-        --------
-        - Extracts global_step via `get_step(row)`
-        - Splits meta vs. metric values using `split_meta`
-        - Logs each metric as a scalar
+        Notes
+        -----
+        The write procedure is:
+        1. Infer the TensorBoard `global_step` using `_get_step(row)`.
+        2. Split meta keys from metric keys using `_split_meta(row)`.
+        3. Emit each metric as a scalar:
+           ``add_scalar(tag=str(key), scalar_value=float(value), global_step=step)``.
+
+        Raises
+        ------
+        Exception
+            Propagates exceptions thrown by TensorBoard `add_scalar`.
+            (Callers typically wrap this writer with `SafeWriter` or rely on
+            `Logger` to handle exceptions.)
         """
-        # Determine the global step for TensorBoard
-        step = get_step(row)
+        step = _get_step(row)
+        _, metrics = _split_meta(row)
 
-        # Separate metadata (e.g., step/time) from actual scalar metrics
-        _, metrics = split_meta(row)
-
-        # Log each metric independently
         for k, v in metrics.items():
-            self._tb.add_scalar(str(k), float(v), global_step=step)
+            self._tb.add_scalar(str(k), float(v), global_step=int(step))
 
     def flush(self) -> None:
         """
-        Flush pending TensorBoard events to disk (best-effort).
+        Best-effort flush of pending TensorBoard events to disk.
 
-        Useful for:
-        - long-running jobs
-        - reducing data loss on crashes
+        Notes
+        -----
+        - This method suppresses all exceptions to avoid disrupting training.
+        - Flushing improves durability for long-running jobs but does not strictly
+          guarantee persistence to physical storage (OS-dependent).
         """
         try:
             self._tb.flush()
         except Exception:
-            # Never allow logging failures to interrupt training
             pass
 
     def close(self) -> None:
         """
-        Close the underlying TensorBoard writer (best-effort).
+        Best-effort close of the underlying TensorBoard writer.
 
-        Safe to call multiple times.
+        Notes
+        -----
+        - Safe to call multiple times.
+        - Exceptions are suppressed.
         """
         try:
             self._tb.close()

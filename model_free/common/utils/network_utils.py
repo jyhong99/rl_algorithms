@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence, Tuple
-
+from typing import Any, Callable, Sequence, Tuple, Union
 import math
+
 import torch as th
 import torch.nn as nn
 
@@ -14,27 +14,34 @@ class TanhBijector:
     """
     Tanh bijector for squashed Gaussian policies.
 
-    Implements the transformation:
-        a = tanh(z),  z ∈ R, a ∈ (-1, 1)
+    This bijector implements the element-wise transformation:
 
-    Commonly used in continuous-control policies (e.g., SAC) where the policy
-    samples `z` from an unbounded Gaussian and squashes it into action bounds.
+        a = tanh(z),   z ∈ R,   a ∈ (-1, 1)
+
+    It is commonly used in continuous-control policies (e.g., SAC) where the policy
+    samples an unconstrained Gaussian variable `z` and then squashes it into a
+    bounded action range. If the environment action bounds are not (-1, 1), a
+    further affine transformation is usually applied outside this bijector.
 
     Parameters
     ----------
-    epsilon : float, optional
-        Numerical stability constant used in:
+    epsilon : float, default=1e-6
+        Numerical stability constant used for:
         - inverse clamp margin (avoid atanh(±1))
         - Jacobian term: log(1 - tanh(z)^2 + epsilon)
-        by default 1e-6.
 
     Notes
     -----
-    Change-of-variables (per-dimension correction):
+    Change-of-variables correction (per dimension):
+
         log |da/dz| = log(1 - tanh(z)^2)
 
-    Full squashed log-prob:
+    For squashed log-probabilities:
+
         log π(a|s) = log p(z) - Σ log(1 - tanh(z)^2 + eps)
+
+    The correction returned by `log_prob_correction` is per-dimension; callers
+    typically sum across action dimensions.
     """
 
     def __init__(self, epsilon: float = 1e-6) -> None:
@@ -52,7 +59,7 @@ class TanhBijector:
         Returns
         -------
         a : torch.Tensor
-            Squashed tensor, shape (..., A), range (-1, 1).
+            Squashed tensor, shape (..., A), with values in (-1, 1).
         """
         return th.tanh(z)
 
@@ -72,11 +79,14 @@ class TanhBijector:
 
         Notes
         -----
-        - We clamp `a` away from ±1 to avoid atanh overflow.
-        - Clamp margin uses both dtype epsilon and the user-provided epsilon.
+        - We clamp `a` away from ±1 to avoid numerical overflow in atanh.
+        - The clamp margin uses both dtype epsilon and the user-provided epsilon,
+          taking the larger for practical stability.
         """
-        # Prefer a practical margin, not the extremely tiny dtype eps alone.
-        finfo_eps = th.finfo(a.dtype).eps if a.is_floating_point() else 1e-12
+        if not a.is_floating_point():
+            a = a.float()
+
+        finfo_eps = th.finfo(a.dtype).eps
         margin = max(self.epsilon, float(finfo_eps))
 
         a = a.clamp(min=-1.0 + margin, max=1.0 - margin)
@@ -99,12 +109,16 @@ class TanhBijector:
         -------
         z : torch.Tensor
             Pre-squash tensor, shape (..., A).
+
+        Notes
+        -----
+        Prefer this over `0.5*log((1+a)/(1-a))` for stability near 0.
         """
         return 0.5 * (th.log1p(a) - th.log1p(-a))
 
     def log_prob_correction(self, z: th.Tensor) -> th.Tensor:
         """
-        Per-dimension log-Jacobian correction for a = tanh(z).
+        Compute the per-dimension log-Jacobian correction for `a = tanh(z)`.
 
         Parameters
         ----------
@@ -113,24 +127,28 @@ class TanhBijector:
 
         Returns
         -------
-        correction : torch.Tensor
-            Per-dimension correction term, shape (..., A).
+        corr : torch.Tensor
+            Per-dimension correction term, shape (..., A), equal to:
+                log(1 - tanh(z)^2 + epsilon)
 
         Notes
         -----
-        Caller typically does:
-            correction.sum(dim=-1, keepdim=True)
+        For squashed Gaussian policies, log-prob is typically computed as:
+
+            logp_a = logp_z - corr.sum(dim=-1, keepdim=True)
+
+        where `logp_z` is the Gaussian log-prob in z-space.
         """
         t = th.tanh(z)
         return th.log(1.0 - t * t + self.epsilon)
 
 
 # =============================================================================
-# Network utils
+# Network utilities
 # =============================================================================
-def validate_hidden_sizes(hidden_sizes: Sequence[int]) -> Tuple[int, ...]:
+def _validate_hidden_sizes(hidden_sizes: Sequence[int]) -> Tuple[int, ...]:
     """
-    Validate MLP hidden layer specification.
+    Validate an MLP hidden layer size specification.
 
     Parameters
     ----------
@@ -139,13 +157,15 @@ def validate_hidden_sizes(hidden_sizes: Sequence[int]) -> Tuple[int, ...]:
 
     Returns
     -------
-    hidden_sizes : Tuple[int, ...]
-        Validated sizes as a tuple of positive ints.
+    hs : Tuple[int, ...]
+        Validated sizes as a tuple of positive integers.
 
     Raises
     ------
     ValueError
         If empty or contains non-positive entries.
+    TypeError
+        If entries cannot be cast to int.
     """
     hs = tuple(int(h) for h in hidden_sizes)
     if len(hs) == 0:
@@ -155,19 +175,19 @@ def validate_hidden_sizes(hidden_sizes: Sequence[int]) -> Tuple[int, ...]:
     return hs
 
 
-def make_weights_init(
+def _make_weights_init(
     init_type: str = "xavier_uniform",
     gain: float = 1.0,
     bias: float = 0.0,
     kaiming_a: float = math.sqrt(5.0),
 ) -> Callable[[nn.Module], None]:
     """
-    Create a module initializer compatible with `nn.Module.apply()`.
+    Create an initializer function compatible with `nn.Module.apply()`.
 
     Parameters
     ----------
-    init_type : str, optional
-        Initialization scheme identifier (case-insensitive), by default "xavier_uniform".
+    init_type : str, default="xavier_uniform"
+        Initialization scheme identifier (case-insensitive).
 
         Supported for `nn.Linear`:
         - "xavier_uniform"
@@ -177,24 +197,30 @@ def make_weights_init(
         - "orthogonal"
         - "normal"   (std = gain)
         - "uniform"  (range = [-gain, +gain])
-    gain : float, optional
-        Gain used by Xavier/Orthogonal initializers (and as std/range for normal/uniform),
-        by default 1.0.
-    bias : float, optional
-        Constant used to initialize linear biases (if present), by default 0.0.
-    kaiming_a : float, optional
-        Negative slope parameter `a` for Kaiming initialization, by default sqrt(5.0).
+    gain : float, default=1.0
+        Gain used by Xavier/Orthogonal initializers, and used as:
+        - std for "normal"
+        - magnitude for "uniform" ([-gain, +gain])
+    bias : float, default=0.0
+        Constant value for initializing linear biases (if present).
+    kaiming_a : float, default=sqrt(5.0)
+        Negative slope parameter `a` for Kaiming initialization.
 
     Returns
     -------
     init_fn : Callable[[nn.Module], None]
         Function intended to be used as:
-            model.apply(init_fn)
+            `model.apply(init_fn)`
+
+    Raises
+    ------
+    ValueError
+        If `init_type` is unknown.
 
     Notes
     -----
     - Only `nn.Linear` modules are initialized; other modules are ignored.
-    - Centralizing init helps reproducibility and controlled ablations.
+    - Centralizing init logic helps reproducibility and controlled ablations.
     """
     name = str(init_type).lower().strip()
     gain = float(gain)
@@ -202,7 +228,14 @@ def make_weights_init(
     kaiming_a = float(kaiming_a)
 
     def init_fn(module: nn.Module) -> None:
-        """Initialize a single module in-place (called by `apply`)."""
+        """
+        Initialize a single module in-place (called by `nn.Module.apply`).
+
+        Parameters
+        ----------
+        module : nn.Module
+            Module instance to initialize.
+        """
         if not isinstance(module, nn.Linear):
             return
 
@@ -234,53 +267,109 @@ def make_weights_init(
 # =============================================================================
 class DuelingMixin:
     """
-    Utility for dueling combination.
+    Utility mixin for dueling value/advantage combination.
 
-    Combines value and advantage streams as:
-        Q = V + (A - mean(A, over action dimension))
+    Dueling networks decompose Q-values into:
+        - a scalar value stream V
+        - an advantage stream A over actions
+
+    The canonical combination is:
+
+        Q = V + (A - mean(A))
+
+    which makes Q identifiable by forcing advantages to have zero mean across the
+    action dimension.
+
+    Notes
+    -----
+    This mixin only provides the combination; it does not impose any architectural
+    constraints on how V and A are produced.
     """
 
     @staticmethod
     def combine_dueling(v: th.Tensor, a: th.Tensor, *, mean_dim: int = -1) -> th.Tensor:
         """
+        Combine value and advantage streams.
+
         Parameters
         ----------
         v : torch.Tensor
             Value stream. Common shapes:
-            - (B, 1) for standard dueling Q
-            - (B, N, 1) for quantile dueling
-            - (B, 1, K) for C51 logits dueling
+            - (B, 1)     for standard dueling Q
+            - (B, N, 1)  for quantile dueling (e.g., IQN)
+            - (B, 1, K)  for categorical logits dueling (e.g., C51)
         a : torch.Tensor
-            Advantage stream:
+            Advantage stream. Common shapes:
             - (B, A)
             - (B, N, A)
             - (B, A, K)
-        mean_dim : int, optional
-            Dimension over which to mean-reduce advantages (typically action dim),
-            by default -1.
+        mean_dim : int, default=-1
+            Dimension over which to mean-reduce advantages (typically the action dim).
 
         Returns
         -------
         q : torch.Tensor
-            Combined tensor matching `a` broadcast shape.
+            Combined tensor with broadcasted shape compatible with `a`.
+
+        Notes
+        -----
+        Broadcasting rules must align between `v` and `a`. Typically `v` includes
+        singleton dimensions where appropriate.
         """
         return v + (a - a.mean(dim=mean_dim, keepdim=True))
 
 
-def ensure_batch(x: Any, device: th.device | str) -> th.Tensor:
+# =============================================================================
+# Input shape/device normalization
+# =============================================================================
+def _ensure_batch(x: Any, device: Union[th.device, str]) -> th.Tensor:
+    """
+    Convert input to a floating-point tensor on `device` and ensure a batch dimension.
+
+    This is a common utility for policy/value networks that accept either:
+      - a single sample (D,)  -> converted to (1, D)
+      - a batch        (B, D) -> unchanged
+
+    Parameters
+    ----------
+    x : Any
+        Input data. Accepted forms include:
+        - torch.Tensor
+        - numpy array
+        - Python list/tuple
+        - scalar (becomes shape (1, 1) or (1,) depending on conversion)
+    device : torch.device or str
+        Target device.
+
+    Returns
+    -------
+    x_t : torch.Tensor
+        Floating-point tensor on `device` with shape:
+        - (1, D) if input is 1D
+        - (B, ...) if input already has batch dimension
+        - (1, 1) if input is scalar (depends on torch's as_tensor rules)
+
+    Notes
+    -----
+    - Non-floating tensors are cast to float32 to match typical neural network inputs.
+    - Device move errors are swallowed (best-effort) to be robust in edge cases,
+      but in most training code you may prefer to raise to catch misconfigurations.
+    """
     x_t = x if isinstance(x, th.Tensor) else th.as_tensor(x)
 
-    # float policy면 float로
     if not x_t.is_floating_point():
         x_t = x_t.float()
 
-    # device 정렬 (self.device가 있거나 파라미터 device에 맞춤)
     try:
         x_t = x_t.to(device)
     except Exception:
         pass
 
-    if x_t.dim() == 1:
+    if x_t.dim() == 0:
+        # Scalar -> (1, 1)
+        x_t = x_t.view(1, 1)
+    elif x_t.dim() == 1:
+        # (D,) -> (1, D)
         x_t = x_t.unsqueeze(0)
 
     return x_t

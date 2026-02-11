@@ -1,64 +1,76 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Union, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch as th
 
 from ..buffers import RolloutBuffer
 from ..utils.common_utils import (
-    to_numpy,
-    to_scalar,
-    is_scalar_like,
-    require_mapping,
-    require_scalar_like,
-    infer_shape,
-    to_action_np,
+    _is_scalar_like,
+    _infer_shape,
+    _require_mapping,
+    _require_scalar_like,
+    _to_action_np,
+    _to_numpy,
+    _to_scalar,
 )
 from .base_policy import BasePolicyAlgorithm
 
 
 class OnPolicyAlgorithm(BasePolicyAlgorithm):
     """
-    On-policy algorithm driver (rollout + PPO/A2C-style update loop).
+    On-policy algorithm driver (rollout + PPO/A2C/TRPO-style update loop).
 
-    Responsibilities
-    ----------------
-    - Owns a RolloutBuffer and fills it with env transitions
-    - Bootstraps last value for GAE
-    - Runs multiple epochs of minibatch updates via `core.update_from_batch(batch)`
-    - Aggregates scalar metrics for logging
-    - Resets rollout state after update
+    This driver owns a :class:`~RolloutBuffer` and implements the standard
+    on-policy lifecycle:
 
-    Required head interface (duck-typed)
-    ------------------------------------
-    - act(obs, deterministic=False) -> action
-    - evaluate_actions(obs, action) -> Mapping with keys:
-        * 'value'    : scalar-like (or tensor containing scalar for B=1)
-        * 'log_prob' : scalar-like (or tensor containing scalar for B=1)
-      Optional:
-        * value_only(obs) -> V(s) (preferred for bootstrap)
+    1) Collect `rollout_steps` transitions into the rollout buffer.
+    2) Bootstrap the last-state value (for GAE) if the rollout ended mid-episode.
+    3) Compute returns/advantages in the buffer.
+    4) Run multiple epochs of minibatch SGD updates via `core.update_from_batch(batch)`.
+    5) Aggregate scalar-like metrics and reset rollout state.
 
-    Required core interface
-    -----------------------
-    - update_from_batch(batch) -> Mapping[str, Any]
-      (scalar-like values will be logged)
+    Parameters and interfaces are intentionally duck-typed to allow multiple head/core
+    implementations.
+
+    Required interfaces (duck-typed)
+    --------------------------------
+    head
+        - act(obs, deterministic=False) -> action
+        - evaluate_actions(obs, action) -> Mapping[str, Any] with at least:
+            * "value"    : scalar-like or tensor/array containing a scalar (typically B==1)
+            * "log_prob" : scalar-like or tensor/array containing a scalar (typically B==1)
+        Optional:
+        - value_only(obs) -> V(s) (preferred for bootstrap)
+
+    core
+        - update_from_batch(batch) -> Mapping[str, Any]
+          Scalar-like values will be aggregated into logs.
 
     Transition contract (on_env_step)
     ---------------------------------
     transition must contain:
-      - 'obs'
-      - 'action'
-      - 'reward' : scalar-like
-      - 'done'   : scalar-like/bool
+        - "obs"
+        - "action"
+        - "reward" : scalar-like
+        - "done"   : scalar-like / bool
     optional:
-      - 'next_obs'
-      - 'value'    (scalar-like)
-      - 'log_prob' (scalar-like)
+        - "next_obs"
+        - "value"    : scalar-like (if already computed during acting)
+        - "log_prob" : scalar-like (if already computed during acting)
+
+    Notes
+    -----
+    - When value/log_prob are not provided in the transition, they are computed
+      via `head.evaluate_actions(obs, action)`.
+    - Log-probabilities may be per-dimension (e.g., (B,A)). In that case, this
+      driver reduces them to a joint scalar by summing across non-batch dims.
     """
 
     is_off_policy: bool = False
 
+    # A convention key a core can emit to request early stop (e.g., PPO target_kl)
     _EARLY_STOP_KEY = "train/early_stop"
 
     def __init__(
@@ -77,6 +89,35 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
         normalize_advantages: bool = False,
         adv_eps: float = 1e-8,
     ) -> None:
+        """
+        Parameters
+        ----------
+        head : Any
+            Policy/value head. See class docstring for required methods.
+        core : Any
+            Learner core that updates parameters from a sampled rollout batch.
+        rollout_steps : int, default=2048
+            Number of env transitions to collect before an update.
+        gamma : float, default=0.99
+            Discount factor used inside the rollout buffer (returns/GAE).
+        gae_lambda : float, default=0.95
+            GAE parameter λ.
+        update_epochs : int, default=10
+            Number of passes over the rollout data per update.
+        minibatch_size : Optional[int], default=64
+            Minibatch size for sampling from the rollout buffer during update.
+            If None, uses full-batch updates without shuffling.
+        device : Optional[Union[str, torch.device]], optional
+            Device used by the rollout buffer (and potentially head/core).
+        dtype_obs : Any, default=np.float32
+            Storage dtype for observations in the rollout buffer.
+        dtype_act : Any, default=np.float32
+            Storage dtype for actions in the rollout buffer.
+        normalize_advantages : bool, default=False
+            If True, normalize advantages inside the rollout buffer.
+        adv_eps : float, default=1e-8
+            Numerical epsilon used in advantage normalization.
+        """
         super().__init__(head=head, core=core, device=device)
 
         self.rollout_steps = int(rollout_steps)
@@ -100,17 +141,27 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
     # ------------------------------------------------------------------
     def setup(self, env: Any) -> None:
         """
-        Initialize RolloutBuffer from env spaces.
+        Initialize :class:`~RolloutBuffer` from environment spaces.
+
+        Parameters
+        ----------
+        env : Any
+            Environment with `.observation_space` and `.action_space`.
+
+        Raises
+        ------
+        ValueError
+            If `rollout_steps` is invalid.
 
         Notes
         -----
-        Uses project utility `infer_shape(space)` to extract tensor shapes.
+        Uses project utility :func:`infer_shape` to extract shapes from spaces.
         """
         if self.rollout_steps <= 0:
             raise ValueError(f"rollout_steps must be > 0, got: {self.rollout_steps}")
 
-        obs_shape = infer_shape(env.observation_space, name="observation_space")
-        action_shape = infer_shape(env.action_space, name="action_space")
+        obs_shape = _infer_shape(env.observation_space, name="observation_space")
+        action_shape = _infer_shape(env.action_space, name="action_space")
 
         self.rollout = RolloutBuffer(
             buffer_size=self.rollout_steps,
@@ -127,16 +178,26 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
 
     def remaining_rollout_steps(self) -> int:
         """
-        For Ray on-policy collection scheduling.
+        Return how many more transitions are needed to fill the rollout buffer.
 
-        Returns how many more transitions are needed to fill the rollout buffer.
-        When <= 0, the algorithm is ready to update (or should update before collecting more).
+        This is useful for Ray-style rollout scheduling.
+
+        Returns
+        -------
+        remaining : int
+            Remaining transitions to collect. When <= 0, the algorithm is ready
+            to update (or should update before collecting more).
+
+        Notes
+        -----
+        RolloutBuffer implementations may store the write pointer under different
+        attribute names; this method tries common candidates and falls back to:
+        - 0 if `rollout.full` is True
+        - rollout_steps otherwise (conservative)
         """
         if self.rollout is None:
             return int(self.rollout_steps)
 
-        # RolloutBuffer에 현재 저장된 step 수를 나타내는 속성명이 구현마다 다를 수 있으니
-        # 가장 흔한 후보들을 순차로 시도 (fallback 포함)
         for attr in ("pos", "ptr", "idx", "t", "step", "n", "size"):
             if hasattr(self.rollout, attr):
                 try:
@@ -145,9 +206,7 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
                 except Exception:
                     pass
 
-        # 마지막 fallback: full이면 0, 아니면 rollout_steps(보수적으로)
         return 0 if bool(getattr(self.rollout, "full", False)) else int(self.rollout_steps)
-
 
     # ------------------------------------------------------------------
     # Data collection
@@ -156,15 +215,25 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
         """
         Add one transition to the rollout buffer.
 
-        Required keys
-        -------------
-        - obs, action, reward, done
+        Parameters
+        ----------
+        transition : Dict[str, Any]
+            Required keys:
+            - "obs"
+            - "action"
+            - "reward" : scalar-like
+            - "done"   : scalar-like/bool
+            Optional keys:
+            - "next_obs"
+            - "value"
+            - "log_prob"
 
-        Optional keys
-        -------------
-        - next_obs, value, log_prob
-        If value/log_prob are missing, they are computed via head.evaluate_actions().
-        In that case, log_prob is reduced to a joint scalar by summing action dims.
+        Notes
+        -----
+        - If "value" and "log_prob" are absent, they are computed via
+          `head.evaluate_actions(obs, action)`.
+        - `log_prob` may be per-dimension; it will be reduced to a joint scalar by
+          summing non-batch dimensions, then validated as scalar-like (usually B==1).
         """
         if self.rollout is None:
             raise RuntimeError("RolloutBuffer not initialized. Call setup(env) first.")
@@ -173,11 +242,12 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
 
         obs_raw = transition["obs"]
         act_raw = transition["action"]
-        rew = require_scalar_like(transition["reward"], name="transition['reward']")
-        done = bool(require_scalar_like(transition["done"], name="transition['done']"))
+        rew = _require_scalar_like(transition["reward"], name="transition['reward']")
+        done = bool(_require_scalar_like(transition["done"], name="transition['done']"))
 
-        obs_np = to_numpy(obs_raw).astype(self.dtype_obs, copy=False)
-        act_np = np.asarray(to_action_np(act_raw), dtype=self.dtype_act)
+        obs_np = _to_numpy(obs_raw).astype(self.dtype_obs, copy=False)
+        act_np = np.asarray(_to_action_np(act_raw), dtype=self.dtype_act)
+
         value_any = transition.get("value", None)
         logp_any = transition.get("log_prob", None)
 
@@ -197,6 +267,7 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
             log_prob=log_prob,
         )
 
+        # Cache last step termination + last observation for bootstrapping.
         self._last_done = done
         self._last_obs = transition.get("next_obs", None)
 
@@ -212,26 +283,46 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
         logp_any: Any,
     ) -> Tuple[float, float]:
         """
-        Return (value, log_prob) as Python floats.
+        Resolve (value, log_prob) for the current transition.
 
-        Policy
-        ------
-        - If transition provides both value/log_prob: use them as-is (scalar-like).
-        - Otherwise: compute via head.evaluate_actions(obs, action).
-        log_prob may be per-dim (B,A); we reduce to joint by summing over non-batch dims.
-        Then require scalar-like (typically B==1).
+        Parameters
+        ----------
+        obs_raw : Any
+            Raw observation passed to head for evaluation if needed.
+        act_raw : Any
+            Raw action passed to head for evaluation if needed.
+        value_any : Any
+            Transition-provided value baseline estimate (optional).
+        logp_any : Any
+            Transition-provided log-probability (optional).
+
+        Returns
+        -------
+        value : float
+            Baseline value estimate V(s) as a Python float.
+        log_prob : float
+            Joint log-probability log π(a|s) as a Python float.
+
+        Notes
+        -----
+        Policy:
+        - If transition provides both `value` and `log_prob`, they are used
+          as-is after scalar validation.
+        - Otherwise, compute via `head.evaluate_actions(obs, action)` and extract:
+          - "value" (scalar-like)
+          - "log_prob" (possibly per-dim; reduced to a joint scalar)
         """
         if (value_any is not None) and (logp_any is not None):
-            value = require_scalar_like(value_any, name="transition['value']")
-            log_prob = require_scalar_like(logp_any, name="transition['log_prob']")
+            value = _require_scalar_like(value_any, name="transition['value']")
+            log_prob = _require_scalar_like(logp_any, name="transition['log_prob']")
             return float(value), float(log_prob)
 
-        eval_out = require_mapping(
+        eval_out = _require_mapping(
             self.head.evaluate_actions(obs_raw, act_raw),
             name="head.evaluate_actions(obs, action)",
         )
 
-        value = require_scalar_like(eval_out.get("value", None), name="evaluate_actions()['value']")
+        value = _require_scalar_like(eval_out.get("value", None), name="evaluate_actions()['value']")
 
         logp = eval_out.get("log_prob", None)
         if logp is None:
@@ -240,31 +331,55 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
         log_prob = self._joint_logp_scalar(logp, name="evaluate_actions()['log_prob'] (joint summed)")
         return float(value), float(log_prob)
 
-
     def _joint_logp_scalar(self, logp_any: Any, *, name: str) -> float:
         """
-        Convert log_prob output to a scalar-like joint log_prob.
+        Convert a log_prob output into a scalar-like joint log_prob.
 
-        Accepts:
-        - torch.Tensor: (B,), (B,1), (B,A), (B,...) -> reduce to (B,) by summing dims != batch
-        - array-like: similar reduction semantics
+        Parameters
+        ----------
+        logp_any : Any
+            Log-probability output which may be:
+            - torch.Tensor of shape (B,), (B,1), (B,A), (B,...)  (common)
+            - array-like with similar semantics
+        name : str
+            Name used in error messages.
 
-        Then enforces scalar-like via require_scalar_like (typically B==1).
+        Returns
+        -------
+        log_prob : float
+            Joint log-probability as a Python float.
+
+        Notes
+        -----
+        Reduction rule:
+        - If logp has ndim >= 2, it is reduced to (B,) by flattening from dim=1
+          and summing across the remaining dims.
+        - The result is then validated as scalar-like, which typically implies
+          B == 1 at collection time (common for synchronous env stepping).
         """
         if th.is_tensor(logp_any):
             lp = logp_any
             if lp.dim() >= 2:
                 lp = lp.flatten(start_dim=1).sum(dim=1)  # (B,)
-            return float(require_scalar_like(lp, name=name))
+            return float(_require_scalar_like(lp, name=name))
 
         arr = np.asarray(logp_any)
         if arr.ndim >= 2:
             arr = arr.reshape(arr.shape[0], -1).sum(axis=1)  # (B,)
-        return float(require_scalar_like(arr, name=name))
+        return float(_require_scalar_like(arr, name=name))
 
-
+    # ------------------------------------------------------------------
+    # Update readiness
+    # ------------------------------------------------------------------
     def ready_to_update(self) -> bool:
-        """True if rollout buffer is full."""
+        """
+        Return True if the rollout buffer is full.
+
+        Returns
+        -------
+        ready : bool
+            True if `self.rollout.full` is True.
+        """
         return (self.rollout is not None) and bool(self.rollout.full)
 
     # ------------------------------------------------------------------
@@ -272,14 +387,21 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
     # ------------------------------------------------------------------
     def _bootstrap_last_value(self) -> float:
         """
-        Compute V(s_T) for GAE bootstrapping.
+        Compute V(s_T) for GAE bootstrapping at the end of a rollout.
 
-        Rules
+        Returns
+        -------
+        last_value : float
+            Bootstrap value used by GAE/returns computation.
+
+        Notes
         -----
-        - If episode terminated at last step: return 0.0
-        - Else:
-            prefer head.value_only(next_obs)
-            fallback: evaluate_actions(next_obs, act(next_obs, deterministic=True))
+        Rules:
+        - If the last transition ended an episode (`done=True`) or `next_obs` is missing,
+          returns 0.0 (no bootstrap across terminal).
+        - Otherwise, prefers `head.value_only(next_obs)` (cheap and explicit).
+        - Fallback: compute `a_T = head.act(next_obs, deterministic=True)` and call
+          `head.evaluate_actions(next_obs, a_T)` to extract "value".
         """
         if self._last_done or (self._last_obs is None):
             return 0.0
@@ -287,14 +409,14 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
         value_only = getattr(self.head, "value_only", None)
         if callable(value_only):
             v = value_only(self._last_obs)
-            return float(require_scalar_like(v, name="head.value_only(next_obs)"))
+            return float(_require_scalar_like(v, name="head.value_only(next_obs)"))
 
         aT = self.head.act(self._last_obs, deterministic=True)
-        outT = require_mapping(
+        outT = _require_mapping(
             self.head.evaluate_actions(self._last_obs, aT),
             name="head.evaluate_actions(next_obs, aT) [fallback]",
         )
-        vT = require_scalar_like(outT.get("value", None), name="evaluate_actions(fallback)['value']")
+        vT = _require_scalar_like(outT.get("value", None), name="evaluate_actions(fallback)['value']")
         return float(vT)
 
     # ------------------------------------------------------------------
@@ -302,19 +424,29 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
     # ------------------------------------------------------------------
     def update(self) -> Dict[str, float]:
         """
-        Run PPO/A2C-style updates from the filled RolloutBuffer.
-
-        Behavior
-        --------
-        - Bootstraps last value (if needed) and computes returns/advantages
-        - Iterates update_epochs and minibatches
-        - Aggregates scalar metrics returned by core
-        - Supports early stop if metrics contain `train/early_stop` > 0
+        Run PPO/A2C-style learner updates from a filled rollout buffer.
 
         Returns
         -------
         metrics : Dict[str, float]
-            Mean-aggregated metrics plus bookkeeping under 'onpolicy/*'.
+            Mean-aggregated scalar metrics plus bookkeeping metrics under
+            'onpolicy/*' and 'sys/num_updates'.
+
+        Raises
+        ------
+        RuntimeError
+            If setup(env) was not called.
+        ValueError
+            If update hyperparameters are invalid.
+
+        Notes
+        -----
+        Workflow:
+        1) Bootstrap last value and compute returns/advantages in the rollout buffer.
+        2) Iterate `update_epochs` and sample minibatches (optionally shuffled).
+        3) Call `core.update_from_batch(batch)` and aggregate scalar-like metrics.
+        4) Support early stop if `metrics["train/early_stop"] > 0`.
+        5) Reset rollout state after finishing updates.
         """
         if self.rollout is None:
             raise RuntimeError("RolloutBuffer not initialized. Call setup(env) first.")
@@ -327,14 +459,14 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
         last_value = self._bootstrap_last_value()
         self.rollout.compute_returns_and_advantage(last_value=last_value, last_done=self._last_done)
 
-        # 2) sampling config
+        # 2) minibatch sampling config
         rollout_size = int(self.rollout_steps)
         if self.minibatch_size is None:
             batch_size, shuffle = rollout_size, False
         else:
             batch_size, shuffle = min(self.minibatch_size, rollout_size), True
 
-        # 3) update loop with metric aggregation
+        # 3) update loop + metric aggregation
         sums: Dict[str, float] = {}
         num_minibatches = 0
 
@@ -346,18 +478,19 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
                 out_any = self.core.update_from_batch(batch)
                 metrics_any = dict(out_any) if isinstance(out_any, Mapping) else {}
 
-                # scalar aggregation
                 for k, v in metrics_any.items():
-                    if is_scalar_like(v):
-                        sv = to_scalar(v)
-                        if sv is not None:
-                            key = str(k)
-                            sums[key] = sums.get(key, 0.0) + float(sv)
+                    if not _is_scalar_like(v):
+                        continue
+                    sv = _to_scalar(v)
+                    if sv is None:
+                        continue
+                    key = str(k)
+                    sums[key] = sums.get(key, 0.0) + float(sv)
 
                 num_minibatches += 1
 
-                # early stop (PPO target_kl, etc.)
-                es = to_scalar(metrics_any.get(self._EARLY_STOP_KEY, 0.0))
+                # Early stop (e.g., PPO target KL)
+                es = _to_scalar(metrics_any.get(self._EARLY_STOP_KEY, 0.0))
                 if es is not None and float(es) > 0.0:
                     early_stop = True
                     early_stop_epoch = int(ep)
@@ -372,15 +505,15 @@ class OnPolicyAlgorithm(BasePolicyAlgorithm):
             for k, v in sums.items():
                 means[k] = v * inv
 
-        # bookkeeping metrics
+        # Bookkeeping metrics
         means["onpolicy/rollout_steps"] = float(self.rollout_steps)
         means["onpolicy/num_minibatches"] = float(num_minibatches)
         means["onpolicy/env_steps"] = float(self._env_steps)
         means["onpolicy/early_stop"] = 1.0 if early_stop else 0.0
         means["onpolicy/early_stop_epoch"] = float(early_stop_epoch if early_stop else -1)
 
-        # NEW: learner update accounting
-        # PPO/A2C style: one learner update == one minibatch update_from_batch call
+        # Learner update accounting:
+        # PPO/A2C style: one learner update == one minibatch `update_from_batch` call
         means["sys/num_updates"] = float(num_minibatches)
 
         # 4) reset rollout state

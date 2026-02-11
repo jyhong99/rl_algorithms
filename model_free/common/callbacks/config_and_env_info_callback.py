@@ -1,37 +1,61 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
-
 import math
 import platform
 import sys
 import time
+from typing import Any, Dict, Mapping, Optional
 
 from .base_callback import BaseCallback
-from ..utils.log_utils import log
-from ..utils.callback_utils import infer_step
+from ..utils.callback_utils import _infer_step
 
 
 class ConfigAndEnvInfoCallback(BaseCallback):
     """
-    Log basic run metadata at train start (best-effort, framework-agnostic).
+    Log basic run metadata at training start (best-effort, framework-agnostic).
+
+    This callback collects a JSON-friendly snapshot of:
+    - Trainer configuration knobs (if present)
+    - Algorithm / head / core identities (if exposed by the trainer)
+    - Environment identity hints (Gym/Gymnasium style) and vectorization info
+    - Runtime/system info (Python version, platform string, timestamp)
 
     Design goals
     ------------
-    - Never raise (best-effort introspection)
-    - JSON-friendly payload (scalars, small dict/list summaries, strings truncated)
-    - Minimal assumptions about Trainer/Env shape (duck-typed)
+    - Never raise: all introspection is best-effort.
+    - JSON-friendly payload:
+        - scalars (bool/int/finite float), strings (truncated),
+          small dict/list summaries (bounded size, recursive).
+    - Minimal assumptions about Trainer/Env: everything is accessed duck-typed.
 
     Parameters
     ----------
-    log_prefix : str, default="sys/"
-        Prefix used by your logger's `log(...)` function.
-    max_collection_items : int, default=32
-        Max number of items/keys to keep when normalizing lists/dicts.
-    max_string_len : int, default=200
-        Max string length (ellipsis truncation).
-    log_once : bool, default=True
-        If True, log only once per callback instance (even if on_train_start called again).
+    log_prefix:
+        Prefix used by the logger (passed to :meth:`BaseCallback.log`).
+        Typical values include ``"sys/"`` or ``"meta/"``.
+    max_collection_items:
+        Maximum number of items/keys to keep when normalizing lists/dicts.
+        Extra items are summarized with an ellipsis marker.
+    max_string_len:
+        Maximum string length. Longer strings are truncated with ellipsis.
+    log_once:
+        If True, log only once per callback instance, even if
+        :meth:`on_train_start` is called multiple times (e.g., resume/restart).
+
+    Notes
+    -----
+    Trainer contract (duck-typed)
+    -----------------------------
+    The callback may read some subset of:
+    - Common trainer fields: ``seed``, ``batch_size``, ``gamma``, ``device``, etc.
+    - Optional identity fields: ``algo``, ``core``, ``head``, ``logger``
+    - Environment handle: ``train_env``
+
+    Step selection
+    --------------
+    The log step is determined by :func:`infer_step`, which typically prefers
+    an environment-step counter when available, falling back to update-step
+    counters otherwise.
     """
 
     def __init__(
@@ -50,17 +74,48 @@ class ConfigAndEnvInfoCallback(BaseCallback):
         self._did_log = False
 
     # =========================================================================
-    # Internal helpers (merged from standalone utilities)
+    # Internal helpers
     # =========================================================================
-    def _safe_getattr(self, obj: Any, name: str, default: Any = None) -> Any:
-        """Best-effort getattr that never raises."""
+    @staticmethod
+    def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
+        """
+        Best-effort getattr that never raises.
+
+        Parameters
+        ----------
+        obj:
+            Object from which to read an attribute.
+        name:
+            Attribute name to read.
+        default:
+            Value to return if getattr fails.
+
+        Returns
+        -------
+        Any
+            Attribute value if accessible; otherwise ``default``.
+        """
         try:
             return getattr(obj, name)
         except Exception:
             return default
 
     def _truncate_str(self, s: str, *, max_len: Optional[int] = None) -> str:
-        """Truncate a string to max_len with ellipsis."""
+        """
+        Truncate a string to a maximum length with ellipsis.
+
+        Parameters
+        ----------
+        s:
+            Input string.
+        max_len:
+            Maximum length. If None, uses ``self.max_string_len``.
+
+        Returns
+        -------
+        str
+            Truncated string. If ``max_len <= 0``, returns an empty string.
+        """
         ml = self.max_string_len if max_len is None else int(max_len)
         if ml <= 0:
             return ""
@@ -70,20 +125,40 @@ class ConfigAndEnvInfoCallback(BaseCallback):
 
     def _norm_jsonish(self, x: Any) -> Any:
         """
-        Normalize arbitrary values into JSON-friendly types (best-effort).
+        Normalize arbitrary Python objects into JSON-friendly types (best-effort).
 
-        Keeps:
-          - None, bool, int, float (finite only), str (truncated)
-        Summarizes:
-          - Mapping: keep up to max_collection_items keys (recursive)
-          - list/tuple: keep up to max_collection_items items (recursive)
+        Conversion rules
+        ---------------
+        Preserved types:
+        - None
+        - bool, int
+        - float (finite only; NaN/inf -> None)
+        - str (truncated)
+
+        Best-effort scalar extraction:
+        - numpy/torch scalars that implement ``.item()`` are converted to a Python scalar.
+
+        Summaries:
+        - Mapping: keep up to ``max_collection_items`` key/value pairs (recursive).
+        - list/tuple: keep up to ``max_collection_items`` items (recursive), then append a
+          summary marker (e.g., ``"... +12 more"``).
+
         Fallback:
-          - "<ClassName>" string (truncated)
+        - If an object cannot be normalized, returns a string ``"<ClassName>"`` (truncated).
+
+        Parameters
+        ----------
+        x:
+            Arbitrary input value.
+
+        Returns
+        -------
+        Any
+            JSON-friendly representation.
         """
         if x is None:
             return None
 
-        # Basic scalars
         if isinstance(x, (bool, int)):
             return x
 
@@ -132,15 +207,26 @@ class ConfigAndEnvInfoCallback(BaseCallback):
             head.append(f"... +{n - self.max_collection_items} more")
             return head
 
-        # Fallback: class name
         return self._truncate_str(f"<{type(x).__name__}>")
 
     def _infer_env_id(self, env: Any) -> Optional[str]:
         """
-        Try to infer environment id string from common patterns:
-          - env.spec.id (gym/gymnasium)
-          - env.unwrapped.spec.id
-          - env.envs[0].spec.id (VecEnv-like)
+        Infer an environment id string from common Gym/Gymnasium patterns.
+
+        Attempts the following in order (best-effort):
+        - ``env.spec.id``
+        - ``env.unwrapped.spec.id``
+        - ``env.envs[0].spec.id`` (VecEnv-like containers)
+
+        Parameters
+        ----------
+        env:
+            Environment object (duck-typed).
+
+        Returns
+        -------
+        Optional[str]
+            Environment id string if inferred; otherwise None.
         """
         try:
             if env is None:
@@ -165,7 +251,23 @@ class ConfigAndEnvInfoCallback(BaseCallback):
         return None
 
     def _infer_env_num(self, env: Any) -> Optional[int]:
-        """Best-effort env count."""
+        """
+        Infer the number of environments (vectorization degree) best-effort.
+
+        Attempts:
+        - ``env.num_envs`` (common VecEnv API)
+        - ``len(env.envs)`` (list/tuple container)
+
+        Parameters
+        ----------
+        env:
+            Environment object (duck-typed).
+
+        Returns
+        -------
+        Optional[int]
+            Number of environments if inferred; otherwise None.
+        """
         try:
             if env is None:
                 return None
@@ -179,19 +281,40 @@ class ConfigAndEnvInfoCallback(BaseCallback):
                 return len(envs)
         except Exception:
             pass
+
         return None
 
     # =========================================================================
     # Callback hook
     # =========================================================================
     def on_train_start(self, trainer: Any) -> bool:
+        """
+        Collect and log trainer/environment metadata at training start.
+
+        Parameters
+        ----------
+        trainer:
+            Trainer object (duck-typed). The callback introspects commonly used
+            configuration fields if present, and uses :func:`infer_step` to
+            choose a logging step.
+
+        Returns
+        -------
+        bool
+            Always True (this callback never requests early stop).
+
+        Notes
+        -----
+        - If ``log_once=True``, this method logs at most once per instance.
+        - All failures are swallowed (best-effort introspection).
+        """
         if self.log_once and self._did_log:
             return True
         self._did_log = True
 
         payload: Dict[str, Any] = {}
 
-        # ---- trainer knobs (common) ----
+        # ---- trainer knobs (common fields) ----
         trainer_keys = (
             "seed",
             "total_env_steps",
@@ -276,7 +399,7 @@ class ConfigAndEnvInfoCallback(BaseCallback):
         payload["time.unix"] = int(time.time())
 
         if payload:
-            step = infer_step(trainer)
-            log(trainer, payload, step=step, prefix=self.log_prefix)
+            step = _infer_step(trainer)
+            self.log(trainer, payload, step=step, prefix=self.log_prefix)
 
         return True

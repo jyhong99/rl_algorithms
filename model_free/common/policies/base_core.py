@@ -5,17 +5,18 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import torch as th
 import torch.nn as nn
+from torch.optim import Optimizer
 
 from model_free.common.optimizers.optimizer_builder import (
-    clip_grad_norm,
-    optimizer_state_dict,
-    load_optimizer_state_dict,
     build_optimizer,
+    clip_grad_norm,
+    load_optimizer_state_dict,
+    optimizer_state_dict,
 )
 from model_free.common.optimizers.scheduler_builder import (
-    scheduler_state_dict,
-    load_scheduler_state_dict,
     build_scheduler,
+    load_scheduler_state_dict,
+    scheduler_state_dict,
 )
 
 
@@ -23,39 +24,63 @@ class BaseCore(ABC):
     """
     Base class for update engines ("cores").
 
-    This class provides shared infrastructure:
-      - `head` reference and normalized `device`
-      - optional AMP GradScaler
-      - update-call counter (used for scheduling target updates)
-      - gradient clipping helper
-      - generic target-network update helper (hard/soft) + freezing
-      - optimizer/scheduler persistence helpers
+    A "core" is the unit responsible for performing parameter updates from data
+    batches (e.g., PPO update step, SAC update step, DQN update step). This base
+    class provides shared infrastructure that most RL training cores need:
+
+    - A reference to `head` (duck-typed container of networks and utilities).
+    - Normalized `device` selection.
+    - Optional AMP (automatic mixed precision) support via GradScaler.
+    - A monotonically increasing update-call counter.
+    - AMP-safe gradient clipping helper.
+    - Target-network update utilities (hard/soft updates + freezing).
+    - Optimizer/scheduler checkpoint serialization helpers.
+
+    Parameters
+    ----------
+    head : Any
+        A duck-typed container typically holding neural networks (e.g., actor,
+        critic) and optional helper methods. Commonly expected attributes:
+
+        - device : torch.device or str, optional
+            Device used for training. If missing, defaults to CPU.
+        - freeze_target(module) : callable, optional
+            Custom target-freezing logic (e.g., disabling grads, eval mode).
+        - hard_update(target, source) : callable, optional
+            Custom hard update logic for target networks.
+        - soft_update(target, source, tau=...) : callable, optional
+            Custom Polyak averaging logic.
+
+    use_amp : bool, default=False
+        If True and CUDA is available, enables AMP with a GradScaler. AMP is
+        automatically disabled on CPU or when CUDA is not available.
 
     Notes
     -----
-    - This class assumes `head` is a duck-typed container that may provide:
-        * device: torch.device or str
-        * freeze_target(module): optional
-        * hard_update(target, source): optional
-        * soft_update(target, source, tau=...): optional
-    - Concrete cores must implement `update_from_batch`.
+    - Concrete subclasses must implement `update_from_batch`.
+    - The update counter `_update_calls` is commonly used to schedule target
+      network updates (e.g., every N gradient steps).
     """
 
     def __init__(self, *, head: Any, use_amp: bool = False) -> None:
         self.head = head
 
-        # Normalize device
+        # -------------------------
+        # Device normalization
+        # -------------------------
         dev = getattr(head, "device", th.device("cpu"))
         self.device = dev if isinstance(dev, th.device) else th.device(str(dev))
 
-        # AMP is meaningful only on CUDA
+        # AMP is only meaningful on CUDA
         self.use_amp = bool(use_amp) and (self.device.type == "cuda") and th.cuda.is_available()
 
-        # GradScaler creation (safe across torch variants)
+        # -------------------------
+        # GradScaler (safe across torch variants)
+        # -------------------------
         try:
             self.scaler = th.cuda.amp.GradScaler(enabled=self.use_amp)
         except Exception:
-            # fallback (rare torch builds)
+            # Fallback for some torch builds/versions
             self.scaler = th.amp.GradScaler(enabled=self.use_amp)  # type: ignore[attr-defined]
 
         self._update_calls: int = 0
@@ -65,11 +90,26 @@ class BaseCore(ABC):
     # ---------------------------------------------------------------------
     @property
     def update_calls(self) -> int:
-        """Number of times the core performed an update step."""
+        """
+        Number of times the core performed an update step.
+
+        Returns
+        -------
+        update_calls : int
+            Count of completed update calls, typically incremented by subclasses
+            after a successful parameter update.
+        """
         return int(self._update_calls)
 
     def _bump(self) -> None:
-        """Increment internal update counter."""
+        """
+        Increment internal update counter.
+
+        Notes
+        -----
+        Subclasses typically call this once per "update step" (e.g., after
+        optimizer.step()) so that target-network update schedules remain correct.
+        """
         self._update_calls += 1
 
     # ---------------------------------------------------------------------
@@ -83,22 +123,26 @@ class BaseCore(ABC):
         optimizer: Optional[Any] = None,
     ) -> None:
         """
-        Clip gradients in-place.
+        Clip gradients in-place (optionally AMP-safe).
 
         Parameters
         ----------
         params : Any
-            Iterable of parameters (e.g., module.parameters()).
+            Iterable of parameters whose gradients will be clipped
+            (e.g., `module.parameters()`).
+
         max_grad_norm : float
-            If <= 0, clipping is disabled.
-        optimizer : Optional[Any], optional
-            Optimizer instance, needed by some AMP-unscale implementations.
+            Maximum allowed norm. If `max_grad_norm <= 0`, clipping is disabled.
+
+        optimizer : Optional[Any], default=None
+            Optimizer instance. If AMP is enabled, it is passed to the clipping
+            utility so that gradients can be unscaled before clipping.
 
         Notes
         -----
-        - If AMP is enabled, gradients are unscaled before clipping.
-        - `clip_grad_norm` is expected to be your project utility that supports
-          scaler/optimizer arguments.
+        - If AMP is enabled, gradients are unscaled (via GradScaler) before clipping.
+        - This method delegates to your project utility `clip_grad_norm`, which
+          is expected to accept `(scaler=..., optimizer=...)`.
         """
         mg = float(max_grad_norm)
         if mg <= 0.0:
@@ -110,11 +154,22 @@ class BaseCore(ABC):
             clip_grad_norm(params, mg)
 
     # ---------------------------------------------------------------------
-    # Target freezing
+    # Target network freezing
     # ---------------------------------------------------------------------
     @staticmethod
     def _freeze_module_fallback(module: nn.Module) -> None:
-        """Fallback freezing: requires_grad=False and eval()."""
+        """
+        Fallback target freezing.
+
+        This fallback:
+        - disables gradients (`requires_grad=False`) for all parameters
+        - switches the module into eval mode
+
+        Parameters
+        ----------
+        module : nn.Module
+            Target module to freeze.
+        """
         for p in module.parameters():
             p.requires_grad_(False)
         module.eval()
@@ -123,9 +178,15 @@ class BaseCore(ABC):
         """
         Freeze a target module.
 
-        Preference order:
-          1) head.freeze_target(module) if provided
-          2) fallback implementation
+        Preference order
+        ----------------
+        1) `head.freeze_target(module)` if provided and callable
+        2) fallback implementation `_freeze_module_fallback`
+
+        Parameters
+        ----------
+        module : nn.Module
+            Target module to freeze.
         """
         fn = getattr(self.head, "freeze_target", None)
         if callable(fn):
@@ -139,18 +200,43 @@ class BaseCore(ABC):
     @staticmethod
     @th.no_grad()
     def _hard_update_fallback(target: nn.Module, source: nn.Module) -> None:
-        """Fallback hard update via state_dict copy."""
+        """
+        Fallback hard update via `state_dict` copy.
+
+        Parameters
+        ----------
+        target : nn.Module
+            Target network (updated in-place).
+        source : nn.Module
+            Source/online network (copied from).
+        """
         target.load_state_dict(source.state_dict())
 
     @staticmethod
     @th.no_grad()
     def _soft_update_fallback(target: nn.Module, source: nn.Module, tau: float) -> None:
-        """Fallback Polyak averaging."""
+        """
+        Fallback soft update (Polyak averaging).
+
+        Parameters
+        ----------
+        target : nn.Module
+            Target network (updated in-place).
+        source : nn.Module
+            Source/online network (copied from).
+        tau : float
+            Polyak factor in (0, 1]. Larger values update targets more aggressively.
+
+        Notes
+        -----
+        Implements:
+            θ_target <- (1 - tau) * θ_target + tau * θ_source
+        """
         for p_t, p_s in zip(target.parameters(), source.parameters()):
             p_t.data.mul_(1.0 - tau).add_(p_s.data, alpha=tau)
 
     # ---------------------------------------------------------------------
-    # Target update (generic)
+    # Target update controller
     # ---------------------------------------------------------------------
     def _maybe_update_target(
         self,
@@ -166,44 +252,51 @@ class BaseCore(ABC):
         Parameters
         ----------
         target : Optional[nn.Module]
-            Target network. If None, no-op.
+            Target network. If None, this function is a no-op.
+
         source : nn.Module
-            Online/source network.
+            Source (online) network.
+
         interval : int
-            Update frequency in *core update calls*.
+            Update frequency in **core update calls**.
             - interval <= 0 : disabled
-            - otherwise     : update when (update_calls % interval) == 0
+            - otherwise     : update when `(update_calls % interval) == 0`
+
+            Notes
+            -----
+            This method updates on call 0 as well (i.e., when update_calls == 0).
+
         tau : float
-            Update mode:
+            Update mode selector:
             - tau <= 0 : hard update
-            - tau > 0  : soft update with Polyak factor tau, must be in (0,1]
+            - tau > 0  : soft update with Polyak factor tau (must be in (0, 1])
 
         Notes
         -----
-        - This method always freezes the target after updating.
-        - Neither hard nor soft update functions are assumed to freeze.
+        - The target is always frozen after updating (via `_freeze_target`).
+        - Custom update logic may be provided by `head.hard_update` or `head.soft_update`.
+        - Neither hard nor soft update functions are assumed to freeze targets.
         """
         if target is None:
             return
 
-        interval = int(interval)
-        if interval <= 0:
+        interval_i = int(interval)
+        if interval_i <= 0:
             return
 
-        # Update on call 0, interval, 2*interval, ...
-        if (self._update_calls % interval) != 0:
+        if (self._update_calls % interval_i) != 0:
             return
 
-        tau = float(tau)
-        if not (0.0 <= tau <= 1.0):
-            raise ValueError(f"tau must be in [0, 1], got {tau}")
+        tau_f = float(tau)
+        if not (0.0 <= tau_f <= 1.0):
+            raise ValueError(f"tau must be in [0, 1], got {tau_f}")
 
-        if tau > 0.0:
+        if tau_f > 0.0:
             fn = getattr(self.head, "soft_update", None)
             if callable(fn):
-                fn(target, source, tau=tau)
+                fn(target, source, tau=tau_f)
             else:
-                self._soft_update_fallback(target, source, tau)
+                self._soft_update_fallback(target, source, tau_f)
         else:
             fn = getattr(self.head, "hard_update", None)
             if callable(fn):
@@ -214,28 +307,47 @@ class BaseCore(ABC):
         self._freeze_target(target)
 
     # ---------------------------------------------------------------------
-    # Optimizer / Scheduler persistence helpers
+    # Optimizer / scheduler persistence helpers
     # ---------------------------------------------------------------------
-    def _save_opt_sched(self, opt: Any, sched: Any) -> Dict[str, Any]:
+    def _save_opt_sched(self, opt: Optimizer, sched: Optional[Any]) -> Dict[str, Any]:
         """
         Serialize optimizer and scheduler state.
 
-        Notes
-        -----
-        - `sched` may be None (e.g., sched_name="none"). In that case, stores {}.
+        Parameters
+        ----------
+        opt : torch.optim.Optimizer
+            Optimizer instance to serialize.
+        sched : Optional[Any]
+            Scheduler instance (or None). If None, scheduler state is stored as {}.
+
+        Returns
+        -------
+        state : Dict[str, Any]
+            Dictionary with keys:
+            - "opt": optimizer_state_dict(opt)
+            - "sched": scheduler_state_dict(sched) or {}
         """
         return {
             "opt": optimizer_state_dict(opt),
             "sched": scheduler_state_dict(sched) if sched is not None else {},
         }
 
-    def _load_opt_sched(self, opt: Any, sched: Any, state: Mapping[str, Any]) -> None:
+    def _load_opt_sched(self, opt: Optimizer, sched: Optional[Any], state: Mapping[str, Any]) -> None:
         """
         Restore optimizer and scheduler state.
 
+        Parameters
+        ----------
+        opt : torch.optim.Optimizer
+            Optimizer instance to restore into.
+        sched : Optional[Any]
+            Scheduler instance to restore into (or None).
+        state : Mapping[str, Any]
+            Dict produced by `_save_opt_sched`.
+
         Notes
         -----
-        - If scheduler is None, scheduler state is ignored.
+        - If `sched` is None, scheduler state is ignored.
         """
         opt_state = state.get("opt", None)
         if opt_state is not None:
@@ -248,11 +360,26 @@ class BaseCore(ABC):
     # Default persistence (core-wide)
     # ---------------------------------------------------------------------
     def state_dict(self) -> Dict[str, Any]:
-        """Return serializable core state."""
+        """
+        Return serializable core state.
+
+        Returns
+        -------
+        state : Dict[str, Any]
+            Core state dictionary containing at least:
+            - "update_calls": int
+        """
         return {"update_calls": int(self._update_calls)}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Load core state."""
+        """
+        Load core state.
+
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State dict produced by `state_dict()`.
+        """
         self._update_calls = int(state.get("update_calls", 0))
 
     # ---------------------------------------------------------------------
@@ -263,10 +390,16 @@ class BaseCore(ABC):
         """
         Run one update step from a batch and return metrics.
 
+        Parameters
+        ----------
+        batch : Any
+            Training batch. The structure is algorithm-specific (e.g., dict of
+            tensors, namedtuple, replay sample, etc.).
+
         Returns
         -------
         metrics : Dict[str, float]
-            Scalar training diagnostics (losses, KL, entropy, grad norms, etc.).
+            Scalar diagnostics (losses, KL, entropy, gradient norms, etc.).
         """
         raise NotImplementedError
 
@@ -275,15 +408,25 @@ class ActorCriticCore(BaseCore, ABC):
     """
     Base class for actor-critic update engines.
 
-    Owns:
-      - actor optimizer/scheduler
-      - critic optimizer/scheduler
-      - persistence for both
+    This core owns two independent optimization pipelines:
+    - actor optimizer + (optional) scheduler
+    - critic optimizer + (optional) scheduler
+
+    It also implements checkpoint persistence for both pipelines.
 
     Required head interface (duck-typed)
     ------------------------------------
-    - head.actor: nn.Module
-    - head.critic: nn.Module
+    - head.actor : nn.Module
+        Policy / actor network.
+    - head.critic : nn.Module
+        Value function / critic network.
+
+    Notes
+    -----
+    - KFAC support:
+      Your `build_optimizer` enforces `name="kfac"` requires `model=...`. This
+      class provides a helper that auto-injects `model=module` unless explicitly
+      provided in `actor_optim_kwargs` / `critic_optim_kwargs`.
     """
 
     def __init__(
@@ -298,7 +441,7 @@ class ActorCriticCore(BaseCore, ABC):
         critic_optim_name: str = "adamw",
         critic_lr: float = 3e-4,
         critic_weight_decay: float = 0.0,
-        # NEW: optimizer extra kwargs (e.g., KFAC knobs)
+        # optimizer extra kwargs (e.g., KFAC knobs)
         actor_optim_kwargs: Optional[Mapping[str, Any]] = None,
         critic_optim_kwargs: Optional[Mapping[str, Any]] = None,
         # scheduler
@@ -319,33 +462,31 @@ class ActorCriticCore(BaseCore, ABC):
         if not hasattr(self.head, "critic") or not isinstance(self.head.critic, nn.Module):
             raise ValueError("ActorCriticCore requires head.critic: nn.Module")
 
-        actor_optim_kwargs = dict(actor_optim_kwargs or {})
-        critic_optim_kwargs = dict(critic_optim_kwargs or {})
+        actor_optim_kwargs_d = dict(actor_optim_kwargs or {})
+        critic_optim_kwargs_d = dict(critic_optim_kwargs or {})
 
         # ---------------------------------------------------------------------
         # Optimizers
         # ---------------------------------------------------------------------
-        # IMPORTANT:
-        # - build_optimizer(..., name='kfac', model=...) is required in your builder.
-        # - We auto-inject model=... for kfac unless user explicitly provided one.
         self.actor_opt = self._build_optimizer_with_optional_model(
             module=self.head.actor,
             name=str(actor_optim_name),
             lr=float(actor_lr),
             weight_decay=float(actor_weight_decay),
-            extra_kwargs=actor_optim_kwargs,
+            extra_kwargs=actor_optim_kwargs_d,
         )
         self.critic_opt = self._build_optimizer_with_optional_model(
             module=self.head.critic,
             name=str(critic_optim_name),
             lr=float(critic_lr),
             weight_decay=float(critic_weight_decay),
-            extra_kwargs=critic_optim_kwargs,
+            extra_kwargs=critic_optim_kwargs_d,
         )
 
         # ---------------------------------------------------------------------
         # Schedulers
         # ---------------------------------------------------------------------
+        ms = tuple(int(m) for m in milestones)
         self.actor_sched = build_scheduler(
             self.actor_opt,
             name=str(actor_sched_name),
@@ -355,7 +496,7 @@ class ActorCriticCore(BaseCore, ABC):
             poly_power=float(poly_power),
             step_size=int(step_size),
             gamma=float(sched_gamma),
-            milestones=tuple(int(m) for m in milestones),
+            milestones=ms,
         )
         self.critic_sched = build_scheduler(
             self.critic_opt,
@@ -366,7 +507,7 @@ class ActorCriticCore(BaseCore, ABC):
             poly_power=float(poly_power),
             step_size=int(step_size),
             gamma=float(sched_gamma),
-            milestones=tuple(int(m) for m in milestones),
+            milestones=ms,
         )
 
     @staticmethod
@@ -377,22 +518,39 @@ class ActorCriticCore(BaseCore, ABC):
         lr: float,
         weight_decay: float,
         extra_kwargs: Dict[str, Any],
-    ) -> Any:
+    ) -> Optimizer:
         """
-        Build optimizer and auto-inject `model=module` for KFAC.
+        Build an optimizer and auto-inject `model=module` for KFAC.
 
-        Rationale
-        ---------
-        Your build_optimizer enforces:
-          build_optimizer(..., name='kfac', model=...) is required.
+        Parameters
+        ----------
+        module : nn.Module
+            Module whose parameters will be optimized.
+        name : str
+            Optimizer name passed to `build_optimizer`.
+        lr : float
+            Learning rate.
+        weight_decay : float
+            Weight decay coefficient.
+        extra_kwargs : Dict[str, Any]
+            Extra optimizer-specific kwargs. If `name` is KFAC and `model` is not
+            provided, this function inserts `model=module`.
 
-        This helper guarantees that requirement is satisfied without forcing
-        every caller to remember passing model explicitly.
+        Returns
+        -------
+        optimizer : torch.optim.Optimizer
+            Instantiated optimizer.
+
+        Notes
+        -----
+        Your `build_optimizer` enforces:
+            build_optimizer(..., name="kfac", model=...) is required
+
+        This helper ensures callers can simply request "kfac" without manually
+        providing `model` every time.
         """
-        n = str(name).lower()
-
-        # If user already provided model, respect it. Otherwise inject for KFAC.
-        if n == "kfac" and "model" not in extra_kwargs:
+        opt_name = str(name).lower().strip().replace("-", "").replace("_", "")
+        if opt_name == "kfac" and "model" not in extra_kwargs:
             extra_kwargs["model"] = module
 
         return build_optimizer(
@@ -404,14 +562,31 @@ class ActorCriticCore(BaseCore, ABC):
         )
 
     def _step_scheds(self) -> None:
-        """Step actor/critic schedulers if they exist."""
+        """
+        Step actor/critic schedulers if they exist.
+
+        Notes
+        -----
+        This assumes you are using step-based schedulers (called once per optimizer
+        step). If you want epoch-based semantics, call this at epoch boundaries.
+        """
         if self.actor_sched is not None:
             self.actor_sched.step()
         if self.critic_sched is not None:
             self.critic_sched.step()
 
     def state_dict(self) -> Dict[str, Any]:
-        """Serialize core + optimizer/scheduler states."""
+        """
+        Serialize core state plus actor/critic optimizer + scheduler states.
+
+        Returns
+        -------
+        state : Dict[str, Any]
+            Includes:
+            - base core state (update_calls)
+            - "actor": {"opt": ..., "sched": ...}
+            - "critic": {"opt": ..., "sched": ...}
+        """
         s = super().state_dict()
         s.update(
             {
@@ -422,7 +597,14 @@ class ActorCriticCore(BaseCore, ABC):
         return s
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore core + optimizer/scheduler states."""
+        """
+        Restore core state plus actor/critic optimizer + scheduler states.
+
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State dict produced by `state_dict()`.
+        """
         super().load_state_dict(state)
         if "actor" in state:
             self._load_opt_sched(self.actor_opt, self.actor_sched, state["actor"])
@@ -431,20 +613,29 @@ class ActorCriticCore(BaseCore, ABC):
 
     @abstractmethod
     def update_from_batch(self, batch: Any) -> Dict[str, float]:
+        """
+        Algorithm-specific actor-critic update.
+
+        Returns
+        -------
+        metrics : Dict[str, float]
+            Scalar diagnostics.
+        """
         raise NotImplementedError
 
 
 class QLearningCore(BaseCore, ABC):
     """
-    Base class for Q-learning discrete update engines (DQN family).
+    Base class for Q-learning update engines (DQN family).
 
-    Owns:
-      - Q optimizer/scheduler
-      - persistence
+    This core owns:
+    - Q-network optimizer + (optional) scheduler
+    - persistence for that pipeline
 
     Required head interface (duck-typed)
     ------------------------------------
-    - head.q: nn.Module
+    - head.q : nn.Module
+        Q-network (online network).
     """
 
     def __init__(
@@ -490,22 +681,52 @@ class QLearningCore(BaseCore, ABC):
         )
 
     def _step_sched(self) -> None:
-        """Step scheduler if it exists."""
+        """
+        Step scheduler if it exists.
+
+        Notes
+        -----
+        This assumes step-based semantics (called once per optimizer step).
+        """
         if self.sched is not None:
             self.sched.step()
 
     def state_dict(self) -> Dict[str, Any]:
-        """Serialize core + optimizer/scheduler states."""
+        """
+        Serialize core state plus optimizer/scheduler state.
+
+        Returns
+        -------
+        state : Dict[str, Any]
+            Includes:
+            - base core state (update_calls)
+            - "q": {"opt": ..., "sched": ...}
+        """
         s = super().state_dict()
         s.update({"q": self._save_opt_sched(self.opt, self.sched)})
         return s
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore core + optimizer/scheduler states."""
+        """
+        Restore core state plus optimizer/scheduler state.
+
+        Parameters
+        ----------
+        state : Mapping[str, Any]
+            State dict produced by `state_dict()`.
+        """
         super().load_state_dict(state)
         if "q" in state:
             self._load_opt_sched(self.opt, self.sched, state["q"])
 
     @abstractmethod
     def update_from_batch(self, batch: Any) -> Dict[str, float]:
+        """
+        Algorithm-specific Q-learning update.
+
+        Returns
+        -------
+        metrics : Dict[str, float]
+            Scalar diagnostics.
+        """
         raise NotImplementedError

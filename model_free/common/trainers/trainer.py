@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple
-
 import os
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+
 import numpy as np
 
 try:  # pragma: no cover
     from tqdm import tqdm  # type: ignore
 except Exception:  # pragma: no cover
     tqdm = None  # type: ignore
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     # Ray is an optional dependency; keep runtime imports Ray-free.
@@ -19,16 +17,16 @@ else:
     PolicyFactorySpec = Any
 
 from ..utils.train_utils import (
-    env_reset,
-    make_pbar,
-    maybe_call,
-    wrap_make_env_with_normalize,
+    _env_reset,
+    _make_pbar,
+    _maybe_call,
+    _wrap_make_env_with_normalize,
 )
 
 from ..wrappers.normalize_wrapper import NormalizeWrapper
 from ..callbacks.episode_stats_callback import EpisodeStatsCallback
 
-from .train_checkpoint import save_checkpoint, load_checkpoint
+from .train_checkpoint import load_checkpoint, save_checkpoint
 from .train_eval import run_evaluation
 from .train_loop import train_single_env
 from .train_ray import train_ray
@@ -36,48 +34,161 @@ from .train_ray import train_ray
 
 class Trainer:
     """
-    Unified trainer for on-policy and off-policy algorithms (single-env and Ray).
+    Unified trainer/orchestrator for single-env and Ray multi-worker training.
 
-    This class is intentionally a thin orchestrator that delegates heavy logic to:
-      - train_loop.py        (single-env loop)
-      - train_ray.py         (ray multi-worker loop)
-      - train_eval.py        (evaluation)
-      - train_checkpoint.py  (checkpoint save/load)
+    This class is intentionally a *thin orchestrator* that delegates heavy logic to:
 
-    Required algorithm interface (duck-typed)
-    ----------------------------------------
-    algo must provide:
-      - setup(env) -> None
-      - set_training(training: bool) -> None
-      - act(obs, deterministic: bool = False) -> Any
-      - on_env_step(transition: Dict[str, Any]) -> None
-      - ready_to_update() -> bool
-      - update() -> Mapping[str, Any]
+    - ``train_loop.py``        : single-environment rollout/update loop
+    - ``train_ray.py``         : Ray multi-worker rollout/update loop
+    - ``train_eval.py``        : evaluation entrypoint
+    - ``train_checkpoint.py``  : checkpoint save/load
 
-    Optional algorithm features
-    ---------------------------
-      - on_rollout(rollout) -> None
-      - is_off_policy: bool
-      - save(path: str) -> None
-      - load(path: str) -> None
-      - get_ray_policy_factory_spec() -> PolicyFactorySpec
-      - remaining_rollout_steps() -> int  (on-policy ray path)
+    The goal is to keep Trainer focused on:
+      - wiring components together (envs, algo, logger, callbacks, evaluator)
+      - lifecycle (train/eval/checkpoint entrypoints)
+      - shared bookkeeping (counters, run_dir/ckpt_dir)
+      - optional NormalizeWrapper injection
 
-    Callback contract (best-effort)
-    -------------------------------
-    callbacks may provide:
-      - on_train_start(trainer) -> bool
-      - on_step(trainer, transition=...) -> bool
-      - on_update(trainer, metrics=...) -> bool
-      - on_eval_end(trainer, metrics=...) -> bool
-      - on_checkpoint(trainer, path=...) -> bool
-      - on_train_end(trainer) -> bool
+    Parameters
+    ----------
+    train_env : Any
+        Training environment instance. Must support a Gym/Gymnasium-like API:
+
+        - ``reset(...)`` and ``step(action)``
+        - optionally ``set_training(bool)`` (e.g., wrappers that freeze stats)
+        - optionally ``observation_space.shape`` (for normalization auto-shape)
+
+    eval_env : Any
+        Evaluation environment instance (distinct from ``train_env`` recommended).
+
+    algo : Any
+        Algorithm / agent object (duck-typed). Required interface:
+
+        - ``setup(env) -> None``
+        - ``set_training(training: bool) -> None``
+        - ``act(obs, deterministic: bool = False) -> Any``
+        - ``on_env_step(transition: Dict[str, Any]) -> None``
+        - ``ready_to_update() -> bool``
+        - ``update() -> Mapping[str, Any]``
+
+        Optional features recognized by delegated loops/utilities:
+
+        - ``on_rollout(rollout) -> None``
+        - ``is_off_policy: bool``
+        - ``save(path: str) -> None`` / ``load(path: str) -> None``
+        - ``get_ray_policy_factory_spec() -> PolicyFactorySpec``
+        - ``remaining_rollout_steps() -> int`` (Ray on-policy path)
+
+    total_env_steps : int, default=1_000_000
+        Training budget expressed in environment transitions (trainer-side counter).
+
+    seed : int, default=0
+        Base seed for (best-effort) library/env seeding.
+
+    deterministic : bool, default=True
+        Determinism hint used by seeding helper and potentially by algorithms.
+
+    max_episode_steps : int, optional
+        Episode length cap. If normalization wrapper is used, the wrapper may own the
+        time-limit behavior; otherwise loops may apply a trainer-side fallback.
+
+    log_every_steps : int, default=5000
+        Cadence for system-level logging inside loops (delegated).
+
+    run_dir : str, default="./runs/exp"
+        Root directory for run artifacts. If logger exposes ``run_dir``, Trainer may
+        prefer that directory (see Notes).
+
+    checkpoint_dir : str, default="checkpoints"
+        Checkpoint subdirectory (created under ``run_dir``).
+
+    checkpoint_prefix : str, default="ckpt"
+        Prefix used by checkpoint naming utilities.
+
+    n_envs : int, default=1
+        Number of rollout workers. If ``n_envs <= 1`` Trainer uses single-env loop;
+        otherwise uses Ray loop.
+
+    rollout_steps_per_env : int, default=256
+        Ray: number of steps each worker collects per iteration.
+
+    sync_weights_every_updates : int, default=10
+        Ray: weight synchronization cadence (in update steps).
+
+    utd : float, default=1.0
+        Update-To-Data ratio hint. Off-policy loop may use this to scale updates.
+
+    logger : Any, optional
+        Logger object. If provided, Trainer will best-effort call ``logger.bind_trainer(self)``
+        and may prefer ``logger.run_dir`` as the effective run directory.
+
+    evaluator : Any, optional
+        Evaluator object. Expected interface:
+        ``evaluate(agent) -> Mapping[str, Any]`` (see ``train_eval.py``).
+
+    callbacks : Any, optional
+        Callback container (best-effort). Supported hooks:
+        ``on_train_start``, ``on_step``, ``on_update``, ``on_eval_end``,
+        ``on_checkpoint``, ``on_train_end``.
+
+    ray_env_make_fn : Callable[[], Any], optional
+        Ray: factory that constructs a fresh environment on workers.
+
+    ray_policy_spec : PolicyFactorySpec, optional
+        Ray: serializable policy construction spec (optional dependency).
+
+    ray_want_onpolicy_extras : bool, optional
+        Ray: whether workers should request extras (e.g., log_prob/value).
+
+    normalize : bool, default=False
+        If True, wrap both ``train_env`` and ``eval_env`` with ``NormalizeWrapper``.
+        Additionally, if Ray is used and ``ray_env_make_fn`` exists, wrap it with the same
+        normalization parameters (workers run with ``training=True``).
+
+    obs_shape : tuple[int, ...], optional
+        Observation shape required for normalization. If None, Trainer tries
+        ``train_env.observation_space.shape``.
+
+    norm_obs, norm_reward : bool
+        Whether to normalize observations and/or rewards.
+
+    clip_obs, clip_reward : float
+        Clipping magnitudes for normalized observations/rewards.
+
+    norm_gamma, norm_epsilon : float
+        Running-stat hyperparameters in normalization wrapper.
+
+    action_rescale : bool
+        Wrapper-dependent action rescaling toggle.
+
+    clip_action : float
+        Action clipping magnitude (if enabled in wrapper).
+
+    reset_return_on_done, reset_return_on_trunc : bool
+        Return accumulator reset behavior in wrapper.
+
+    obs_dtype : Any, default=np.float32
+        Observation dtype used by wrapper and step-unpacking policy.
+
+    flatten_obs : bool, default=False
+        Step unpacking option passed into delegated loops/utilities.
+
+    strict_checkpoint : bool, default=False
+        If True, checkpoint errors may be treated as fatal depending on IO helpers.
+
+    seed_envs : bool, default=True
+        If True, best-effort seed ``train_env`` and ``eval_env`` after wrapping.
 
     Notes
     -----
-    - If NormalizeWrapper is enabled, both train_env and eval_env are wrapped in-place.
-    - Episode indexing is owned by Trainer unless EpisodeStatsCallback is present.
-    - Ray dependencies are isolated to train_ray/train_ray_utils modules.
+    - **Run directory policy**: Trainer resolves ``self.run_dir`` using the provided ``run_dir``.
+      If a logger is attached and exposes ``logger.run_dir``, Trainer prefers it.
+    - **Episode indexing ownership**:
+      If callbacks include ``EpisodeStatsCallback``, that callback is assumed to own episode
+      counting/logging and Trainer will avoid incrementing episode counters redundantly.
+    - **Optional dependencies**:
+      - tqdm is optional; if missing, progress bars degrade gracefully.
+      - Ray is optional; Trainer avoids importing Ray at runtime.
     """
 
     def __init__(
@@ -109,7 +220,7 @@ class Trainer:
         ray_env_make_fn: Optional[Callable[[], Any]] = None,
         ray_policy_spec: Optional[PolicyFactorySpec] = None,
         ray_want_onpolicy_extras: Optional[bool] = None,
-        # normalization (wrap envs if True)
+        # normalization
         normalize: bool = False,
         obs_shape: Optional[Tuple[int, ...]] = None,
         norm_obs: bool = True,
@@ -128,7 +239,7 @@ class Trainer:
         strict_checkpoint: bool = False,
         seed_envs: bool = True,
     ) -> None:
-        # ---- references ----
+        # ---- external components ----
         self.algo = algo
         self.logger = logger
         self.evaluator = evaluator
@@ -142,13 +253,13 @@ class Trainer:
         self.seed = int(seed)
         self.deterministic = bool(deterministic)
         self.max_episode_steps = None if max_episode_steps is None else int(max_episode_steps)
-
         self.log_every_steps = int(log_every_steps)
 
-        # Step unpacking policy
+        # ---- step unpacking policy ----
         self.flatten_obs = bool(flatten_obs)
         self.step_obs_dtype = obs_dtype
 
+        # ---- checkpoint policy ----
         self.strict_checkpoint = bool(strict_checkpoint)
         self.seed_envs = bool(seed_envs)
 
@@ -171,7 +282,7 @@ class Trainer:
         self.ckpt_dir = os.path.join(self.run_dir, self.checkpoint_dir)
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
-        # ---- ray plumbing ----
+        # ---- Ray plumbing (pure data holders; actual Ray imports are elsewhere) ----
         self.ray_env_make_fn = ray_env_make_fn
         self.ray_policy_spec = ray_policy_spec
         self.ray_want_onpolicy_extras = ray_want_onpolicy_extras
@@ -183,11 +294,12 @@ class Trainer:
         self._ep_return: float = 0.0
         self._ep_len: int = 0
 
-        # ---- one-time warning guards ----
+        # ---- one-time warning guards / control flags ----
         self._warned_norm_sync: bool = False
         self._warned_tqdm_missing: bool = False
         self._warned_checkpoint: bool = False
         self._stop_training: bool = False
+
         # ---- best-effort library-level seeding ----
         self._seed_libraries_best_effort()
 
@@ -211,6 +323,7 @@ class Trainer:
                 obs_dtype=obs_dtype,
             )
 
+        # ---- bind env references ----
         self.train_env = train_env
         self.eval_env = eval_env
 
@@ -218,7 +331,7 @@ class Trainer:
         if self.seed_envs:
             self._seed_envs_best_effort()
 
-        # ---- algo setup sees wrapped train_env ----
+        # ---- algorithm setup sees the *wrapped* train_env ----
         self.algo.setup(self.train_env)
 
         # ---- allow logger to bind to trainer ----
@@ -226,6 +339,10 @@ class Trainer:
 
         # ---- detect EpisodeStatsCallback ownership ----
         self._episode_stats_enabled = self._detect_episode_stats_callback()
+
+        # ---- pbar handles (assigned during train()) ----
+        self._pbar = None
+        self._msg_pbar = None
 
     # ---------------------------------------------------------------------
     # Context manager
@@ -237,7 +354,18 @@ class Trainer:
         # No resource ownership here (Ray lifecycle handled elsewhere).
         return None
 
+    # ---------------------------------------------------------------------
+    # Control
+    # ---------------------------------------------------------------------
     def request_stop(self) -> None:
+        """
+        Request cooperative training termination.
+
+        Notes
+        -----
+        - Delegated loops periodically check ``trainer._stop_training``.
+        - Callbacks may also set this flag (e.g., early stopping).
+        """
         self._stop_training = True
 
     # ---------------------------------------------------------------------
@@ -246,10 +374,14 @@ class Trainer:
     def _warn(self, message: str) -> None:
         """
         Best-effort warning emitter (stderr).
+
+        Parameters
+        ----------
+        message : str
+            Warning message to print.
         """
         try:
             import sys
-
             print(f"[Trainer][WARN] {message}", file=sys.stderr)
         except Exception:
             pass
@@ -259,12 +391,12 @@ class Trainer:
     # =============================================================================
     def run_evaluation(self) -> Dict[str, Any]:
         """
-        Evaluate current policy using trainer.evaluator if provided.
+        Evaluate current policy using ``trainer.evaluator`` if provided.
 
         Returns
         -------
         metrics : Dict[str, Any]
-            Empty dict if no evaluator.
+            Evaluation metrics. Returns an empty dict when no evaluator is attached.
         """
         return run_evaluation(self)
 
@@ -273,29 +405,34 @@ class Trainer:
     # =============================================================================
     def train(self) -> None:
         """
-        Train until global_env_step reaches total_env_steps or a callback requests stop.
+        Train until one of the following termination conditions holds:
+
+        - ``global_env_step >= total_env_steps``
+        - a callback requests stop (returns False)
+        - ``trainer.request_stop()`` is called (sets ``_stop_training``)
         """
         if self.callbacks is not None:
-            cont = maybe_call(self.callbacks, "on_train_start", self)
+            cont = _maybe_call(self.callbacks, "on_train_start", self)
             if cont is False:
                 return
 
+        # Put algo/env in training mode (best-effort for env).
         self.algo.set_training(True)
-        maybe_call(self.train_env, "set_training", True)
+        _maybe_call(self.train_env, "set_training", True)
 
-        # 메시지 라인(상단): 진행바 없이 텍스트만
-        msg_pbar = make_pbar(
-            total=1,                 # <-- 0 말고 1
+        # A top "message-only" line (desc-only tqdm bar).
+        msg_pbar = _make_pbar(
+            total=1,
             initial=0,
             position=0,
             leave=True,
-            bar_format="{desc}",     # 텍스트만 표시 (정상)
+            bar_format="{desc}",
             dynamic_ncols=True,
         )
-        msg_pbar.set_description_str(" ", refresh=True)  # 첫 렌더 강제
+        msg_pbar.set_description_str(" ", refresh=True)
 
-        # 진행바(하단)
-        pbar = make_pbar(
+        # The main progress bar.
+        pbar = _make_pbar(
             total=self.total_env_steps,
             initial=self.global_env_step,
             desc="Training",
@@ -318,6 +455,7 @@ class Trainer:
             else:
                 train_ray(self, self._pbar, self._msg_pbar)
         finally:
+            # Always attempt to close progress bars.
             try:
                 pbar.close()
             except Exception:
@@ -330,9 +468,13 @@ class Trainer:
 
             self._pbar = None
             self._msg_pbar = None
+
+            # Return algo/env to eval-ish mode.
             self.algo.set_training(False)
-            maybe_call(self.train_env, "set_training", False)
-            maybe_call(self.callbacks, "on_train_end", self)
+            _maybe_call(self.train_env, "set_training", False)
+
+            # Notify callbacks.
+            _maybe_call(self.callbacks, "on_train_end", self)
 
     # =============================================================================
     # Checkpointing (delegated)
@@ -341,15 +483,20 @@ class Trainer:
         """
         Save a trainer checkpoint and notify callbacks.
 
+        Parameters
+        ----------
+        path : str, optional
+            Target checkpoint file path. See ``train_checkpoint.save_checkpoint`` for rules.
+
         Returns
         -------
         ckpt_path : Optional[str]
-            Path to checkpoint file, or None on failure.
+            Absolute/normalized checkpoint path on success; None on failure.
         """
         ckpt_path = save_checkpoint(self, path=path)
         if ckpt_path is not None and self.callbacks is not None:
             try:
-                maybe_call(self.callbacks, "on_checkpoint", self, path=ckpt_path)
+                _maybe_call(self.callbacks, "on_checkpoint", self, path=ckpt_path)
             except Exception:
                 pass
         return ckpt_path
@@ -357,6 +504,11 @@ class Trainer:
     def load_checkpoint(self, path: str) -> None:
         """
         Load a trainer checkpoint from path.
+
+        Parameters
+        ----------
+        path : str
+            Path to a torch checkpoint file created by ``save_checkpoint``.
         """
         load_checkpoint(self, path=path)
 
@@ -365,9 +517,20 @@ class Trainer:
     # =============================================================================
     def _resolve_run_dir(self, default_run_dir: str) -> str:
         """
-        Resolve trainer run_dir, preferring logger.run_dir if present.
+        Resolve effective trainer run directory.
+
+        Parameters
+        ----------
+        default_run_dir : str
+            The run directory requested by the caller.
+
+        Returns
+        -------
+        run_dir : str
+            Effective run directory. If logger exposes a non-empty ``logger.run_dir``,
+            it takes precedence.
         """
-        run_dir = default_run_dir
+        run_dir = str(default_run_dir)
         if self.logger is not None:
             lr = getattr(self.logger, "run_dir", None)
             if isinstance(lr, str) and lr:
@@ -380,9 +543,9 @@ class Trainer:
 
         Notes
         -----
-        - Avoid hard dependency on a specific module path; uses try/except.
-        - You already import `set_random_seed` elsewhere; if you want single-source-of-truth,
-          consider using that here too.
+        - This function is intentionally permissive: failures do not abort training.
+        - If your project already has a canonical seeding utility (e.g., `_set_random_seed`
+          in train_utils), it is cleaner to call that here and remove the fallback import.
         """
         try:
             # Prefer a project-level seed helper if available.
@@ -393,25 +556,29 @@ class Trainer:
         except Exception:
             pass
 
-        # Fallback: do nothing (trainer remains robust even without global seeding).
         return
 
     def _seed_envs_best_effort(self) -> None:
         """
-        Best-effort environment seeding via env_reset(..., seed=...).
+        Best-effort environment seeding using ``_env_reset(..., seed=...)``.
+
+        Notes
+        -----
+        - Runs after normalization wrapping so wrappers see seeded resets.
+        - Uses two different seeds for train/eval by convention.
         """
         try:
-            _ = env_reset(self.train_env, seed=int(self.seed))
+            _ = _env_reset(self.train_env, seed=int(self.seed))
         except Exception:
             pass
         try:
-            _ = env_reset(self.eval_env, seed=int(self.seed) + 1)
+            _ = _env_reset(self.eval_env, seed=int(self.seed) + 1)
         except Exception:
             pass
 
     def _bind_logger_best_effort(self) -> None:
         """
-        Bind logger to trainer if logger exposes bind_trainer(trainer).
+        Bind logger to trainer if logger exposes ``bind_trainer(trainer)``.
         """
         if self.logger is None:
             return
@@ -424,12 +591,13 @@ class Trainer:
 
     def _detect_episode_stats_callback(self) -> bool:
         """
-        Detect whether EpisodeStatsCallback is installed (and thus owns episode counting).
+        Detect whether ``EpisodeStatsCallback`` is installed.
 
         Returns
         -------
         enabled : bool
-            True if callbacks contains an EpisodeStatsCallback instance.
+            True if ``callbacks.callbacks`` contains an EpisodeStatsCallback instance.
+            When True, episode indexing/logging is assumed to be owned elsewhere.
         """
         try:
             cbs = getattr(self.callbacks, "callbacks", None)
@@ -458,15 +626,41 @@ class Trainer:
         obs_dtype: Any,
     ) -> Tuple[Any, Any]:
         """
-        Wrap train and eval environments with NormalizeWrapper.
+        Wrap train and eval environments with ``NormalizeWrapper``.
 
-        Also wraps ray_env_make_fn when:
-          - n_envs > 1
-          - ray_env_make_fn is provided
+        Parameters
+        ----------
+        train_env, eval_env : Any
+            Raw environments to wrap.
+        obs_shape : tuple[int, ...], optional
+            Required observation shape for normalization. If None, attempts to infer from
+            ``train_env.observation_space.shape``.
+        norm_obs, norm_reward : bool
+            Whether to normalize observations and/or rewards.
+        clip_obs, clip_reward : float
+            Clipping magnitudes for normalized observations/rewards.
+        norm_gamma, norm_epsilon : float
+            Running-stat hyperparameters.
+        action_rescale : bool
+            Wrapper-dependent action rescale toggle.
+        clip_action : float
+            Action clipping magnitude (if enabled).
+        reset_return_on_done, reset_return_on_trunc : bool
+            Return accumulator reset behavior.
+        obs_dtype : Any
+            Observation dtype used by wrapper.
 
         Returns
         -------
-        (train_env_wrapped, eval_env_wrapped) : Tuple[Any, Any]
+        train_env_wrapped, eval_env_wrapped : Tuple[Any, Any]
+            Wrapped environments.
+
+        Notes
+        -----
+        - Training env wrapper uses ``training=True``.
+        - Eval env wrapper uses ``training=False`` (frozen stats).
+        - If Ray is used (``n_envs > 1``) and ``ray_env_make_fn`` exists, this method also
+          wraps that maker so workers match the same normalization semantics (training=True).
         """
         if obs_shape is None:
             try:
@@ -512,9 +706,9 @@ class Trainer:
             obs_dtype=obs_dtype,
         )
 
-        # Ensure ray workers also wrap envs the same way (training=True on workers).
+        # Ensure Ray workers also wrap envs the same way (training=True on workers).
         if self.n_envs > 1 and self.ray_env_make_fn is not None:
-            self.ray_env_make_fn = wrap_make_env_with_normalize(
+            self.ray_env_make_fn = _wrap_make_env_with_normalize(
                 self.ray_env_make_fn,
                 obs_shape=obs_shape,
                 norm_obs=bool(norm_obs),

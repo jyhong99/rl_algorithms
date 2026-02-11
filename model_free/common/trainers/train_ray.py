@@ -1,44 +1,78 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import math
 import numpy as np
 
-from ..utils.train_utils import maybe_call, infer_env_id, wrap_make_env_with_normalize
+from ..utils.train_utils import _maybe_call, _infer_env_id, _wrap_make_env_with_normalize
 
 
 def train_ray(trainer: Any, pbar: Any, msg_pbar: Any) -> None:
     """
-    Ray multi-worker rollout loop.
+    Ray multi-worker rollout loop (learner-side).
 
-    This loop collects rollouts from Ray workers and feeds them into `trainer.algo`,
-    then performs updates and periodically synchronizes policy weights (and optional
-    environment normalization state) back to workers.
+    This loop collects rollout chunks from Ray workers, ingests them into the learner
+    algorithm (`trainer.algo`), runs learner updates, and periodically synchronizes
+    policy weights (and optionally NormalizeWrapper running statistics) back to workers.
+
+    High-level flow
+    ---------------
+    Setup:
+      1) Ensure `trainer.ray_env_make_fn` exists (auto-infer from train_env if possible).
+      2) Ensure `trainer.ray_policy_spec` exists (from algo factory spec if possible).
+      3) Construct a Ray runner (RayLearner) and broadcast initial weights/env state.
+
+    Main loop:
+      A) (Off-policy only) Optionally pause rollout after warmup to run updates-only.
+      B) Collect rollout from workers.
+      C) Ingest rollout into algo.
+      D) Fire per-transition callbacks (on_step).
+      E) Run updates (on-policy or off-policy mode).
+      F) Periodically broadcast weights and env normalization stats to workers.
+      G) Periodically log system counters and update progress bar postfix.
 
     Parameters
     ----------
     trainer : Any
-        Trainer-like object providing (duck-typed):
-          - train_env, eval_env, algo, callbacks, logger
+        Trainer-like object (duck-typed) providing:
+          - algo : learner algorithm
+              - is_off_policy : bool (optional)
+              - ready_to_update() -> bool
+              - update() -> Mapping[str, Any] or {}
+              - on_env_step(tr) or on_rollout(rollout) (optional)
+              - (on-policy only) remaining_rollout_steps() -> int
+              - (off-policy only) warmup_steps / update_after and internal _env_steps (optional)
+          - train_env : environment (used for normalization state export)
           - n_envs : int
           - rollout_steps_per_env : int
           - seed : int
-          - utd : float
-          - total_env_steps : int
+          - utd : float (used to scale update budget)
+          - total_env_steps : int (stop condition; counts learner-ingested transitions)
+          - global_env_step : int (incremented by ingested transitions)
+          - global_update_step : int (incremented by inferred update count)
+          - episode_idx : int (sys logging only; in Ray mode this is often approximate)
+          - log_every_steps : int (sys logging cadence; <=0 disables)
+          - _normalize_enabled : bool
+          - ray_env_make_fn : Optional[Callable[[], Any]]
+          - ray_policy_spec : Optional[Any] (PolicyFactorySpec)
+          - ray_want_onpolicy_extras : Optional[bool]
+          - sync_weights_every_updates : int (<=0 disables)
+          - pause_rollout_after_warmup : bool (off-policy only, optional; default True)
           - max_episode_steps : Optional[int]
           - flatten_obs : bool
           - step_obs_dtype : dtype
-          - global_env_step, global_update_step, episode_idx : int
-          - _normalize_enabled : bool
-          - ray_env_make_fn : Optional[Callable[[], env]]
-          - ray_policy_spec : Optional[Any]
-          - ray_want_onpolicy_extras : Optional[bool]
-          - sync_weights_every_updates : int
-          - _warn(msg) optional
+          - callbacks : optional (on_step/on_update)
+          - logger : optional (log(metrics, step, prefix, pbar=...))
+          - _stop_training : bool flag (optional; if True breaks)
+          - _warn(msg) : optional warning hook
 
     pbar : Any
-        Progress bar-like object providing update(int) and set_postfix(dict, ...).
+        Progress bar-like object supporting:
+          - update(int)
+          - set_postfix(dict, refresh=...)
+    msg_pbar : Any
+        A progress-bar-like object to pass into logger calls.
 
     Returns
     -------
@@ -46,16 +80,22 @@ def train_ray(trainer: Any, pbar: Any, msg_pbar: Any) -> None:
 
     Notes
     -----
-    - On-policy: expects `algo.remaining_rollout_steps()` to exist, and performs exactly one
-      update when ready (mode="onpolicy").
-    - Off-policy: performs up to `max_update_calls_per_iter` update calls per iteration
-      (mode="offpolicy") while `algo.ready_to_update()` stays True.
-    - Ray is initialized best-effort if not already initialized.
+    On-policy vs off-policy update behavior
+    --------------------------------------
+    - On-policy: expects `algo.remaining_rollout_steps()`; collection is trimmed to exactly
+      the remaining batch size. When ready, performs exactly one update per iteration.
+    - Off-policy: performs up to `max_update_calls_per_iter` update() calls per iteration
+      while `algo.ready_to_update()` is True.
+
+    Ray initialization
+    ------------------
+    Ray is initialized best-effort if not already initialized (inside `_build_ray_runner`).
     """
     _ensure_ray_env_make_fn(trainer)
     _ensure_ray_policy_spec(trainer)
 
-    is_off_policy = bool(getattr(trainer.algo, "is_off_policy", False))
+    algo = getattr(trainer, "algo", None)
+    is_off_policy = bool(getattr(algo, "is_off_policy", False))
     want_onpolicy_extras = _infer_want_onpolicy_extras(trainer, is_off_policy=is_off_policy)
 
     runner, get_policy_state_dict_cpu_fn = _build_ray_runner(
@@ -68,85 +108,121 @@ def train_ray(trainer: Any, pbar: Any, msg_pbar: Any) -> None:
     last_sys_log_step = int(getattr(trainer, "global_env_step", 0))
     max_update_calls_per_iter = _infer_max_update_calls_per_iter(trainer)
 
-    while int(getattr(trainer, "global_env_step", 0)) < int(getattr(trainer, "total_env_steps", 0)):
+    total_env_steps = int(getattr(trainer, "total_env_steps", 0))
+    while int(getattr(trainer, "global_env_step", 0)) < total_env_steps:
+        # ------------------------------------------------------------------
+        # (A) Off-policy: optional "updates-only" phase after warmup
+        # ------------------------------------------------------------------
         if is_off_policy:
-            algo = getattr(trainer, "algo", None)
             warmup = int(getattr(algo, "warmup_steps", 0))
             update_after = int(getattr(algo, "update_after", 0))
             gate = max(warmup, update_after)
 
-            # learner 관점에서 env_steps 기준이 가장 정확합니다.
-            env_steps = int(getattr(algo, "_env_steps", 0))  # OffPolicyAlgorithm이 on_env_step에서 증가시킴
+            # In your OffPolicyAlgorithm, `_env_steps` is incremented in on_env_step.
+            env_steps = int(getattr(algo, "_env_steps", 0))
             pause_after = bool(getattr(trainer, "pause_rollout_after_warmup", True))
 
-            # gate를 넘었고, 업데이트가 가능한 동안은 collect를 쉬고 update만 수행
             if pause_after and env_steps >= gate and algo.ready_to_update():
-                if not run_updates(trainer, mode="offpolicy", max_calls=int(max_update_calls_per_iter), pbar=msg_pbar):
+                if not run_updates(trainer, mode="offpolicy", max_calls=max_update_calls_per_iter, pbar=msg_pbar):
                     return
 
                 maybe_sync_worker_weights_and_env(trainer, runner, get_policy_state_dict_cpu_fn)
                 last_sys_log_step = _maybe_log_sys_ray(trainer, last_sys_log_step, pbar=pbar)
-
+                if getattr(trainer, "_stop_training", False):
+                    break
                 continue
 
-        # -------------------------
-        # 기존: collect -> ingest ...
-        # -------------------------
+        # ------------------------------------------------------------------
+        # (B) Collect rollout from workers
+        # ------------------------------------------------------------------
         per_worker, target_new = _decide_collection_size(trainer, is_off_policy=is_off_policy)
+
         rollout = runner.collect(deterministic=False, n_steps=int(per_worker))
-        n_new_total = int(len(rollout))
-        if n_new_total <= 0:
+        n_total = int(len(rollout))
+        if n_total <= 0:
             continue
 
         rollout, n_new = _trim_onpolicy_rollout(rollout, target_new=target_new)
-
-        # Bookkeeping
-        trainer.global_env_step = int(getattr(trainer, "global_env_step", 0)) + int(n_new)
-        try:
-            pbar.update(int(n_new))
-        except Exception:
+        if n_new <= 0:
+            # on-policy case where remaining==0 may yield empty trimmed rollout
+            # (outer loop will run updates and continue).
             pass
 
-        # Ingest
+        # ------------------------------------------------------------------
+        # (C) Bookkeeping and progress bar
+        # ------------------------------------------------------------------
+        trainer.global_env_step = int(getattr(trainer, "global_env_step", 0)) + int(n_new)
+        _pbar_update_best_effort(pbar, int(n_new))
+
+        # ------------------------------------------------------------------
+        # (D) Ingest rollout into algo
+        # ------------------------------------------------------------------
         _ingest_rollout(trainer, rollout)
 
-        # Callbacks per transition (same behavior as original)
+        # Per-transition callbacks (preserve existing behavior)
         if getattr(trainer, "callbacks", None) is not None:
             for tr in rollout:
-                cont = maybe_call(trainer.callbacks, "on_step", trainer, transition=tr)
+                cont = _maybe_call(trainer.callbacks, "on_step", trainer, transition=tr)
                 if cont is False:
                     return
 
-        # Updates
+        # ------------------------------------------------------------------
+        # (E) Learner updates
+        # ------------------------------------------------------------------
         if is_off_policy:
-            if not run_updates(trainer, mode="offpolicy", max_calls=int(max_update_calls_per_iter), pbar=msg_pbar):
-                return
+            ok = run_updates(trainer, mode="offpolicy", max_calls=max_update_calls_per_iter, pbar=msg_pbar)
         else:
-            # On-policy: if rollout collection finished the batch, algo may become ready.
-            if not run_updates(trainer, mode="onpolicy", max_calls=1, pbar=msg_pbar):
-                return
+            ok = run_updates(trainer, mode="onpolicy", max_calls=1, pbar=msg_pbar)
+        if not ok:
+            return
 
-        # Sync weights / env stats
+        # ------------------------------------------------------------------
+        # (F) Sync weights (and optional env stats)
+        # ------------------------------------------------------------------
         maybe_sync_worker_weights_and_env(trainer, runner, get_policy_state_dict_cpu_fn)
 
-        # Sys log
+        # ------------------------------------------------------------------
+        # (G) Sys log + UI
+        # ------------------------------------------------------------------
         last_sys_log_step = _maybe_log_sys_ray(trainer, last_sys_log_step, pbar=pbar)
+        _maybe_set_updates_postfix(trainer, pbar)
 
-        try:
-            pbar.set_postfix({"updates": int(getattr(trainer, "global_update_step", 0))}, refresh=False)
-        except Exception:
-            pass
-        
         if getattr(trainer, "_stop_training", False):
             break
 
+
+# =============================================================================
+# Updates
+# =============================================================================
 def _infer_num_updates_from_metrics(metrics: Any) -> int:
     """
-    Infer 'how many learner updates were performed' from metrics.
+    Infer how many learner updates were performed from an update metrics mapping.
 
-    Convention:
-      - Prefer sys/num_updates or num_updates or n_updates, if present.
-      - Else default to 1 (one update() call == one learner update).
+    Parameters
+    ----------
+    metrics : Any
+        Typically the return value of `algo.update()`. If mapping-like, we attempt
+        to read a conventional key that indicates how many updates were executed
+        by that call.
+
+    Returns
+    -------
+    n_updates : int
+        Positive integer update increment (>= 1).
+
+    Convention
+    ----------
+    Preference order (first present and parseable wins):
+      - "sys/num_updates"
+      - "num_updates"
+      - "n_updates"
+      - "update_steps"
+      - "train/num_updates"
+
+    Notes
+    -----
+    If no suitable key is found or parsing fails, defaults to 1 meaning:
+      one `update()` call counts as one learner update step.
     """
     if not isinstance(metrics, Mapping):
         return 1
@@ -164,6 +240,38 @@ def _infer_num_updates_from_metrics(metrics: Any) -> int:
 
 
 def run_updates(trainer: Any, *, mode: str, max_calls: int, pbar: Any) -> bool:
+    """
+    Run learner updates in either on-policy or off-policy mode.
+
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object providing:
+          - algo.ready_to_update() -> bool
+          - algo.update() -> metrics mapping (or {})
+          - global_update_step : int (incremented here)
+          - callbacks.on_update(...) (optional)
+          - logger.log(...) (optional)
+    mode : {"onpolicy", "offpolicy"}
+        Update regime:
+          - "onpolicy": at most one update() call when ready_to_update() is True.
+          - "offpolicy": repeated update() calls while ready_to_update() and budget allows.
+    max_calls : int
+        Maximum number of `algo.update()` calls to issue (off-policy only).
+    pbar : Any
+        Progress bar-like object passed into logger (optional).
+
+    Returns
+    -------
+    ok : bool
+        False if callbacks request stop (on_update returns False), else True.
+
+    Notes
+    -----
+    - Each update() call increments trainer.global_update_step by k where k is
+      inferred from metrics via `_infer_num_updates_from_metrics`.
+    - Off-policy path increments `n_calls` per update() call to avoid infinite loops.
+    """
     if mode not in ("onpolicy", "offpolicy"):
         raise ValueError(f"Unknown update mode: {mode}")
 
@@ -175,11 +283,11 @@ def run_updates(trainer: Any, *, mode: str, max_calls: int, pbar: Any) -> bool:
 
         metrics = algo.update()
         k = _infer_num_updates_from_metrics(metrics)
-        trainer.global_update_step += k
+        trainer.global_update_step = int(getattr(trainer, "global_update_step", 0)) + k
 
         return _handle_update_side_effects(trainer, metrics, pbar=pbar)
 
-    # offpolicy
+    # off-policy
     n_calls = 0
     while n_calls < int(max_calls):
         if not algo.ready_to_update():
@@ -187,9 +295,9 @@ def run_updates(trainer: Any, *, mode: str, max_calls: int, pbar: Any) -> bool:
 
         metrics = algo.update()
         k = _infer_num_updates_from_metrics(metrics)
-        trainer.global_update_step += k
+        trainer.global_update_step = int(getattr(trainer, "global_update_step", 0)) + k
 
-        n_calls += 1  # ✅ 이거 없으면 루프 제어가 깨짐
+        n_calls += 1  # important: ensures loop control progresses
 
         if not _handle_update_side_effects(trainer, metrics, pbar=pbar):
             return False
@@ -197,7 +305,9 @@ def run_updates(trainer: Any, *, mode: str, max_calls: int, pbar: Any) -> bool:
     return True
 
 
-
+# =============================================================================
+# Worker synchronization
+# =============================================================================
 def maybe_sync_worker_weights_and_env(
     trainer: Any,
     runner: Any,
@@ -209,21 +319,33 @@ def maybe_sync_worker_weights_and_env(
     Parameters
     ----------
     trainer : Any
-        Trainer-like object with:
+        Trainer-like object that may provide:
           - sync_weights_every_updates : int
           - global_update_step : int
           - algo : policy holder
-          - train_env : optional, may implement state_dict
+          - train_env : optional, may implement state_dict()
           - _normalize_enabled : bool
     runner : Any
-        Ray runner providing broadcast_policy(...) and broadcast_env_state(...).
-    get_policy_state_dict_cpu_fn : Callable
-        Function that returns a CPU state_dict for broadcasting.
+        Ray runner providing:
+          - broadcast_policy(state_dict)
+          - broadcast_env_state(env_state)
+    get_policy_state_dict_cpu_fn : Callable[[Any], Dict[str, Any]]
+        Function that returns a CPU (device-agnostic) state_dict suitable for broadcast.
 
     Returns
     -------
     did_sync : bool
-        True if sync was performed, else False.
+        True if synchronization was performed; False otherwise.
+
+    Notes
+    -----
+    Sync condition:
+      - `sync_weights_every_updates` must be > 0, and
+      - `global_update_step % sync_weights_every_updates == 0`
+
+    Normalization state sync:
+      - If `_normalize_enabled` is True and `train_env.state_dict()` exists,
+        broadcast that env state as well (best-effort).
     """
     every = int(getattr(trainer, "sync_weights_every_updates", 0))
     if every <= 0:
@@ -234,9 +356,10 @@ def maybe_sync_worker_weights_and_env(
 
     runner.broadcast_policy(get_policy_state_dict_cpu_fn(getattr(trainer, "algo", None)))
 
-    if bool(getattr(trainer, "_normalize_enabled", False)) and callable(getattr(trainer.train_env, "state_dict", None)):
+    train_env = getattr(trainer, "train_env", None)
+    if bool(getattr(trainer, "_normalize_enabled", False)) and callable(getattr(train_env, "state_dict", None)):
         try:
-            runner.broadcast_env_state(trainer.train_env.state_dict())
+            runner.broadcast_env_state(train_env.state_dict())
         except Exception:
             pass
 
@@ -246,19 +369,46 @@ def maybe_sync_worker_weights_and_env(
 # =============================================================================
 # Internal helpers
 # =============================================================================
+def _pbar_update_best_effort(pbar: Any, n: int) -> None:
+    """Best-effort progress bar update."""
+    try:
+        pbar.update(int(n))
+    except Exception:
+        pass
+
+
+def _maybe_set_updates_postfix(trainer: Any, pbar: Any) -> None:
+    """Best-effort progress bar postfix update for global update counter."""
+    try:
+        pbar.set_postfix({"updates": int(getattr(trainer, "global_update_step", 0))}, refresh=False)
+    except Exception:
+        pass
+
+
 def _ensure_ray_env_make_fn(trainer: Any) -> None:
     """
-    Ensure trainer.ray_env_make_fn is populated.
+    Ensure `trainer.ray_env_make_fn` is populated.
 
-    If missing, attempts to infer env_id from train_env and creates a default gym.make maker.
-    If normalization is enabled, wraps maker with NormalizeWrapper parameters recovered from train_env.
+    If missing, attempts to infer an env_id from `trainer.train_env` and creates
+    a default `gym.make(env_id)` factory. If normalization is enabled, wraps the
+    factory with NormalizeWrapper parameters recovered from `trainer.train_env`.
+
+    Raises
+    ------
+    ValueError
+        If env_id cannot be inferred and no ray_env_make_fn is provided.
+    RuntimeError
+        If normalization is enabled but required normalization parameters cannot
+        be recovered from train_env (e.g., obs_shape).
     """
     if getattr(trainer, "ray_env_make_fn", None) is not None:
         return
 
-    env_id = infer_env_id(getattr(trainer, "train_env", None))
+    env_id = _infer_env_id(getattr(trainer, "train_env", None))
     if env_id is None:
-        raise ValueError("n_envs > 1 requires ray_env_make_fn OR a resolvable train_env.spec.id to auto-make envs.")
+        raise ValueError(
+            "n_envs > 1 requires ray_env_make_fn OR a resolvable train_env.spec.id to auto-make envs."
+        )
 
     def _default_make_env() -> Any:
         try:
@@ -269,14 +419,13 @@ def _ensure_ray_env_make_fn(trainer: Any) -> None:
 
     make_fn: Callable[[], Any] = _default_make_env
 
-    # If normalization enabled, auto wrap the default maker too.
     if bool(getattr(trainer, "_normalize_enabled", False)):
-        obs_shape = getattr(getattr(trainer, "train_env", None), "obs_shape", None)
+        te = getattr(trainer, "train_env", None)
+        obs_shape = getattr(te, "obs_shape", None)
         if obs_shape is None:
             raise RuntimeError("normalize=True but could not recover obs_shape from train_env.")
 
-        te = getattr(trainer, "train_env", None)
-        make_fn = wrap_make_env_with_normalize(
+        make_fn = _wrap_make_env_with_normalize(
             make_fn,
             obs_shape=tuple(obs_shape),
             norm_obs=bool(getattr(te, "norm_obs", True)),
@@ -299,9 +448,14 @@ def _ensure_ray_env_make_fn(trainer: Any) -> None:
 
 def _ensure_ray_policy_spec(trainer: Any) -> None:
     """
-    Ensure trainer.ray_policy_spec is populated.
+    Ensure `trainer.ray_policy_spec` is populated.
 
-    If missing, uses algo.get_ray_policy_factory_spec().
+    If missing, uses `trainer.algo.get_ray_policy_factory_spec()`.
+
+    Raises
+    ------
+    ValueError
+        If neither trainer.ray_policy_spec nor algo.get_ray_policy_factory_spec is available.
     """
     if getattr(trainer, "ray_policy_spec", None) is not None:
         return
@@ -316,28 +470,57 @@ def _infer_want_onpolicy_extras(trainer: Any, *, is_off_policy: bool) -> bool:
     """
     Infer whether Ray workers should return on-policy extras (logp, value, etc.).
 
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object possibly providing `ray_want_onpolicy_extras`.
+    is_off_policy : bool
+        Whether the learner algorithm is off-policy.
+
+    Returns
+    -------
+    want : bool
+        Whether workers should request/return on-policy extras.
+
     Precedence
     ----------
-    - trainer.ray_want_onpolicy_extras if not None
-    - else: True for on-policy algorithms, False for off-policy algorithms
+    1) If trainer.ray_want_onpolicy_extras is not None: use it.
+    2) Else: True for on-policy algorithms, False for off-policy algorithms.
     """
     if getattr(trainer, "ray_want_onpolicy_extras", None) is not None:
         return bool(trainer.ray_want_onpolicy_extras)
     return (not bool(is_off_policy))
 
 
-def _build_ray_runner(trainer: Any, *, want_onpolicy_extras: bool) -> tuple[Any, Callable[[Any], Dict[str, Any]]]:
+def _build_ray_runner(trainer: Any, *, want_onpolicy_extras: bool) -> Tuple[Any, Callable[[Any], Dict[str, Any]]]:
     """
-    Construct RayLearner runner and return it along with get_policy_state_dict_cpu function.
+    Construct the Ray runner (RayLearner) and return it along with a policy state extractor.
+
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object with ray config fields.
+    want_onpolicy_extras : bool
+        Whether workers should request on-policy extras.
+
+    Returns
+    -------
+    runner : Any
+        Instance of RayLearner.
+    get_policy_state_dict_cpu_fn : Callable[[Any], Dict[str, Any]]
+        Function that converts a policy/algo into a CPU state_dict for broadcasting.
+
+    Notes
+    -----
+    Imports Ray lazily to keep this module importable without Ray.
     """
     import ray
 
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True, include_dashboard=False, log_to_driver=False)
 
-    # NOTE: Keep these imports local to avoid importing ray-related modules when unused.
     from model_free.common.trainers.ray_workers import RayLearner
-    from ..utils.ray_utils import get_policy_state_dict_cpu
+    from ..utils.ray_utils import _get_policy_state_dict_cpu
 
     runner = RayLearner(
         env_make_fn=getattr(trainer, "ray_env_make_fn", None),
@@ -350,45 +533,89 @@ def _build_ray_runner(trainer: Any, *, want_onpolicy_extras: bool) -> tuple[Any,
         flatten_obs=bool(getattr(trainer, "flatten_obs", False)),
         obs_dtype=getattr(trainer, "step_obs_dtype", np.float32),
     )
-    return runner, get_policy_state_dict_cpu
+    return runner, _get_policy_state_dict_cpu
 
 
-def _initial_broadcast(trainer: Any, runner: Any, get_policy_state_dict_cpu_fn: Callable[[Any], Dict[str, Any]]) -> None:
+def _initial_broadcast(
+    trainer: Any,
+    runner: Any,
+    get_policy_state_dict_cpu_fn: Callable[[Any], Dict[str, Any]],
+) -> None:
     """
     Initial broadcast of policy weights and (optional) env normalization state to workers.
+
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object with `algo`, `train_env`, and normalization flags.
+    runner : Any
+        Ray runner exposing broadcast_policy / broadcast_env_state.
+    get_policy_state_dict_cpu_fn : Callable
+        Policy state_dict CPU extractor.
     """
     runner.broadcast_policy(get_policy_state_dict_cpu_fn(getattr(trainer, "algo", None)))
 
-    if bool(getattr(trainer, "_normalize_enabled", False)) and callable(getattr(trainer.train_env, "state_dict", None)):
+    train_env = getattr(trainer, "train_env", None)
+    if bool(getattr(trainer, "_normalize_enabled", False)) and callable(getattr(train_env, "state_dict", None)):
         try:
-            runner.broadcast_env_state(trainer.train_env.state_dict())
+            runner.broadcast_env_state(train_env.state_dict())
         except Exception:
             pass
 
 
 def _infer_max_update_calls_per_iter(trainer: Any) -> int:
     """
-    Infer update call budget per iteration for off-policy mode.
+    Infer off-policy update-call budget per iteration.
 
-    Uses a base budget and scales by UTD when utd > 0.
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object with `utd` configuration.
+
+    Returns
+    -------
+    max_calls : int
+        Maximum number of update() calls allowed per iteration (>= 1).
+
+    Notes
+    -----
+    Current policy:
+      - base budget = 10_000 calls
+      - scaled by utd when utd > 0
+    This is intentionally generous; the `ready_to_update()` gate usually limits it.
     """
-    max_calls = 10_000
+    base = 10_000
     utd = float(getattr(trainer, "utd", 1.0))
-    if utd > 0.0:
-        max_calls = int(max_calls * utd)
+    max_calls = int(base * utd) if utd > 0.0 else base
     return max(1, int(max_calls))
 
 
-def _decide_collection_size(trainer: Any, *, is_off_policy: bool) -> tuple[int, Optional[int]]:
+def _decide_collection_size(trainer: Any, *, is_off_policy: bool) -> Tuple[int, Optional[int]]:
     """
-    Decide per-worker collection steps and optional on-policy target trim.
+    Decide how many steps each worker should collect this iteration.
+
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object containing:
+          - n_envs
+          - rollout_steps_per_env
+          - algo.remaining_rollout_steps() (on-policy only)
+    is_off_policy : bool
+        Whether learner algorithm is off-policy.
 
     Returns
     -------
     per_worker : int
-        Steps each worker should collect this iteration.
-    target_new : Optional[int]
-        Total desired number of transitions (on-policy only). If set, rollout may be trimmed.
+        Number of steps per worker to collect this iteration.
+    target_new : int or None
+        For on-policy, total desired number of new transitions to ingest. The
+        collected rollout may be trimmed to exactly this size. For off-policy, None.
+
+    Raises
+    ------
+    ValueError
+        If on-policy mode is requested but algo.remaining_rollout_steps() is missing.
     """
     n_envs = int(getattr(trainer, "n_envs", 1))
     steps_per_env = int(getattr(trainer, "rollout_steps_per_env", 1))
@@ -396,17 +623,13 @@ def _decide_collection_size(trainer: Any, *, is_off_policy: bool) -> tuple[int, 
     if is_off_policy:
         return steps_per_env, None
 
-    # On-policy path: use algo.remaining_rollout_steps()
     fn_rem = getattr(getattr(trainer, "algo", None), "remaining_rollout_steps", None)
     if not callable(fn_rem):
-        raise ValueError(
-            "Ray on-policy path requires algo.remaining_rollout_steps(). Implement it in your on-policy driver."
-        )
+        raise ValueError("Ray on-policy path requires algo.remaining_rollout_steps().")
 
     remaining = int(fn_rem())
     if remaining <= 0:
-        # If algo is already ready, let the outer loop call updates by returning a tiny collection.
-        # The caller handles the 'remaining<=0' case by running updates first in the original code.
+        # Return a tiny collection; outer loop will then perform updates.
         return 1, 0
 
     per_worker = int(math.ceil(float(remaining) / float(n_envs)))
@@ -414,13 +637,21 @@ def _decide_collection_size(trainer: Any, *, is_off_policy: bool) -> tuple[int, 
     return per_worker, int(remaining)
 
 
-def _trim_onpolicy_rollout(rollout: Any, *, target_new: Optional[int]) -> tuple[Any, int]:
+def _trim_onpolicy_rollout(rollout: Any, *, target_new: Optional[int]) -> Tuple[Any, int]:
     """
-    Trim rollout to exactly target_new transitions (on-policy only).
+    Trim rollout to at most `target_new` transitions (on-policy only).
+
+    Parameters
+    ----------
+    rollout : sequence
+        Collected rollout transitions.
+    target_new : int or None
+        Desired total transition count. If None, no trimming is applied.
 
     Returns
     -------
-    rollout : same type as input
+    rollout_out : same type as input
+        Possibly sliced rollout.
     n_new : int
         Number of transitions after trimming.
     """
@@ -441,7 +672,17 @@ def _ingest_rollout(trainer: Any, rollout: Any) -> None:
     """
     Feed collected rollout into algo.
 
-    Prefers algo.on_rollout(rollout) if available, else calls algo.on_env_step per transition.
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object with `algo`.
+    rollout : sequence
+        Transition sequence.
+
+    Notes
+    -----
+    Prefers `algo.on_rollout(rollout)` if available, else falls back to calling
+    `algo.on_env_step(tr)` for each transition.
     """
     algo = getattr(trainer, "algo", None)
 
@@ -456,25 +697,43 @@ def _ingest_rollout(trainer: Any, rollout: Any) -> None:
 
 def _handle_update_side_effects(trainer: Any, metrics: Any, pbar: Any) -> bool:
     """
-    Apply common side effects after a single update call:
-      - callbacks.on_update
-      - logger.log(train/...)
+    Apply side effects after a single algo.update() call.
+
+    Side effects
+    ------------
+    - callbacks.on_update(trainer, metrics=...)
+    - logger.log(metrics, step=global_env_step, prefix="train/", pbar=pbar)
+
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object with callbacks/logger.
+    metrics : Any
+        Update metrics returned by algo.update().
+    pbar : Any
+        Progress bar-like object passed into logger.
 
     Returns
     -------
     ok : bool
-        False if callbacks request stop; True otherwise.
+        False if callbacks request stop (on_update returns False), else True.
     """
     metrics_map = dict(metrics) if isinstance(metrics, Mapping) else None
 
     if getattr(trainer, "callbacks", None) is not None:
-        cont = maybe_call(trainer.callbacks, "on_update", trainer, metrics=metrics_map)
+        cont = _maybe_call(trainer.callbacks, "on_update", trainer, metrics=metrics_map)
         if cont is False:
             return False
 
-    if getattr(trainer, "logger", None) is not None and metrics_map:
+    logger = getattr(trainer, "logger", None)
+    if logger is not None and metrics_map:
         try:
-            trainer.logger.log(metrics_map, step=int(getattr(trainer, "global_env_step", 0)), pbar=pbar, prefix="train/")
+            logger.log(
+                metrics_map,
+                step=int(getattr(trainer, "global_env_step", 0)),
+                pbar=pbar,
+                prefix="train/",
+            )
         except Exception:
             pass
 
@@ -484,6 +743,27 @@ def _handle_update_side_effects(trainer: Any, metrics: Any, pbar: Any) -> bool:
 def _maybe_log_sys_ray(trainer: Any, last_sys_log_step: int, pbar: Any) -> int:
     """
     Periodically log system-level counters from the Ray loop.
+
+    Parameters
+    ----------
+    trainer : Any
+        Trainer-like object with logger and counters.
+    last_sys_log_step : int
+        Last env_step at which sys log was emitted.
+    pbar : Any
+        Progress bar-like object passed into logger.
+
+    Returns
+    -------
+    new_last_sys_log_step : int
+        Updated last log step (unchanged if no log emitted).
+
+    Notes
+    -----
+    Payload keys (under prefix "sys/"):
+      - env_step
+      - update_step
+      - episode (only if episode stats are trainer-owned)
     """
     logger = getattr(trainer, "logger", None)
     log_every = int(getattr(trainer, "log_every_steps", 0))
@@ -494,11 +774,13 @@ def _maybe_log_sys_ray(trainer: Any, last_sys_log_step: int, pbar: Any) -> int:
     if (now - int(last_sys_log_step)) < log_every:
         return last_sys_log_step
 
-    payload = {
+    payload: Dict[str, Any] = {
         "env_step": int(getattr(trainer, "global_env_step", 0)),
         "update_step": int(getattr(trainer, "global_update_step", 0)),
-        "episode": int(getattr(trainer, "episode_idx", 0)),
     }
+    if not bool(getattr(trainer, "_episode_stats_enabled", False)):
+        payload["episode"] = int(getattr(trainer, "episode_idx", 0))
+
     try:
         logger.log(payload, step=now, pbar=pbar, prefix="sys/")
     except Exception:

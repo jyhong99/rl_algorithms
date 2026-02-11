@@ -1,28 +1,49 @@
 from __future__ import annotations
 
-from typing import Optional, Sequence, Union, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import torch as th
 
-from .noises import GaussianNoise, OrnsteinUhlenbeckNoise, UniformNoise
-from ..utils.noise_utils import normalize_kind, as_flat_bounds
 from .action_noises import (
-    GaussianActionNoise,
     ClippedGaussianActionNoise,
+    GaussianActionNoise,
     MultiplicativeActionNoise,
 )
+from .noises import GaussianNoise, OrnsteinUhlenbeckNoise, UniformNoise
+from ..utils.noise_utils import _as_flat_bounds, _normalize_kind
 
-# If you have a common base interface like NoiseProcess, prefer:
-# from base_noise import NoiseProcess, BaseNoise, BaseActionNoise
-# and then return Optional[Union[BaseNoise, BaseActionNoise]].
+
+# =============================================================================
+# Types
+# =============================================================================
+
 NoiseObj = Union[
+    # action-independent
     GaussianNoise,
     OrnsteinUhlenbeckNoise,
     UniformNoise,
+    # action-dependent
     GaussianActionNoise,
     MultiplicativeActionNoise,
     ClippedGaussianActionNoise,
 ]
+
+
+# =============================================================================
+# Factory
+# =============================================================================
+
+_SUPPORTED_KINDS = (
+    "gaussian",
+    "ou",
+    "ornstein_uhlenbeck",
+    "uniform",
+    "gaussian_action",
+    "multiplicative",
+    "multiplicative_action",
+    "clipped_gaussian",
+    "clipped_gaussian_action",
+)
 
 
 def build_noise(
@@ -46,62 +67,116 @@ def build_noise(
     dtype: th.dtype = th.float32,
 ) -> Optional[NoiseObj]:
     """
-    Factory to construct exploration noise objects.
+    Construct an exploration-noise object.
+
+    This is a small factory that builds either:
+    - **action-independent noise** (returns a tensor of shape (action_dim,))
+      such as Gaussian / OU / Uniform, or
+    - **action-dependent noise** (expects an action tensor at sampling time)
+      such as multiplicative or clipped Gaussian action noise.
 
     Parameters
     ----------
     kind : Optional[str]
-        Noise type identifier. If None/"none"/"" -> returns None.
-        Supported kinds (aliases allowed):
-          - "gaussian"
-          - "ou" / "ornstein_uhlenbeck"
-          - "uniform"
-          - "gaussian_action"
-          - "multiplicative" / "multiplicative_action"
-          - "clipped_gaussian" / "clipped_gaussian_action"
+        Noise type identifier. If `None`, empty, or an alias of "none",
+        this returns ``None`` (no exploration noise).
+        Supported kinds (aliases may be normalized by `_normalize_kind`):
+
+        Action-independent
+            - ``"gaussian"``
+            - ``"ou"`` or ``"ornstein_uhlenbeck"``
+            - ``"uniform"``
+
+        Action-dependent
+            - ``"gaussian_action"``
+            - ``"multiplicative"`` or ``"multiplicative_action"``
+            - ``"clipped_gaussian"`` or ``"clipped_gaussian_action"``
+
     action_dim : int
-        Action dimension (> 0). Used to set noise tensor size for action-independent noises.
+        Action dimension ``A`` (must be > 0).
+
+        Notes
+        -----
+        - For action-independent noises, this determines the returned sample size.
+        - For action-dependent noises, this is used only for validating bounds
+          (e.g., clipped Gaussian with per-dimension low/high).
+
     device : str or torch.device, optional
-        Device for noise tensors/state, by default "cpu".
+        Device used for action-independent noise buffers/state (default: "cpu").
+        For clipped action noise, bounds will be constructed on this device.
+
     noise_mu : float, optional
-        Mean for Gaussian/OU, by default 0.0.
+        Mean for Gaussian/OU noise (default: 0.0).
+
     noise_sigma : float, optional
-        Stddev/scale parameter (>= 0), by default 0.2.
+        Standard deviation / scale parameter (must be >= 0) (default: 0.2).
+
     ou_theta : float, optional
-        OU mean reversion speed (>= 0), by default 0.15.
+        OU mean reversion speed (must be >= 0) (default: 0.15).
+
     ou_dt : float, optional
-        OU time step (> 0), by default 1e-2.
+        OU time step (must be > 0) (default: 1e-2).
+
     uniform_low, uniform_high : float, optional
-        Uniform bounds, requires high > low.
+        Uniform bounds (require ``uniform_high > uniform_low``).
+
     action_noise_eps : float, optional
-        Epsilon for GaussianActionNoise scale clamp (> 0), by default 1e-6.
+        Epsilon used by :class:`~GaussianActionNoise` to prevent vanishing scale at
+        action=0 (must be > 0) (default: 1e-6).
+
     action_noise_low, action_noise_high : Optional[float or Sequence[float]]
-        Required for clipped Gaussian action noise. If sequences, length must equal action_dim.
+        Bounds for clipped Gaussian action noise.
+        Must be provided iff kind is ``"clipped_gaussian"`` / ``"clipped_gaussian_action"``.
+
+        - If scalar: treated as a shared bound for all action dimensions.
+        - If a sequence: must have length ``action_dim``.
+
     dtype : torch.dtype, optional
-        Dtype for created tensors, by default torch.float32.
+        Dtype used for tensors created inside the noise objects (default: torch.float32).
 
     Returns
     -------
-    noise : Optional[NoiseObj]
-        Noise instance or None.
+    Optional[NoiseObj]
+        The constructed noise instance, or ``None`` if `kind` indicates no noise.
 
     Raises
     ------
     ValueError
-        If parameters are invalid or `kind` is unknown.
+        If:
+        - `action_dim` <= 0
+        - `noise_sigma` < 0
+        - OU parameters are invalid
+        - uniform bounds are invalid
+        - clipped bounds are missing/invalid
+        - `kind` is unknown
+
+    Notes
+    -----
+    Device and dtype rules
+        - Action-independent noises typically create and return tensors on `device`
+          with `dtype`.
+        - Action-dependent noises typically infer device/dtype from the input action
+          at sampling time (except clipped bounds, which are validated/constructed here).
+
+    Kind normalization
+        `_normalize_kind(kind)` is expected to:
+        - return ``None`` for None/"none"/"" (no noise)
+        - return a canonical kind string for aliases (e.g., "OU" -> "ou")
     """
-    nt = normalize_kind(kind)
+    nt = _normalize_kind(kind)
     if nt is None:
         return None
 
     if action_dim <= 0:
         raise ValueError(f"action_dim must be > 0, got {action_dim}")
-
     if noise_sigma < 0.0:
         raise ValueError(f"noise_sigma must be >= 0, got {noise_sigma}")
 
     size: Tuple[int, ...] = (int(action_dim),)
 
+    # -------------------------------------------------------------------------
+    # Action-independent noises
+    # -------------------------------------------------------------------------
     if nt == "gaussian":
         return GaussianNoise(
             size=size,
@@ -139,7 +214,12 @@ def build_noise(
             dtype=dtype,
         )
 
+    # -------------------------------------------------------------------------
+    # Action-dependent noises
+    # -------------------------------------------------------------------------
     if nt == "gaussian_action":
+        if action_noise_eps <= 0.0:
+            raise ValueError(f"action_noise_eps must be > 0, got {action_noise_eps}")
         return GaussianActionNoise(sigma=float(noise_sigma), eps=float(action_noise_eps))
 
     if nt in ("multiplicative", "multiplicative_action"):
@@ -151,20 +231,33 @@ def build_noise(
                 "clipped_gaussian requires action_noise_low and action_noise_high "
                 "(scalar or sequence of length action_dim)."
             )
-        low_t = as_flat_bounds(
-            action_noise_low, action_dim=action_dim, device=device, dtype=dtype, name="action_noise_low"
+
+        low_t = _as_flat_bounds(
+            action_noise_low,
+            action_dim=action_dim,
+            device=device,
+            dtype=dtype,
+            name="action_noise_low",
         )
-        high_t = as_flat_bounds(
-            action_noise_high, action_dim=action_dim, device=device, dtype=dtype, name="action_noise_high"
+        high_t = _as_flat_bounds(
+            action_noise_high,
+            action_dim=action_dim,
+            device=device,
+            dtype=dtype,
+            name="action_noise_high",
         )
 
-        # If both are scalar tensors, validate ordering early.
-        if low_t.ndim == 0 and high_t.ndim == 0 and (high_t <= low_t).item():
-            raise ValueError(f"action_noise_high must be > action_noise_low, got {high_t.item()} <= {low_t.item()}")
+        # Ordering check:
+        # - If both are scalar bounds, validate once.
+        # - If per-dimension bounds, you might optionally validate elementwise.
+        if low_t.numel() == 1 and high_t.numel() == 1 and (high_t <= low_t).item():
+            raise ValueError(
+                f"action_noise_high must be > action_noise_low, got {high_t.item()} <= {low_t.item()}"
+            )
 
         return ClippedGaussianActionNoise(sigma=float(noise_sigma), low=low_t, high=high_t)
 
     raise ValueError(
-        f"Unknown exploration noise kind='{kind}'. "
-        "Supported: None|'gaussian'|'ou'|'uniform'|'gaussian_action'|'multiplicative'|'clipped_gaussian'."
+        f"Unknown exploration noise kind={kind!r} (normalized={nt!r}). "
+        f"Supported kinds include: {', '.join(_SUPPORTED_KINDS)}."
     )

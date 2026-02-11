@@ -6,35 +6,61 @@ import torch as th
 import torch.nn as nn
 
 from .base_networks import BaseStateCritic, BaseStateActionCritic, MLPFeaturesExtractor
-from ..utils.network_utils import validate_hidden_sizes, make_weights_init, ensure_batch
+from ..utils.network_utils import _ensure_batch, _make_weights_init, _validate_hidden_sizes
 
 
 # =============================================================================
 # V(s)
 # =============================================================================
+
 class StateValueNetwork(BaseStateCritic):
     """
-    State-value function network V(s).
+    State-value function approximator V(s).
+
+    This network implements a standard value function:
+        V(s) = head(trunk(s))
+
+    where `trunk` is an MLP feature extractor and `head` maps features to a scalar.
 
     Parameters
     ----------
     state_dim : int
-        State dimension.
+        Dimensionality of the state vector.
     hidden_sizes : tuple[int, ...], optional
-        Trunk MLP hidden sizes, by default (64, 64).
+        Hidden layer sizes of the trunk MLP (default: (64, 64)).
     activation_fn : type[nn.Module], optional
-        Activation module class, by default nn.ReLU.
+        Activation module class inserted between Linear layers (default: ``nn.ReLU``).
     init_type : str, optional
-        Weight initializer name, by default "orthogonal".
+        Weight initialization scheme name (default: ``"orthogonal"``).
     gain : float, optional
-        Init gain, by default 1.0.
+        Initialization gain (default: 1.0).
     bias : float, optional
-        Bias init constant, by default 0.0.
+        Bias initialization constant (default: 0.0).
+
+    Attributes
+    ----------
+    state_dim : int
+        State dimension.
+    hidden_sizes : tuple[int, ...]
+        Hidden sizes for the trunk.
+    trunk : MLPFeaturesExtractor
+        Feature extractor mapping (B, state_dim) -> (B, trunk_dim).
+    trunk_dim : int
+        Feature dimension produced by the trunk.
+    head : nn.Linear
+        Linear head mapping (B, trunk_dim) -> (B, 1).
 
     Returns
     -------
-    v : torch.Tensor
-        Value estimates, shape (B, 1).
+    torch.Tensor
+        Value estimates V(s), shape (B, 1).
+
+    Notes
+    -----
+    Initialization:
+    - `BaseStateCritic` (via `BaseCriticNet`) stores init hyperparameters.
+    - We call `_finalize_init()` after building `head` so both trunk and head
+      are initialized consistently.
     """
 
     def __init__(
@@ -57,7 +83,7 @@ class StateValueNetwork(BaseStateCritic):
 
         self.head = nn.Linear(self.trunk_dim, 1)
 
-        # BaseStateCritic uses BaseCriticNet; finalize init after heads exist
+        # Finalize initialization after all modules exist.
         self._finalize_init()
 
     def forward(self, state: th.Tensor) -> th.Tensor:
@@ -65,12 +91,12 @@ class StateValueNetwork(BaseStateCritic):
         Parameters
         ----------
         state : torch.Tensor
-            State tensor, shape (B, state_dim) or (state_dim,).
+            State tensor of shape (state_dim,) or (B, state_dim).
 
         Returns
         -------
-        v : torch.Tensor
-            Value estimates, shape (B, 1).
+        torch.Tensor
+            Value estimates of shape (B, 1).
         """
         state = self._ensure_batch(state)
         feat = self.trunk(state)
@@ -80,14 +106,57 @@ class StateValueNetwork(BaseStateCritic):
 # =============================================================================
 # Q(s,a)
 # =============================================================================
+
 class StateActionValueNetwork(BaseStateActionCritic):
     """
-    State-action value function network Q(s,a).
+    State-action value function approximator Q(s, a).
+
+    This network implements a standard critic:
+        Q(s, a) = head(trunk([s, a]))
+
+    where [s, a] denotes concatenation along the last dimension.
+
+    Parameters
+    ----------
+    state_dim : int
+        State dimension.
+    action_dim : int
+        Action dimension.
+    hidden_sizes : tuple[int, ...], optional
+        Hidden layer sizes of the trunk MLP (default: (64, 64)).
+    activation_fn : type[nn.Module], optional
+        Activation module class (default: ``nn.ReLU``).
+    init_type : str, optional
+        Weight initialization scheme name (default: ``"orthogonal"``).
+    gain : float, optional
+        Initialization gain (default: 1.0).
+    bias : float, optional
+        Bias initialization constant (default: 0.0).
+
+    Attributes
+    ----------
+    state_dim : int
+        State dimension.
+    action_dim : int
+        Action dimension.
+    input_dim : int
+        Concatenated input dimension = state_dim + action_dim.
+    trunk : MLPFeaturesExtractor
+        Feature extractor mapping (B, input_dim) -> (B, trunk_dim).
+    head : nn.Linear
+        Linear head mapping (B, trunk_dim) -> (B, 1).
 
     Returns
     -------
-    q : torch.Tensor
-        Q-value estimates, shape (B, 1).
+    torch.Tensor
+        Q-value estimates Q(s, a), shape (B, 1).
+
+    Notes
+    -----
+    - `state` and `action` must have the same batch size B after `_ensure_batch`.
+      If you ever see shape bugs here, add an assertion:
+          assert state.size(0) == action.size(0)
+    - Initialization is finalized after heads exist via `_finalize_init()`.
     """
 
     def __init__(
@@ -112,7 +181,7 @@ class StateActionValueNetwork(BaseStateActionCritic):
 
         self.head = nn.Linear(self.trunk_dim, 1)
 
-        # BaseStateActionCritic -> BaseCriticNet pattern: call finalize after heads
+        # Finalize initialization after all modules exist.
         self._finalize_init()
 
     def forward(self, state: th.Tensor, action: th.Tensor) -> th.Tensor:
@@ -120,14 +189,14 @@ class StateActionValueNetwork(BaseStateActionCritic):
         Parameters
         ----------
         state : torch.Tensor
-            State tensor, shape (B, state_dim) or (state_dim,).
+            State tensor of shape (state_dim,) or (B, state_dim).
         action : torch.Tensor
-            Action tensor, shape (B, action_dim) or (action_dim,).
+            Action tensor of shape (action_dim,) or (B, action_dim).
 
         Returns
         -------
-        q : torch.Tensor
-            Q-value estimates, shape (B, 1).
+        torch.Tensor
+            Q-value estimates of shape (B, 1).
         """
         state = self._ensure_batch(state)
         action = self._ensure_batch(action)
@@ -139,12 +208,39 @@ class StateActionValueNetwork(BaseStateActionCritic):
 
 class DoubleStateActionValueNetwork(nn.Module):
     """
-    Twin critics Q1(s,a), Q2(s,a).
+    Twin state-action critics: Q1(s,a), Q2(s,a).
+
+    This wrapper is commonly used in TD3/SAC-style algorithms to reduce
+    overestimation bias via clipped double-Q targets.
+
+    Parameters
+    ----------
+    state_dim : int
+        State dimension.
+    action_dim : int
+        Action dimension.
+    hidden_sizes : tuple[int, ...], optional
+        Hidden sizes for each critic trunk (default: (64, 64)).
+    activation_fn : type[nn.Module], optional
+        Activation module class (default: ``nn.ReLU``).
+    init_type : str, optional
+        Weight initialization scheme name (default: ``"orthogonal"``).
+    gain : float, optional
+        Initialization gain (default: 1.0).
+    bias : float, optional
+        Bias initialization constant (default: 0.0).
+
+    Attributes
+    ----------
+    q1 : StateActionValueNetwork
+        First critic.
+    q2 : StateActionValueNetwork
+        Second critic.
 
     Returns
     -------
     q1, q2 : torch.Tensor
-        Each is shape (B, 1).
+        Each tensor is shape (B, 1).
     """
 
     def __init__(
@@ -178,18 +274,39 @@ class DoubleStateActionValueNetwork(nn.Module):
         )
 
     def forward(self, state: th.Tensor, action: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Parameters
+        ----------
+        state : torch.Tensor
+            State tensor of shape (state_dim,) or (B, state_dim).
+        action : torch.Tensor
+            Action tensor of shape (action_dim,) or (B, action_dim).
+
+        Returns
+        -------
+        q1 : torch.Tensor
+            Q1(s,a), shape (B, 1).
+        q2 : torch.Tensor
+            Q2(s,a), shape (B, 1).
+        """
         return self.q1(state, action), self.q2(state, action)
 
 
 # =============================================================================
 # Quantile critic ensemble (TQC/QR variants)
 # =============================================================================
+
 class QuantileStateActionValueNetwork(nn.Module):
     """
-    Quantile critic ensemble with independent trunks/heads.
+    Quantile critic ensemble with independent trunks and heads.
 
-    Outputs a stack of quantile values per critic:
-        (B, n_nets, n_quantiles)
+    This module outputs quantile values per critic network:
+        output shape = (B, n_nets, n_quantiles)
+
+    This is useful for:
+    - TQC (Truncated Quantile Critics)
+    - QR-style critic ensembles
+    - any distributional continuous-control variant
 
     Parameters
     ----------
@@ -198,25 +315,47 @@ class QuantileStateActionValueNetwork(nn.Module):
     action_dim : int
         Action dimension.
     n_quantiles : int, optional
-        Number of quantiles per critic, by default 25.
+        Number of quantiles produced per critic (default: 25).
     n_nets : int, optional
-        Number of critic networks in the ensemble, by default 2.
+        Number of critics in the ensemble (default: 2).
     hidden_sizes : tuple[int, ...], optional
-        Hidden sizes for each critic trunk, by default (64, 64).
+        Trunk hidden sizes for each critic (default: (64, 64)).
     activation_fn : type[nn.Module], optional
-        Activation module class, by default nn.ReLU.
+        Activation module class used in each trunk (default: ``nn.ReLU``).
     init_type : str, optional
-        Weight initializer name, by default "orthogonal".
+        Weight initialization scheme name (default: ``"orthogonal"``).
     gain : float, optional
-        Init gain, by default 1.0.
+        Initialization gain (default: 1.0).
     bias : float, optional
-        Bias init constant, by default 0.0.
+        Bias initialization constant (default: 0.0).
+
+    Attributes
+    ----------
+    state_dim : int
+        State dimension.
+    action_dim : int
+        Action dimension.
+    input_dim : int
+        Concatenated input dimension = state_dim + action_dim.
+    n_quantiles : int
+        Number of quantiles per critic.
+    n_nets : int
+        Number of critics.
+    trunks : nn.ModuleList
+        List of feature extractors; each maps (B, input_dim) -> (B, trunk_dim).
+    heads : nn.ModuleList
+        List of linear heads; each maps (B, trunk_dim) -> (B, n_quantiles).
+
+    Returns
+    -------
+    torch.Tensor
+        Quantile tensor of shape (B, n_nets, n_quantiles).
 
     Notes
     -----
-    - This class does NOT inherit BaseStateActionCritic because it builds multiple
-      independent trunks; inheriting a base that assumes a single trunk complicates
-      initialization and creates unused modules.
+    - This class does not inherit `BaseStateActionCritic` because that base assumes
+      a *single* trunk, while here we explicitly maintain multiple independent trunks.
+    - `_ensure_batch` moves inputs to the module device and ensures a batch dimension.
     """
 
     def __init__(
@@ -233,7 +372,7 @@ class QuantileStateActionValueNetwork(nn.Module):
     ) -> None:
         super().__init__()
 
-        hs = validate_hidden_sizes(hidden_sizes)
+        hs = _validate_hidden_sizes(hidden_sizes)
 
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
@@ -254,35 +393,58 @@ class QuantileStateActionValueNetwork(nn.Module):
 
         self.heads = nn.ModuleList([nn.Linear(trunk_dim, self.n_quantiles) for _ in range(self.n_nets)])
 
-        init_fn = make_weights_init(init_type=init_type, gain=gain, bias=bias)
+        init_fn = _make_weights_init(init_type=init_type, gain=gain, bias=bias)
         self.apply(init_fn)
 
     def _ensure_batch(self, x: Any) -> th.Tensor:
-        device = next(self.parameters()).device
-        return ensure_batch(x, device=device)
-    
-    def forward(self, state: th.Tensor, action: th.Tensor) -> th.Tensor:
         """
+        Ensure input has batch dimension and is placed on module device.
+
         Parameters
         ----------
-        state : torch.Tensor
-            State tensor, shape (B, state_dim) or (state_dim,).
-        action : torch.Tensor
-            Action tensor, shape (B, action_dim) or (action_dim,).
+        x : Any
+            Input convertible by `_ensure_batch` (Tensor / ndarray / sequence).
 
         Returns
         -------
-        quantiles : torch.Tensor
-            Quantile values, shape (B, n_nets, n_quantiles).
+        torch.Tensor
+            Tensor on this module's device with shape (B, D).
+        """
+        device = next(self.parameters()).device
+        return _ensure_batch(x, device=device)
+
+    def forward(self, state: th.Tensor, action: th.Tensor) -> th.Tensor:
+        """
+        Compute quantile values for each critic in the ensemble.
+
+        Parameters
+        ----------
+        state : torch.Tensor
+            State tensor of shape (state_dim,) or (B, state_dim).
+        action : torch.Tensor
+            Action tensor of shape (action_dim,) or (B, action_dim).
+
+        Returns
+        -------
+        torch.Tensor
+            Quantile values of shape (B, n_nets, n_quantiles).
+
+        Notes
+        -----
+        - All critics share the same input x = concat(state, action),
+          but have independent parameters.
+        - If you want vectorized evaluation (no Python loop), you could stack
+          parameters or use vmap; however, explicit loops are often fine given
+          small n_nets (e.g., 2~5).
         """
         state = self._ensure_batch(state)
         action = self._ensure_batch(action)
 
         x = th.cat([state, action], dim=-1)
 
-        qs = []
+        qs: list[th.Tensor] = []
         for trunk, head in zip(self.trunks, self.heads):
-            feat = trunk(x)
-            qs.append(head(feat))  # (B, n_quantiles)
+            feat = trunk(x)         # (B, trunk_dim)
+            qs.append(head(feat))   # (B, n_quantiles)
 
         return th.stack(qs, dim=1)  # (B, n_nets, n_quantiles)

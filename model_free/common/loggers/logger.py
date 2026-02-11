@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
-
 import json
 import os
 import socket
@@ -10,69 +8,92 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch as th
-from ..utils.common_utils import to_scalar
-from ..utils.log_utils import make_run_dir
+
+from ..utils.common_utils import _to_scalar
+from ..utils.logger_utils import _make_run_dir
 
 
-
-# =============================================================================
-# Logger
-# =============================================================================
 class Logger:
     """
-    Scalar-first experiment logger.
+    Scalar-first experiment logger (frontend).
 
-    This class provides a lightweight frontend for experiment logging.
-    It owns:
-      - step inference
-      - prefix/key normalization
-      - key throttling (log every N steps per key)
-      - in-memory aggregation buffer (record/dump/dump_stats)
-      - console printing
-      - run metadata/config dumps
+    The `Logger` is responsible for **frontend concerns**:
+    - Resolving and owning a per-run directory (`run_dir`)
+    - Inferring global step (via bound trainer or custom callable)
+    - Normalizing metric keys (prefixing and path normalization)
+    - Per-key throttling (log a key every N steps)
+    - Optional dropping of non-finite values (NaN/Inf)
+    - In-memory aggregation buffer (`record` -> `dump` / `dump_stats`)
+    - Console printing at a configured cadence
+    - Best-effort dumps of runtime metadata and experiment configs
 
-    Writers (backends) own:
-      - file/network IO
-      - serialization format
-      - flush/close semantics
+    Writer backends are responsible for **I/O concerns**:
+    - file/network I/O
+    - serialization formats
+    - buffering, flush, close semantics
 
     Parameters
     ----------
-    log_dir : str
-        Root directory for runs (e.g., "./runs").
-    exp_name : str
-        Experiment name subdirectory under log_dir.
-    run_id : Optional[str]
-        Explicit run identifier (filesystem-level). Highest priority.
-    run_name : Optional[str]
-        Alternative identifier used if run_id is None.
-    overwrite : bool
-        If True, reuse the same run directory even if it exists.
-    resume : bool
-        If True, use the computed run directory directly (assumed to exist).
-        The directory is still created with exist_ok=True for robustness.
-    writers : Optional[Iterable[Writer]]
-        Writer instances (TensorBoard/CSV/JSONL/etc). May be empty/None.
-    console_every : int
-        Print to stdout every N `log()` calls. (Call-count based, not step based.)
-        Set <= 0 to disable.
-    flush_every : int
-        Flush writers every N `log()` calls. Set <= 0 to disable.
-    drop_non_finite : bool
-        If True, drop NaN/Inf scalars instead of writing them.
+    log_dir : str, default="./runs"
+        Root directory for experiment runs.
+    exp_name : str, default="exp"
+        Experiment name used as a subdirectory under `log_dir`.
+    run_id : str, optional
+        Explicit run identifier with highest priority. When provided, it is used
+        to form a deterministic run directory name.
+    run_name : str, optional
+        Human-friendly run identifier used when `run_id` is not provided.
+        Exact usage depends on `_make_run_dir`.
+    overwrite : bool, default=False
+        If True, reuse an existing run directory if it already exists.
+        (Semantics depend on `_make_run_dir`.)
+    resume : bool, default=False
+        If True, treat the resolved run directory as an existing run and append to it.
+        The directory is still created with `exist_ok=True` for robustness.
+    writers : Iterable, optional
+        Writer backend instances (e.g., CSV/JSONL/TensorBoard/W&B). If None,
+        no writers are attached at initialization.
+    console_every : int, default=1
+        Print to stdout every N calls to `log()` (call-count based, not step-based).
+        Set <= 0 to disable console output.
+    flush_every : int, default=200
+        Flush writers every N calls to `log()`. Set <= 0 to disable periodic flushing.
+    drop_non_finite : bool, default=False
+        If True, discard NaN/Inf scalars rather than writing them.
+    strict : bool, default=False
+        If True, re-raise exceptions encountered during writer operations or metadata dumps.
+        If False, errors are recorded in `_errors` and execution continues (best-effort).
+
+    Attributes
+    ----------
+    run_dir : str
+        Resolved run directory path owned by this logger.
     strict : bool
-        If True, re-raise exceptions from writers/metadata dumps.
+        Strict mode flag controlling exception propagation.
+    console_every : int
+        Console printing cadence (calls to `log()`).
+    flush_every : int
+        Flush cadence (calls to `log()`).
+    drop_non_finite : bool
+        Whether to drop NaN/Inf scalars.
+    _errors : list of str
+        Collected error messages from best-effort operations.
+    _writers : list
+        Attached writer backends.
 
     Notes
     -----
-    - This logger assumes `to_scalar(x)` returns either:
-      - float-compatible scalar, or
-      - None if conversion is not possible.
-    - For step inference, bind a trainer via `bind_trainer()` or set a custom
-      callable via `set_step_fn()`.
+    - Scalar conversion is delegated to `_to_scalar(x)`, which is expected to return
+      a float-like scalar or None when conversion is not possible.
+    - Step inference uses (in priority order):
+        1) explicit `step` argument
+        2) custom callable set via `set_step_fn`
+        3) bound trainer attribute `global_env_step`
+        4) fallback to 0
     """
 
     def __init__(
@@ -84,7 +105,7 @@ class Logger:
         run_name: Optional[str] = None,
         overwrite: bool = False,
         resume: bool = False,
-        writers: Optional[Iterable] = None,
+        writers: Optional[Iterable[Any]] = None,
         console_every: int = 1,
         flush_every: int = 200,
         drop_non_finite: bool = False,
@@ -93,7 +114,8 @@ class Logger:
         self.strict = bool(strict)
         self._errors: List[str] = []
 
-        self.run_dir = make_run_dir(
+        # Resolve and create the run directory.
+        self.run_dir = _make_run_dir(
             log_dir=log_dir,
             exp_name=exp_name,
             run_id=run_id,
@@ -103,27 +125,29 @@ class Logger:
         )
         os.makedirs(self.run_dir, exist_ok=True)
 
+        # Console/flush cadence is based on number of `log()` calls.
         self.console_every = int(console_every)
         self.flush_every = int(flush_every)
         self.drop_non_finite = bool(drop_non_finite)
 
+        # Timing counters.
         self._start_time = time.time()
         self._log_calls = 0
 
-        # Step inference hooks
+        # Step inference hooks.
         self._step_fn: Optional[Callable[[], int]] = None
         self._trainer_ref: Optional[Any] = None
 
-        # Key throttling: full_key -> every_n_steps
+        # Per-key throttling: full_key -> every_n_steps.
         self._key_every: Dict[str, int] = {}
 
-        # Aggregation buffer: full_key -> list of floats
+        # In-memory aggregation buffer: full_key -> list of floats.
         self._buffer: Dict[str, List[float]] = defaultdict(list)
 
-        # Writers
-        self._writers: List = list(writers) if writers is not None else []
+        # Attached writer backends.
+        self._writers: List[Any] = list(writers) if writers is not None else []
 
-        # Best-effort metadata dump
+        # Best-effort metadata dump at creation time.
         try:
             self.dump_metadata(filename="metadata.json")
         except Exception as e:
@@ -133,9 +157,24 @@ class Logger:
     # Context manager
     # ---------------------------------------------------------------------
     def __enter__(self) -> "Logger":
+        """
+        Enter context manager.
+
+        Returns
+        -------
+        Logger
+            The logger itself.
+        """
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        """
+        Exit context manager and close all writers (best-effort).
+
+        Notes
+        -----
+        - Writer failures during close obey the `strict` policy.
+        """
         self.close()
 
     # ---------------------------------------------------------------------
@@ -143,12 +182,18 @@ class Logger:
     # ---------------------------------------------------------------------
     def set_step_fn(self, fn: Optional[Callable[[], int]]) -> None:
         """
-        Set a custom callable that returns the current global step.
+        Set a callable used to infer the current global step.
 
         Parameters
         ----------
-        fn : Optional[Callable[[], int]]
-            Callable that returns a step integer. Set None to disable.
+        fn : callable or None
+            Callable that returns the current step as an integer.
+            Set to None to disable custom inference.
+
+        Notes
+        -----
+        - If provided, this callable takes precedence over a bound trainer.
+        - Exceptions inside the callable are swallowed and step falls back to 0.
         """
         self._step_fn = fn
 
@@ -156,8 +201,19 @@ class Logger:
         """
         Bind a trainer object for default step inference.
 
-        The default step extractor tries:
-        trainer.global_env_step (int), falling back to 0 on error.
+        The default extractor attempts to read:
+        ``trainer.global_env_step``
+
+        Parameters
+        ----------
+        trainer : Any
+            Trainer-like object that (optionally) exposes `global_env_step`.
+
+        Notes
+        -----
+        - This method sets an internal default step function which is used by
+          `_infer_step()` when no explicit `step` is provided.
+        - On any access/cast failure, the inferred step defaults to 0.
         """
         self._trainer_ref = trainer
 
@@ -170,6 +226,19 @@ class Logger:
         self._step_fn = _default_step
 
     def _infer_step(self, step: Optional[int]) -> int:
+        """
+        Infer the step according to the logger's step policy.
+
+        Parameters
+        ----------
+        step : int, optional
+            Explicit step override.
+
+        Returns
+        -------
+        int
+            Inferred step (>=0 by convention; not strictly enforced).
+        """
         if step is not None:
             return int(step)
         if self._step_fn is not None:
@@ -188,6 +257,21 @@ class Logger:
     # Error handling
     # ---------------------------------------------------------------------
     def _handle_exception(self, err: BaseException, context: str) -> None:
+        """
+        Handle an internal exception according to the `strict` policy.
+
+        Parameters
+        ----------
+        err : BaseException
+            The exception object.
+        context : str
+            Human-readable context string indicating where the error occurred.
+
+        Notes
+        -----
+        - In non-strict mode, errors are recorded in `_errors` and execution continues.
+        - In strict mode, the exception is re-raised.
+        """
         msg = f"[{self.__class__.__name__}] {context}: {type(err).__name__}: {err}"
         self._errors.append(msg)
         if self.strict:
@@ -198,6 +282,24 @@ class Logger:
     # ---------------------------------------------------------------------
     @staticmethod
     def _norm_prefix(prefix: str) -> str:
+        """
+        Normalize a prefix into a canonical path-like form.
+
+        Parameters
+        ----------
+        prefix : str
+            User-provided prefix, e.g., "train", "eval", "rollout/env0".
+
+        Returns
+        -------
+        str
+            Normalized prefix ending with '/' when non-empty, otherwise ''.
+
+        Notes
+        -----
+        - Backslashes are converted to forward slashes.
+        - Leading/trailing slashes are stripped.
+        """
         p = str(prefix).strip()
         if not p:
             return ""
@@ -206,10 +308,43 @@ class Logger:
 
     @staticmethod
     def _norm_key(key: Any) -> str:
+        """
+        Normalize a metric key.
+
+        Parameters
+        ----------
+        key : Any
+            Metric key, typically str-like.
+
+        Returns
+        -------
+        str
+            Normalized key without a leading '/'.
+
+        Notes
+        -----
+        - Converts backslashes to forward slashes.
+        - Strips whitespace and leading slashes to avoid accidental absolute paths.
+        """
         k = str(key).strip().replace("\\", "/")
         return k.lstrip("/")
 
     def _join_name(self, prefix: str, key: Any) -> str:
+        """
+        Join prefix and key into a full metric name.
+
+        Parameters
+        ----------
+        prefix : str
+            Prefix (e.g., "train").
+        key : Any
+            Metric key (e.g., "loss").
+
+        Returns
+        -------
+        str
+            Full key name (e.g., "train/loss").
+        """
         p = self._norm_prefix(prefix)
         k = self._norm_key(key)
         return f"{p}{k}" if p else k
@@ -221,8 +356,14 @@ class Logger:
         Parameters
         ----------
         mapping : Mapping[str, int]
-            full_key -> every_n_steps.
-            If value <= 0, throttling for that key is removed.
+            Mapping from full metric key to `every_n_steps`.
+
+            - If `every_n_steps <= 0`, throttling is removed for that key.
+            - Otherwise, the key is logged only when `step % every_n_steps == 0`.
+
+        Notes
+        -----
+        Keys are normalized via `_norm_key` before storing.
         """
         for k, v in mapping.items():
             kk = self._norm_key(k)
@@ -233,6 +374,21 @@ class Logger:
                 self._key_every[kk] = vv
 
     def _should_log_key(self, full_key: str, step: int) -> bool:
+        """
+        Decide whether a given key should be logged at the current step.
+
+        Parameters
+        ----------
+        full_key : str
+            Fully-qualified metric key (after prefix normalization).
+        step : int
+            Current step.
+
+        Returns
+        -------
+        bool
+            True if the key should be logged; False if throttled.
+        """
         every = self._key_every.get(full_key, None)
         if every is None or every <= 0:
             return True
@@ -241,76 +397,116 @@ class Logger:
     # ---------------------------------------------------------------------
     # Public logging APIs
     # ---------------------------------------------------------------------
-    def log(self, metrics: Mapping[str, Any], step: Optional[int] = None, *, pbar: Optional[Any] = None,  prefix: str = "") -> None:
+    def log(
+        self,
+        metrics: Mapping[str, Any],
+        step: Optional[int] = None,
+        *,
+        pbar: Optional[Any] = None,
+        prefix: str = "",
+    ) -> None:
         """
-        Immediately write metrics to writers (and optionally console).
+        Immediately write metrics to writer backends (and optionally console).
 
         Parameters
         ----------
         metrics : Mapping[str, Any]
-            Key-value mapping. Values are converted via `to_scalar`.
-        step : Optional[int]
-            If provided, overrides inferred step.
-        prefix : str
-            Optional prefix for all keys (e.g., "train", "eval").
+            Metric mapping. Values are converted to floats using `_to_scalar`.
+            Non-convertible values are skipped.
+        step : int, optional
+            Explicit step override. If omitted, step is inferred.
+        pbar : Any, optional
+            Optional progress-bar-like object (e.g., tqdm) supporting
+            `set_description_str`. If provided, console output is routed through it.
+        prefix : str, default=""
+            Optional prefix applied to all keys (e.g., "train", "eval").
+
+        Notes
+        -----
+        - Throttling is applied after key normalization (`set_key_every`).
+        - Metadata keys are injected into every emitted row:
+          ``step``, ``wall_time``, ``timestamp``.
+        - Console printing and periodic flushing are based on number of calls to `log()`.
         """
         s = self._infer_step(step)
         self._log_calls += 1
 
         row: Dict[str, float] = {}
 
+        # Convert metrics to float scalars and apply throttling.
         for k, v in metrics.items():
             name = self._join_name(prefix, k)
-            val = to_scalar(v)
+
+            val = _to_scalar(v)
             if val is None:
                 continue
+
             try:
                 fval = float(val)
             except Exception:
                 continue
+
             if self.drop_non_finite and (not np.isfinite(fval)):
                 continue
+
             if not self._should_log_key(name, s):
                 continue
+
             row[name] = fval
 
-        # meta
+        # Inject metadata fields (always present).
+        now = time.time()
         row["step"] = float(int(s))
-        row["wall_time"] = float(time.time() - self._start_time)
-        row["timestamp"] = float(time.time())
+        row["wall_time"] = float(now - self._start_time)
+        row["timestamp"] = float(now)
 
-        # writers
+        # Dispatch to writers.
         for w in self._writers:
             try:
                 w.write(row)
             except Exception as e:
                 self._handle_exception(e, f"writer.write({w.__class__.__name__})")
 
-        # console
+        # Console printing.
         if self.console_every > 0 and (self._log_calls % self.console_every == 0):
             self._print_console(row, pbar=pbar)
 
-        # periodic flush
+        # Periodic flush.
         if self.flush_every > 0 and (self._log_calls % self.flush_every == 0):
             self.flush()
 
     def record(self, metrics: Mapping[str, Any], *, prefix: str = "") -> None:
         """
-        Record metrics into an in-memory buffer for later aggregation.
+        Record metrics in an in-memory buffer for later aggregation.
 
-        Use `dump()` or `dump_stats()` to write aggregated scalars.
+        Parameters
+        ----------
+        metrics : Mapping[str, Any]
+            Metric mapping. Values are converted to floats using `_to_scalar`.
+            Non-convertible values are skipped.
+        prefix : str, default=""
+            Optional prefix applied to all keys recorded into the buffer.
+
+        Notes
+        -----
+        - This method does not call writers.
+        - Use `dump()` or `dump_stats()` to aggregate buffered values and emit scalars.
         """
         for k, v in metrics.items():
             name = self._join_name(prefix, k)
-            val = to_scalar(v)
+
+            val = _to_scalar(v)
             if val is None:
                 continue
+
             try:
                 fval = float(val)
             except Exception:
                 continue
+
             if self.drop_non_finite and (not np.isfinite(fval)):
                 continue
+
             self._buffer[name].append(fval)
 
     def dump(
@@ -322,21 +518,32 @@ class Logger:
         clear: bool = True,
     ) -> None:
         """
-        Aggregate buffered scalars and write them via `log()`.
+        Aggregate buffered scalars and emit them via `log()`.
 
         Parameters
         ----------
-        step : Optional[int]
-            Step override.
-        prefix : str
-            Optional prefix applied to ALL aggregated keys at output time.
-        agg : str
-            Aggregation operator in {"mean","min","max","std"}.
-        clear : bool
-            If True, clears the buffer after dumping.
+        step : int, optional
+            Explicit step override.
+        prefix : str, default=""
+            Optional prefix applied to output keys at dump time.
+            This is applied *after* aggregation.
+        agg : {"mean", "min", "max", "std"}, default="mean"
+            Aggregation operator.
+        clear : bool, default=True
+            If True, clear the buffer after dumping.
+
+        Raises
+        ------
+        ValueError
+            If `agg` is not one of {"mean", "min", "max", "std"}.
+
+        Notes
+        -----
+        - If the buffer is empty, this is a no-op.
+        - Output keys preserve original recording keys unless `prefix` is given.
         """
-        agg = str(agg).lower().strip()
-        if agg not in ("mean", "min", "max", "std"):
+        op = str(agg).lower().strip()
+        if op not in ("mean", "min", "max", "std"):
             raise ValueError(f"Unknown agg={agg!r}. Use mean|min|max|std.")
 
         out: Dict[str, float] = {}
@@ -344,11 +551,11 @@ class Logger:
             if not vals:
                 continue
             a = np.asarray(vals, dtype=np.float64)
-            if agg == "mean":
+            if op == "mean":
                 out[k] = float(np.mean(a))
-            elif agg == "min":
+            elif op == "min":
                 out[k] = float(np.min(a))
-            elif agg == "max":
+            elif op == "max":
                 out[k] = float(np.max(a))
             else:
                 out[k] = float(np.std(a))
@@ -359,10 +566,10 @@ class Logger:
         if not out:
             return
 
-        # Apply output prefix in a predictable way
         if prefix:
             out = {self._join_name(prefix, k): v for k, v in out.items()}
 
+        # Prefix is already applied above (if requested), so pass prefix="".
         self.log(out, step=step, prefix="")
 
     def dump_stats(
@@ -374,18 +581,28 @@ class Logger:
         suffixes: Tuple[str, ...] = ("mean", "min", "max", "std"),
     ) -> None:
         """
-        Dump multiple statistics per buffered key (e.g., mean/min/max/std).
+        Emit multiple statistics per buffered key (mean/min/max/std).
 
         Parameters
         ----------
-        step : Optional[int]
-            Step override.
-        prefix : str
-            Optional prefix applied to output keys.
-        clear : bool
-            If True, clears buffer after dumping.
-        suffixes : Tuple[str, ...]
-            Subset of {"mean","min","max","std"}.
+        step : int, optional
+            Explicit step override.
+        prefix : str, default=""
+            Optional prefix applied to output keys at dump time.
+        clear : bool, default=True
+            If True, clear the buffer after dumping.
+        suffixes : tuple of str, default=("mean","min","max","std")
+            Statistics to compute. Each element must be in {"mean","min","max","std"}.
+
+        Raises
+        ------
+        ValueError
+            If any suffix is not supported.
+
+        Notes
+        -----
+        - For each recorded key `k`, output keys are of the form:
+          `k_mean`, `k_min`, `k_max`, `k_std` (subset depending on `suffixes`).
         """
         use = tuple(str(s).lower().strip() for s in suffixes)
         for sfx in use:
@@ -422,18 +639,23 @@ class Logger:
     # ---------------------------------------------------------------------
     def dump_config(self, config: Mapping[str, Any], filename: str = "config.json") -> None:
         """
-        Dump experiment config as JSON into run_dir.
+        Dump experiment configuration as JSON into `run_dir`.
 
         Parameters
         ----------
         config : Mapping[str, Any]
-            Configuration mapping.
-        filename : str
-            Output filename under run_dir.
+            Configuration mapping. Must be JSON-serializable or convertible via `default=str`.
+        filename : str, default="config.json"
+            Output filename under `run_dir`.
+
+        Notes
+        -----
+        - Performs a shallow copy to avoid mutating caller objects.
+        - Falls back to stringifying keys if `dict(config)` fails.
         """
         path = os.path.join(self.run_dir, filename)
         try:
-            payload = dict(config)  # shallow copy
+            payload = dict(config)
         except Exception:
             payload = {str(k): v for k, v in config.items()}  # type: ignore[attr-defined]
 
@@ -442,24 +664,33 @@ class Logger:
 
     def dump_metadata(self, filename: str = "metadata.json") -> None:
         """
-        Dump runtime/environment metadata into run_dir.
+        Dump runtime/environment metadata as JSON into `run_dir`.
 
-        Includes:
-        - host/pid/python/platform
-        - torch/cuda info (best-effort)
-        - git info (best-effort)
+        Parameters
+        ----------
+        filename : str, default="metadata.json"
+            Output filename under `run_dir`.
+
+        Notes
+        -----
+        Captures (best-effort):
+        - Run directory and start timestamp
+        - Hostname/FQDN/PID and Python/platform info
+        - Torch/CUDA information (if available)
+        - Git information (commit/branch/dirty) when inside a git repo
         """
-        meta: Dict[str, Any] = {}
-        meta["run_dir"] = self.run_dir
-        meta["start_time_unix"] = float(self._start_time)
-        meta["start_time_iso"] = datetime.fromtimestamp(self._start_time).isoformat()
+        meta: Dict[str, Any] = {
+            "run_dir": self.run_dir,
+            "start_time_unix": float(self._start_time),
+            "start_time_iso": datetime.fromtimestamp(self._start_time).isoformat(),
+            "host": socket.gethostname(),
+            "fqdn": socket.getfqdn(),
+            "pid": os.getpid(),
+            "python": sys.version.replace("\n", " "),
+            "platform": sys.platform,
+        }
 
-        meta["host"] = socket.gethostname()
-        meta["fqdn"] = socket.getfqdn()
-        meta["pid"] = os.getpid()
-        meta["python"] = sys.version.replace("\n", " ")
-        meta["platform"] = sys.platform
-
+        # Torch/CUDA info (best-effort).
         try:
             meta["torch"] = str(getattr(th, "__version__", "unknown"))
             meta["cuda_available"] = bool(th.cuda.is_available())
@@ -483,9 +714,14 @@ class Logger:
         Returns
         -------
         Dict[str, Any]
-            Keys may include: commit, branch, dirty.
-            Returns empty dict when not in a git repo or git not available.
+            Dictionary with optional keys:
+            - "commit": str
+            - "branch": str
+            - "dirty": bool
+
+            Returns an empty dict if not inside a git repo or git is unavailable.
         """
+
         def _run(args: List[str]) -> Optional[str]:
             try:
                 out = subprocess.check_output(args, stderr=subprocess.DEVNULL)
@@ -508,13 +744,47 @@ class Logger:
             info["branch"] = branch
         if status is not None:
             info["dirty"] = bool(status.strip() != "")
+
         return info
 
     # ---------------------------------------------------------------------
-    # Flush / close
+    # Writer lifecycle
     # ---------------------------------------------------------------------
+    def add_writer(self, writer: Any) -> None:
+        """
+        Attach a single writer backend.
+
+        Parameters
+        ----------
+        writer : Any
+            Writer-like object exposing `write()`, `flush()`, and `close()`.
+
+        Notes
+        -----
+        - This method does not validate the interface strictly to keep the logger lightweight.
+        """
+        self._writers.append(writer)
+
+    def add_writers(self, writers: Iterable[Any]) -> None:
+        """
+        Attach multiple writer backends.
+
+        Parameters
+        ----------
+        writers : Iterable[Any]
+            Iterable of writer-like objects.
+        """
+        for w in writers:
+            self.add_writer(w)
+
     def flush(self) -> None:
-        """Flush all writers (best-effort unless strict=True)."""
+        """
+        Flush all writers (best-effort unless `strict=True`).
+
+        Notes
+        -----
+        - Errors are recorded and optionally raised according to the `strict` policy.
+        """
         for w in self._writers:
             try:
                 w.flush()
@@ -522,7 +792,14 @@ class Logger:
                 self._handle_exception(e, f"writer.flush({w.__class__.__name__})")
 
     def close(self) -> None:
-        """Flush and close all writers (best-effort unless strict=True)."""
+        """
+        Flush and close all writers (best-effort unless `strict=True`).
+
+        Notes
+        -----
+        - Calls `flush()` first.
+        - Closes each writer even if flushing fails.
+        """
         try:
             self.flush()
         finally:
@@ -533,10 +810,26 @@ class Logger:
                     self._handle_exception(e, f"writer.close({w.__class__.__name__})")
 
     # ---------------------------------------------------------------------
-    # Console
+    # Console output
     # ---------------------------------------------------------------------
     @staticmethod
     def _print_console(row: Mapping[str, float], *, pbar: Optional[Any] = None) -> None:
+        """
+        Render a compact console line for the current logging row.
+
+        Parameters
+        ----------
+        row : Mapping[str, float]
+            Logging row (includes meta keys `step`, `wall_time`, `timestamp`).
+        pbar : Any, optional
+            Progress-bar-like object supporting `set_description_str`. If provided,
+            the message is routed to the progress bar instead of printing a new line.
+
+        Notes
+        -----
+        - Prefers a curated set of common RL metrics; falls back to the first few keys.
+        - Avoids printing meta keys except `step` and elapsed wall time.
+        """
         step = int(row.get("step", 0.0))
         wall = float(row.get("wall_time", 0.0))
 
@@ -572,7 +865,7 @@ class Logger:
 
         msg = f"[step={step} | t={wall:.1f}s] " + " ".join(shown)
 
-        # ---- Update the fixed message line (no new lines) ----
+        # Prefer progress bar update if provided.
         if pbar is not None:
             try:
                 pbar.set_description_str(msg, refresh=True)
@@ -580,5 +873,4 @@ class Logger:
             except Exception:
                 pass
 
-        # fallback
         print(msg)

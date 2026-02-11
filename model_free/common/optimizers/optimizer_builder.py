@@ -12,7 +12,7 @@ from .kfac import KFAC
 
 
 # =============================================================================
-# Optimizer factory
+# Optimizer factory utilities
 # =============================================================================
 def build_optimizer(
     params: Union[Iterable[nn.Parameter], Iterable[Dict[str, Any]]],
@@ -38,93 +38,113 @@ def build_optimizer(
     trust_region: float = 2e-3,
 ) -> Optimizer:
     """
-    Build a PyTorch optimizer.
+    Construct a PyTorch optimizer by name.
+
+    This function centralizes optimizer creation for experiments, allowing you to
+    switch optimizer types via a string identifier while keeping common hyperparameters
+    in a single place.
+
+    Supported optimizers
+    --------------------
+    - Adam:      ``torch.optim.Adam``
+    - AdamW:     ``torch.optim.AdamW``
+    - SGD:       ``torch.optim.SGD``
+    - RMSprop:   ``torch.optim.RMSprop``
+    - RAdam:     ``torch.optim.RAdam``
+    - Lion:      custom ``Lion`` (sign-based momentum descent)
+    - KFAC:      custom ``KFAC`` (Kronecker-factored curvature preconditioner)
 
     Parameters
     ----------
-    params : Iterable[nn.Parameter] or Iterable[Dict[str, Any]]
-        Parameters to optimize. Two formats are supported:
+    params : Iterable[torch.nn.Parameter] or Iterable[Dict[str, Any]]
+        Parameters to optimize.
 
-        1) Flat parameters:
-           Iterable[nn.Parameter] where all parameters share the same base
-           hyperparameters.
+        Two input formats are supported:
 
-        2) Parameter groups:
-           Iterable[Dict[str, Any]] compatible with PyTorch param_group format.
-           Each dict must contain a "params" entry and may override lr,
-           weight_decay, etc.
+        1) Flat parameters
+           An iterable of ``nn.Parameter`` where all parameters share the same
+           base hyperparameters.
 
-        Important:
-        - For `name="kfac"`, this function will construct the optimizer using
-          `model.parameters()` internally. In that case, `params` is accepted
-          for API consistency, but the true optimized parameters are tied to
-          `model`.
+        2) Parameter groups
+           An iterable of PyTorch-compatible param-group dicts. Each dict must
+           contain a ``"params"`` entry and may override group-wise hyperparameters
+           (e.g., ``{"params": ..., "lr": ..., "weight_decay": ...}``).
 
-    name : str, optional
-        Optimizer identifier (case-insensitive), by default "adamw".
-        Supported:
-        - "adam", "adamw", "sgd", "rmsprop", "radam", "lion", "kfac"
+        Notes
+        -----
+        For ``name="kfac"``:
+            KFAC must attach hooks to modules in `model` and internally uses
+            ``model.parameters()`` as the true optimized parameters. In that case,
+            `params` is accepted for API consistency but effectively ignored.
 
-    lr : float, optional
-        Base learning rate, by default 3e-4.
+    name : str, default="adamw"
+        Optimizer identifier (case-insensitive). Common separators are normalized
+        (e.g., "adam-weight-decay" -> "adamw").
 
-    weight_decay : float, optional
-        Weight decay coefficient, by default 0.0.
+    lr : float, default=3e-4
+        Base learning rate. Must be > 0.
 
-    betas : Tuple[float, float], optional
-        Adam-like betas for Adam/AdamW/RAdam, by default (0.9, 0.999).
+    weight_decay : float, default=0.0
+        Weight decay coefficient. For AdamW/Lion this is typically treated as
+        decoupled decay by the underlying optimizer implementation. Must be >= 0.
 
-    eps : float, optional
-        Numerical stability epsilon for Adam/AdamW/RMSprop/RAdam, by default 1e-8.
+    betas : Tuple[float, float], default=(0.9, 0.999)
+        Adam-like betas used for Adam/AdamW/RAdam. Each must be in [0, 1).
 
-    momentum : float, optional
-        Momentum for SGD/RMSprop, and internal SGD of KFAC, by default 0.0.
+    eps : float, default=1e-8
+        Numerical stability epsilon used by Adam/AdamW/RMSprop/RAdam. Must be > 0.
 
-    nesterov : bool, optional
-        Nesterov momentum for SGD, by default False.
+    momentum : float, default=0.0
+        Momentum for SGD/RMSprop and the internal SGD used by KFAC.
 
-    alpha : float, optional
-        RMSprop smoothing constant, by default 0.99.
+    nesterov : bool, default=False
+        Whether to enable Nesterov momentum for SGD.
 
-    centered : bool, optional
-        Whether to use centered RMSprop, by default False.
+    alpha : float, default=0.99
+        Smoothing constant for RMSprop.
 
-    lion_betas : Tuple[float, float], optional
-        Betas for Lion, by default (0.9, 0.99).
+    centered : bool, default=False
+        If True, uses centered RMSprop.
 
-    model : Optional[nn.Module], optional
-        Required when name == "kfac". Used to register hooks and collect
+    lion_betas : Tuple[float, float], default=(0.9, 0.99)
+        Lion-specific betas (beta1, beta2). Each must be in [0, 1).
+
+    model : Optional[nn.Module], default=None
+        Required only when ``name == "kfac"``. Used to register hooks and collect
         curvature statistics.
 
-    damping : float, optional
-        KFAC damping term, by default 1e-2.
+    damping : float, default=1e-2
+        KFAC damping term. Must be >= 0.
 
-    kfac_eps : float, optional
-        KFAC Polyak/EMA coefficient for running covariances, by default 0.95.
+    kfac_eps : float, default=0.95
+        EMA coefficient for KFAC running covariances. Must be in (0, 1).
 
-    Ts : int, optional
-        KFAC statistics collection interval, by default 1.
+    Ts : int, default=1
+        KFAC statistics collection interval (in optimizer steps). Must be > 0.
 
-    Tf : int, optional
-        KFAC inverse update interval, by default 10.
+    Tf : int, default=10
+        KFAC inverse update interval (in optimizer steps). Must be > 0.
 
-    max_lr : float, optional
-        KFAC trust-region scaling upper bound, by default 1.0.
+    max_lr : float, default=1.0
+        Upper bound on KFAC trust-region scaling factor. Must be > 0.
 
-    trust_region : float, optional
-        KFAC trust-region radius, by default 2e-3.
+    trust_region : float, default=2e-3
+        KFAC trust-region radius. Must be > 0.
 
     Returns
     -------
     optimizer : torch.optim.Optimizer
-        Instantiated optimizer.
+        Instantiated optimizer object.
 
     Raises
     ------
     ValueError
-        If `name` is unknown, or if `name == "kfac"` but `model` is None,
-        or if hyperparameters are invalid.
+        If the optimizer `name` is unknown, required inputs are missing (e.g. KFAC
+        without `model`), or hyperparameters are invalid.
     """
+    # -------------------------
+    # Basic validation
+    # -------------------------
     if lr <= 0:
         raise ValueError(f"lr must be > 0, got: {lr}")
     if weight_decay < 0:
@@ -138,7 +158,9 @@ def build_optimizer(
     if not (0.0 <= b1 < 1.0 and 0.0 <= b2 < 1.0):
         raise ValueError(f"betas must be in [0, 1), got: {betas}")
 
-    # normalize names (handle common variants)
+    # -------------------------
+    # Normalize names (common variants)
+    # -------------------------
     opt = name.lower().strip().replace("-", "").replace("_", "")
     if opt in ("adamw", "adamweightdecay"):
         opt = "adamw"
@@ -155,6 +177,9 @@ def build_optimizer(
     elif opt in ("kfac",):
         opt = "kfac"
 
+    # -------------------------
+    # Dispatch
+    # -------------------------
     if opt == "adam":
         return optim.Adam(params, lr=lr, betas=(b1, b2), eps=eps, weight_decay=weight_decay)
 
@@ -162,7 +187,13 @@ def build_optimizer(
         return optim.AdamW(params, lr=lr, betas=(b1, b2), eps=eps, weight_decay=weight_decay)
 
     if opt == "sgd":
-        return optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=bool(nesterov))
+        return optim.SGD(
+            params,
+            lr=lr,
+            momentum=float(momentum),
+            weight_decay=float(weight_decay),
+            nesterov=bool(nesterov),
+        )
 
     if opt == "rmsprop":
         return optim.RMSprop(
@@ -170,8 +201,8 @@ def build_optimizer(
             lr=lr,
             alpha=float(alpha),
             eps=eps,
-            weight_decay=weight_decay,
-            momentum=momentum,
+            weight_decay=float(weight_decay),
+            momentum=float(momentum),
             centered=bool(centered),
         )
 
@@ -198,6 +229,7 @@ def build_optimizer(
         if trust_region <= 0:
             raise ValueError(f"trust_region must be > 0, got: {trust_region}")
 
+        # Important: KFAC uses `model.parameters()` (hooked modules), not `params`.
         return KFAC(
             model=model,
             lr=lr,
@@ -223,45 +255,68 @@ def make_param_groups(
     overrides: Optional[Sequence[Tuple[str, Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Build PyTorch optimizer param groups with practical defaults.
+    Build PyTorch optimizer parameter groups with practical defaults.
+
+    This helper creates param groups that:
+    - apply weight decay to "normal" weights,
+    - avoid weight decay for biases and normalization parameters,
+    - optionally apply prefix-based overrides for specific submodules.
 
     Parameters
     ----------
     named_params : Iterable[Tuple[str, nn.Parameter]]
-        Typically `model.named_parameters()`. Parameters with requires_grad=False
-        are skipped.
+        Typically ``model.named_parameters()``.
+
+        Parameters with ``requires_grad=False`` are skipped.
 
     base_lr : float
-        Default learning rate for all groups.
+        Default learning rate assigned to all groups unless overridden.
 
-    base_weight_decay : float, optional
-        Default weight decay for decay-enabled groups, by default 0.0.
+    base_weight_decay : float, default=0.0
+        Default weight decay applied to decay-enabled parameters.
 
-    no_decay_keywords : Sequence[str], optional
-        If parameter name contains any of these tokens (lowercased), it is assigned
-        to a no-decay group (weight_decay=0.0), by default ("bias", "bn", "ln", "norm").
+    no_decay_keywords : Sequence[str], default=("bias", "bn", "ln", "norm")
+        Substring tokens that mark parameters as "no decay" (weight_decay=0.0).
+        Matching is done on the lowercased parameter name.
 
-        Note:
-        - Token matching is substring-based. For some naming conventions, "bn" might
-          match unintended parameter names. If that is a concern, tighten tokens
-          (e.g., ("bias", "batchnorm", "layernorm", "norm")) or use overrides.
+        Examples
+        --------
+        - "bias" will match "fc.bias"
+        - "bn" may match "encoder.bn1.weight"
 
-    overrides : Optional[Sequence[Tuple[str, Dict[str, Any]]]], optional
-        Optional prefix-based overrides. First match wins.
-        Example:
-            overrides = [
-                ("actor.",  {"lr": 3e-4}),
-                ("critic.", {"lr": 1e-3, "weight_decay": 0.0}),
-            ]
+        Caveat
+        ------
+        Substring matching can be over-inclusive depending on naming conventions.
+        If you want stricter control, use longer tokens (e.g., "batchnorm") or
+        use `overrides`.
 
-        Implementation detail:
-        - Prefixes are matched after sorting by descending prefix length to
-          reduce accidental partial matches.
+    overrides : Optional[Sequence[Tuple[str, Dict[str, Any]]]], default=None
+        Optional prefix-based overrides. Each item is:
+
+            (prefix, config_dict)
+
+        The first matching prefix wins. Prefixes are sorted by descending
+        prefix length to reduce accidental partial matches.
+
+        Example
+        -------
+        overrides = [
+            ("actor.",  {"lr": 3e-4}),
+            ("critic.", {"lr": 1e-3, "weight_decay": 0.0}),
+        ]
+
+        This sends all parameters whose names start with "actor." into a dedicated
+        group with an overridden learning rate.
 
     Returns
     -------
     groups : List[Dict[str, Any]]
-        List of param_group dicts compatible with torch.optim.
+        List of param-group dicts compatible with torch.optim.
+
+    Raises
+    ------
+    ValueError
+        If base hyperparameters are invalid.
     """
     if base_lr <= 0:
         raise ValueError(f"base_lr must be > 0, got: {base_lr}")
@@ -269,12 +324,12 @@ def make_param_groups(
         raise ValueError(f"base_weight_decay must be >= 0, got: {base_weight_decay}")
 
     overrides_list: List[Tuple[str, Dict[str, Any]]] = list(overrides) if overrides is not None else []
-    # longer prefixes first => safer "first match wins"
-    overrides_list.sort(key=lambda x: len(x[0]), reverse=True)
+    overrides_list.sort(key=lambda x: len(x[0]), reverse=True)  # longer prefixes first
 
     decay_params: List[nn.Parameter] = []
     nodecay_params: List[nn.Parameter] = []
 
+    # Collect params for override groups (prefix -> list[Parameter])
     override_bins: Dict[str, List[nn.Parameter]] = {pfx: [] for pfx, _ in overrides_list}
     override_cfgs: Dict[str, Dict[str, Any]] = {pfx: dict(cfg) for pfx, cfg in overrides_list}
 
@@ -288,26 +343,29 @@ def make_param_groups(
                 return pfx
         return None
 
-    for n, p in named_params:
+    for name, p in named_params:
         if not p.requires_grad:
             continue
 
-        pfx = _match_override(n)
+        pfx = _match_override(name)
         if pfx is not None:
             override_bins[pfx].append(p)
             continue
 
-        if _is_no_decay(n):
+        if _is_no_decay(name):
             nodecay_params.append(p)
         else:
             decay_params.append(p)
 
     groups: List[Dict[str, Any]] = []
+
+    # Default groups (non-overridden)
     if decay_params:
         groups.append({"params": decay_params, "lr": float(base_lr), "weight_decay": float(base_weight_decay)})
     if nodecay_params:
         groups.append({"params": nodecay_params, "lr": float(base_lr), "weight_decay": 0.0})
 
+    # Override groups
     for pfx, _ in overrides_list:
         ps = override_bins[pfx]
         if not ps:
@@ -330,31 +388,38 @@ def clip_grad_norm(
     """
     AMP-safe gradient norm clipping.
 
+    This wrapper optionally unscales gradients via GradScaler before applying
+    ``torch.nn.utils.clip_grad_norm_``.
+
     Parameters
     ----------
     parameters : Iterable[nn.Parameter]
         Parameters whose gradients will be clipped.
 
-        Note:
-        - This function materializes the iterable into a list to avoid issues when
-          a generator is passed (generators can be exhausted by earlier passes).
+        Notes
+        -----
+        This function materializes the iterable into a list to avoid subtle issues
+        when a generator is passed (generators can be exhausted by earlier passes).
 
     max_norm : float
-        Maximum allowed norm. If <= 0, no-op and returns 0.0.
+        Maximum allowed gradient norm. If ``max_norm <= 0``, this is a no-op and
+        the function returns 0.0.
 
-    norm_type : float, optional
-        p-norm type, by default 2.0.
+    norm_type : float, default=2.0
+        Norm type for computing the total norm (p-norm).
 
-    scaler : Optional[torch.cuda.amp.GradScaler], optional
+    scaler : Optional[torch.cuda.amp.GradScaler], default=None
         If provided, gradients are unscaled before clipping.
 
-    optimizer : Optional[torch.optim.Optimizer], optional
-        Required if `scaler` is provided (used by scaler.unscale_).
+    optimizer : Optional[torch.optim.Optimizer], default=None
+        Required if ``scaler`` is provided, because ``scaler.unscale_(optimizer)``
+        needs the optimizer instance.
 
     Returns
     -------
     total_norm : float
-        Pre-clip total norm as reported by PyTorch.
+        The total norm of the parameters' gradients *before* clipping, as reported
+        by PyTorch.
 
     Raises
     ------
@@ -372,35 +437,43 @@ def clip_grad_norm(
         scaler.unscale_(optimizer)
 
     total_norm = nn.utils.clip_grad_norm_(params_list, max_norm, norm_type=float(norm_type))
-    if th.is_tensor(total_norm):
-        return float(total_norm.detach().cpu().item())
-    return float(total_norm)
+    return float(total_norm.detach().cpu().item()) if th.is_tensor(total_norm) else float(total_norm)
 
 
 def optimizer_state_dict(optimizer: Optimizer) -> Dict[str, Any]:
     """
-    Get a checkpoint-ready optimizer state dict.
+    Return a checkpoint-ready optimizer state dict.
+
+    This is a thin wrapper around ``optimizer.state_dict()`` for consistency and
+    potential future extension (e.g., filtering, compatibility transforms).
 
     Parameters
     ----------
     optimizer : torch.optim.Optimizer
+        Optimizer instance.
 
     Returns
     -------
     state : Dict[str, Any]
-        Optimizer state dict.
+        The optimizer state dict.
     """
     return optimizer.state_dict()
 
 
 def load_optimizer_state_dict(optimizer: Optimizer, state: Mapping[str, Any]) -> None:
     """
-    Load optimizer state dict from a checkpoint.
+    Load optimizer state from a checkpoint.
+
+    This is a thin wrapper around ``optimizer.load_state_dict(...)`` for
+    consistency and potential future extension (e.g., mapping devices).
 
     Parameters
     ----------
     optimizer : torch.optim.Optimizer
+        Target optimizer instance.
     state : Mapping[str, Any]
+        State dict previously produced by `optimizer_state_dict` or directly by
+        `optimizer.state_dict()`.
 
     Returns
     -------

@@ -1,93 +1,124 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Mapping
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
 from ..utils import MinimalWrapper, RunningMeanStd
-from ..utils.common_utils import to_action_np
-
+from ..utils.common_utils import _to_action_np
 
 # =============================================================================
 # Gym/Gymnasium compatibility shim
 # =============================================================================
-
 try:  # pragma: no cover
     import gymnasium as gym  # type: ignore
     BaseGymWrapper = gym.Wrapper
-    _HAS_GYMNASIUM = True
 except Exception:  # pragma: no cover
     try:
         import gym  # type: ignore
-        BaseGymWrapper = gym.Wrapper  # gym.core.Wrapper also works; gym.Wrapper is standard
-        _HAS_GYMNASIUM = False
+        BaseGymWrapper = gym.Wrapper
     except Exception:  # pragma: no cover
         gym = None  # type: ignore
         BaseGymWrapper = MinimalWrapper
-        _HAS_GYMNASIUM = False
 
 
 class NormalizeWrapper(BaseGymWrapper):
     """
     Online normalization wrapper for Gym/Gymnasium environments.
 
-    Features
+    This wrapper standardizes observations and/or rewards using running
+    statistics computed online, and optionally harmonizes action formatting
+    and time-limit semantics across Gym and Gymnasium.
+
+    Overview
     --------
-    1) Observation normalization (optional)
-       - Maintains running mean/variance (RunningMeanStd) and applies:
-         (obs - mean) / (std + eps), with optional clipping.
+    The wrapper provides four orthogonal features:
 
-    2) Reward normalization (optional)
-       - Maintains a discounted-return accumulator:
+    1. Observation normalization (optional)
+       Maintains running mean/variance via :class:`~RunningMeanStd` and applies::
+
+           obs_norm = (obs - mean) / (std + epsilon)
+
+       with optional clipping to ``[-clip_obs, clip_obs]``.
+
+    2. Reward normalization (optional)
+       Tracks a discounted return accumulator::
+
            R_t = gamma * R_{t-1} + r_t
-       - Updates return RMS from R_t (training only) and returns:
-           r_norm = r / (std(R) + eps)
-       - Optional clipping and configurable reset policy.
 
-    3) Action handling for Box-like action spaces (optional)
-       - action_rescale=True: expects actions in [-1, 1], maps to [low, high]
-       - else: clip_action > 0 clips to [low, high]
+       Updates an RMS of ``R_t`` (training only) and returns::
 
-    4) Time-limit truncation harmonization (best-effort)
-       - Gymnasium (5-tuple): uses terminated/truncated as returned, and can
-         optionally enforce max_episode_steps if provided.
-       - Gym (4-tuple): synthesizes/propagates info["TimeLimit.truncated"] and
-         can force done=True when the time limit is reached.
+           r_norm = r / (std(R) + epsilon)
+
+       with optional clipping to ``[-clip_reward, clip_reward]`` and a configurable
+       reset policy for the return accumulator.
+
+    3. Box-like action handling (optional)
+       - If ``action_rescale=True``: expects actions in ``[-1, 1]`` and maps to the
+         environment action bounds ``[low, high]``.
+       - Else, if ``clip_action > 0``: clips actions to ``[low, high]``.
+       Non-Box action spaces are passed through unchanged.
+
+    4. Time-limit truncation harmonization (best-effort)
+       - Gymnasium (5-tuple): preserves ``terminated``/``truncated`` and can optionally
+         enforce ``max_episode_steps`` if provided.
+       - Gym (4-tuple): synthesizes/propagates ``info["TimeLimit.truncated"]`` and can
+         force ``done=True`` when the time limit is reached.
 
     Parameters
     ----------
     env : Any
         Environment to wrap.
-    obs_shape : Tuple[int, ...]
-        Expected observation shape for array-like observations.
-        (Structured obs: dict/tuple/list are passed through unchanged.)
-    norm_obs : bool, optional
-        Enable observation normalization.
-    norm_reward : bool, optional
-        Enable reward normalization (use with care for off-policy).
-    clip_obs : float, optional
-        If > 0, clip normalized observations to [-clip_obs, clip_obs].
-    clip_reward : float, optional
-        If > 0, clip normalized rewards to [-clip_reward, clip_reward].
-    gamma : float, optional
-        Discount factor used in return accumulator for reward normalization.
-    epsilon : float, optional
-        Numerical stability constant.
-    training : bool, optional
-        If True, updates running stats (obs_rms / ret_rms).
-    max_episode_steps : Optional[int], optional
-        If provided, wrapper may enforce truncation at this horizon.
-    action_rescale : bool, optional
-        If True, rescale actions from [-1,1] to [low,high] for Box-like spaces.
-    clip_action : float, optional
-        If > 0 and action_rescale is False, clip actions to [low,high].
-        (Magnitude is not used; it acts as an on/off switch.)
-    reset_return_on_done : bool, optional
-        Reset discounted return accumulator when done boundary occurs.
-    reset_return_on_trunc : bool, optional
-        Reset discounted return accumulator when truncation boundary occurs.
-    obs_dtype : Any, optional
-        Dtype enforced for array-like observations (e.g., np.float32).
+    obs_shape : tuple[int, ...]
+        Expected observation shape for array-like observations. Structured observations
+        (dict/tuple/list) are passed through unchanged.
+    norm_obs : bool, default=True
+        If True, normalize array-like observations using running RMS statistics.
+    norm_reward : bool, default=False
+        If True, normalize scalar rewards using return RMS statistics. Use with care
+        in off-policy settings.
+    clip_obs : float, default=10.0
+        If > 0, clip normalized observations to ``[-clip_obs, clip_obs]``.
+    clip_reward : float, default=10.0
+        If > 0, clip normalized rewards to ``[-clip_reward, clip_reward]``.
+    gamma : float, default=0.99
+        Discount factor used for the return accumulator in reward normalization.
+    epsilon : float, default=1e-8
+        Numerical stability constant for normalization denominators.
+    training : bool, default=True
+        If True, update running statistics (obs/return RMS). If False, use frozen stats.
+    max_episode_steps : int, optional
+        If provided, the wrapper may enforce a truncation boundary at this horizon.
+        This is meant as a fallback when a TimeLimit wrapper is not present.
+    action_rescale : bool, default=False
+        If True and the action space is Box-like, rescale policy outputs in ``[-1, 1]``
+        to the environment bounds ``[low, high]``.
+    clip_action : float, default=0.0
+        If > 0 and ``action_rescale=False``, clip actions to ``[low, high]`` for Box-like
+        spaces. The magnitude is not used; this acts as an enable/disable switch.
+    reset_return_on_done : bool, default=True
+        If True, reset discounted return accumulator when an episode boundary occurs.
+    reset_return_on_trunc : bool, default=True
+        If True, reset discounted return accumulator when a time-limit truncation occurs.
+    obs_dtype : Any, default=np.float32
+        Dtype enforced for array-like observations (e.g., ``np.float32``).
+
+    Attributes
+    ----------
+    obs_rms : RunningMeanStd or None
+        Running statistics for observations, if ``norm_obs=True``.
+    ret_rms : RunningMeanStd or None
+        Running statistics for discounted returns, if ``norm_reward=True``.
+    training : bool
+        Whether running statistics are being updated.
+
+    Notes
+    -----
+    - This wrapper is intentionally "best-effort" across Gym/Gymnasium versions.
+    - Structured observations (dict/tuple/list) are not normalized by default; if you need
+      structured obs normalization, implement it upstream (e.g., a flattening wrapper).
+    - The wrapper tries to be dependency-light; it avoids relying on Gym space classes
+      directly and instead inspects attributes (low/high/shape).
     """
 
     def __init__(
@@ -111,6 +142,7 @@ class NormalizeWrapper(BaseGymWrapper):
     ) -> None:
         super().__init__(env)
 
+        # ---- observation normalization ----
         self.obs_shape = tuple(obs_shape)
         self.obs_dtype = obs_dtype
 
@@ -125,26 +157,25 @@ class NormalizeWrapper(BaseGymWrapper):
 
         self.training = bool(training)
 
-        # Running statistics
         self.obs_rms: Optional[RunningMeanStd] = RunningMeanStd(shape=self.obs_shape) if self.norm_obs else None
         self.ret_rms: Optional[RunningMeanStd] = RunningMeanStd(shape=()) if self.norm_reward else None
 
-        # Discounted return accumulator for reward normalization
+        # ---- reward normalization state ----
         self._running_return: float = 0.0
 
-        # Episode length tracking (for optional time-limit enforcement)
+        # ---- time-limit tracking (optional) ----
         self.max_episode_steps = None if max_episode_steps is None else int(max_episode_steps)
         self._ep_len: int = 0
 
-        # Action handling configuration
+        # ---- action handling ----
         self.action_rescale = bool(action_rescale)
         self.clip_action = float(clip_action)
 
-        # Reward-return reset policy
+        # ---- return reset policy ----
         self.reset_return_on_done = bool(reset_return_on_done)
         self.reset_return_on_trunc = bool(reset_return_on_trunc)
 
-        # Cache action space metadata (best-effort; dependency-free)
+        # ---- cache action space metadata (dependency-free) ----
         self._action_space = getattr(self.env, "action_space", None)
         self._is_box_action = (
             self._action_space is not None
@@ -152,6 +183,7 @@ class NormalizeWrapper(BaseGymWrapper):
             and hasattr(self._action_space, "high")
             and hasattr(self._action_space, "shape")
         )
+
         if self.action_rescale and not self._is_box_action:
             raise ValueError("action_rescale=True requires a Box-like action_space with low/high/shape.")
 
@@ -160,7 +192,14 @@ class NormalizeWrapper(BaseGymWrapper):
     # -------------------------------------------------------------------------
 
     def set_training(self, training: bool) -> None:
-        """Enable/disable running-stat updates."""
+        """
+        Set whether running statistics are updated.
+
+        Parameters
+        ----------
+        training : bool
+            If True, update running statistics (obs_rms/ret_rms). If False, keep them frozen.
+        """
         self.training = bool(training)
 
     # -------------------------------------------------------------------------
@@ -169,30 +208,36 @@ class NormalizeWrapper(BaseGymWrapper):
 
     def _format_action(self, action: Any) -> Any:
         """
-        Apply action rescaling and/or clipping for Box-like action spaces.
+        Format actions for Box-like action spaces.
 
-        Policy
-        ------
-        - If action_rescale=True:
-            * expects action in [-1, 1]
-            * maps to [low, high]
-        - Else if clip_action > 0:
-            * clips to [low, high]
-        - Non-Box actions: returned unchanged.
+        Parameters
+        ----------
+        action : Any
+            Action produced by a policy. May be a NumPy array, Python scalar,
+            torch tensor, or an array-like container.
+
+        Returns
+        -------
+        action_env : Any
+            Environment-compatible action.
+            - For Box-like spaces: returns ``np.ndarray`` of dtype ``np.float32``.
+            - Otherwise: returns the input action unchanged.
 
         Notes
         -----
-        - Uses to_action_np(...) to tolerate torch tensors / scalars.
-        - Always returns np.float32 for Box actions for consistent env interfacing.
+        - If ``action_rescale=True``, the wrapper expects policy outputs in ``[-1, 1]``.
+        - If ``clip_action > 0`` and rescaling is disabled, the wrapper clips to bounds.
+        - For Box-like spaces, this method always returns a float32 NumPy array for
+          consistent env interfacing.
         """
         if not self._is_box_action:
             return action
 
         a_shape = tuple(getattr(self._action_space, "shape", ()))
-        a = to_action_np(action, action_shape=a_shape).astype(np.float32, copy=False)
+        a = _to_action_np(action, action_shape=a_shape).astype(np.float32, copy=False)
 
-        low = np.asarray(self._action_space.low, dtype=np.float32)
-        high = np.asarray(self._action_space.high, dtype=np.float32)
+        low = np.asarray(getattr(self._action_space, "low"), dtype=np.float32)
+        high = np.asarray(getattr(self._action_space, "high"), dtype=np.float32)
 
         # Broadcast low/high to action shape if needed
         if low.shape != a.shape:
@@ -217,31 +262,36 @@ class NormalizeWrapper(BaseGymWrapper):
 
     def _normalize_obs(self, obs: Any) -> Any:
         """
-        Normalize observations (best-effort).
+        Normalize observation (best-effort).
 
-        Policy
-        ------
-        - dict/tuple/list observations are passed through unchanged.
-        - array-like observations are converted to obs_dtype.
-        - if norm_obs=True and training=True, updates obs_rms with batch dim.
-        - applies RMS normalization and optional clipping.
+        Parameters
+        ----------
+        obs : Any
+            Observation produced by the environment. If it is dict/tuple/list,
+            it is returned unchanged. If it is array-like, it is normalized when
+            ``norm_obs=True`` and the wrapper has an ``obs_rms``.
+
+        Returns
+        -------
+        obs_out : Any
+            Normalized observation for array-like inputs, or unchanged structured input.
 
         Raises
         ------
         ValueError
-            If array-like obs cannot be converted, or shape mismatches obs_shape.
+            If array-like observation cannot be converted to ndarray, or if its
+            shape differs from ``obs_shape``.
         """
         if isinstance(obs, (dict, tuple, list)):
             return obs
 
-        # No RMS: dtype enforcement only (best-effort)
         if self.obs_rms is None:
+            # dtype enforcement only (best-effort)
             try:
                 return np.asarray(obs, dtype=self.obs_dtype)
             except Exception:
                 return obs
 
-        # RMS normalization path (array-like)
         try:
             obs_np = np.asarray(obs, dtype=self.obs_dtype)
         except Exception as e:
@@ -264,35 +314,39 @@ class NormalizeWrapper(BaseGymWrapper):
         Parameters
         ----------
         reward : Any
-            Scalar reward (will be cast to float).
+            Scalar reward. Will be cast to float.
         done_flag : bool
-            True if episode boundary occurred (terminated or truncated).
+            True if an episode boundary occurred (terminated or truncated).
         truncated_flag : bool
-            True if boundary was a time-limit truncation.
+            True if the boundary was a time-limit truncation.
 
         Returns
         -------
-        float
-            Normalized reward (or raw reward if norm_reward=False).
+        reward_out : float
+            Normalized reward if enabled, otherwise the raw reward as float.
+
+        Notes
+        -----
+        - Uses a discounted return accumulator ``R_t`` to estimate return scale.
+        - RMS statistics are updated only when ``training=True``.
+        - The return accumulator reset behavior is controlled by:
+          ``reset_return_on_done`` and ``reset_return_on_trunc``.
         """
         if self.ret_rms is None:
             return float(reward)
 
         r = float(reward)
 
-        # discounted return accumulator
         self._running_return = self.gamma * self._running_return + r
-
         if self.training:
             self.ret_rms.update(np.asarray([self._running_return], dtype=np.float64))
 
-        std = float(self.ret_rms.std(eps=self.epsilon))  # scalar
+        std = float(self.ret_rms.std(eps=self.epsilon))
         r_norm = r / (std + self.epsilon)
 
         if self.clip_reward > 0.0:
             r_norm = float(np.clip(r_norm, -self.clip_reward, self.clip_reward))
 
-        # reset policy for return accumulator
         if (done_flag and self.reset_return_on_done) or (truncated_flag and self.reset_return_on_trunc):
             self._running_return = 0.0
 
@@ -304,12 +358,24 @@ class NormalizeWrapper(BaseGymWrapper):
 
     def reset(self, **kwargs) -> Any:
         """
-        Reset env and normalize initial observation.
+        Reset environment and normalize the initial observation.
+
+        Parameters
+        ----------
+        **kwargs : Any
+            Forwarded to ``env.reset(**kwargs)``. This commonly includes ``seed`` and
+            ``options`` depending on Gym/Gymnasium version.
 
         Returns
         -------
-        - Gymnasium: (obs, info)
-        - Gym: obs
+        out : Any
+            - Gymnasium: ``(obs, info)``
+            - Gym: ``obs``
+
+        Notes
+        -----
+        - Always resets the reward return accumulator and the internal episode-length counter.
+        - Normalizes the returned observation according to ``norm_obs``.
         """
         out = self.env.reset(**kwargs)
         self._running_return = 0.0
@@ -328,15 +394,29 @@ class NormalizeWrapper(BaseGymWrapper):
 
     def step(self, action: Any) -> Any:
         """
-        Step env with optional action formatting and obs/reward normalization.
+        Step environment with optional action formatting and normalization.
+
+        Parameters
+        ----------
+        action : Any
+            Policy action passed to the wrapped environment.
 
         Returns
         -------
-        - Gymnasium: (obs, reward, terminated, truncated, info)
-        - Gym: (obs, reward, done, info)
+        out : Any
+            - Gymnasium: ``(obs, reward, terminated, truncated, info)``
+            - Gym: ``(obs, reward, done, info)``
+
+        Notes
+        -----
+        - Applies action rescaling/clipping for Box-like action spaces.
+        - Normalizes observations and rewards depending on configuration.
+        - Harmonizes time-limit truncation best-effort:
+          * For Gymnasium, may set ``truncated=True`` and annotate ``info["TimeLimit.truncated"]=True``.
+          * For Gym, may force ``done=True`` and annotate ``info_out["TimeLimit.truncated"]=True``.
         """
-        action = self._format_action(action)
-        out = self.env.step(action)
+        action_env = self._format_action(action)
+        out = self.env.step(action_env)
 
         # Gymnasium: (obs, reward, terminated, truncated, info)
         if isinstance(out, tuple) and len(out) == 5:
@@ -346,18 +426,16 @@ class NormalizeWrapper(BaseGymWrapper):
 
             self._ep_len += 1
 
-            # Optional local enforcement of max_episode_steps (in case TimeLimit wrapper is absent)
-            if (
-                self.max_episode_steps is not None
-                and self._ep_len >= self.max_episode_steps
-                and (not terminated_b)
-                and (not truncated_b)
-                and (not bool(dict(info).get("TimeLimit.truncated", False)))
-            ):
-                truncated_b = True
-                truncated = True
-                info = dict(info)
-                info["TimeLimit.truncated"] = True
+            # Optional local enforcement of max_episode_steps
+            if self.max_episode_steps is not None and self._ep_len >= self.max_episode_steps:
+                if (not terminated_b) and (not truncated_b):
+                    # Don't override an existing TimeLimit signal if present
+                    info_map = dict(info)
+                    if not bool(info_map.get("TimeLimit.truncated", False)):
+                        truncated_b = True
+                        truncated = True
+                        info_map["TimeLimit.truncated"] = True
+                        info = info_map
 
             done_flag = terminated_b or truncated_b
             truncated_flag = truncated_b or bool(dict(info).get("TimeLimit.truncated", False))
@@ -377,13 +455,13 @@ class NormalizeWrapper(BaseGymWrapper):
         self._ep_len += 1
         info_out: Dict[str, Any] = dict(info) if isinstance(info, Mapping) else {"info": info}
 
-        # Synthesize/normalize TimeLimit.truncated when max_episode_steps is provided.
         truncated_flag = bool(info_out.get("TimeLimit.truncated", False))
+
+        # Optional local enforcement of max_episode_steps
         if self.max_episode_steps is not None and self._ep_len >= self.max_episode_steps and not truncated_flag:
             truncated_flag = True
             info_out["TimeLimit.truncated"] = True
-
-            # Force episode boundary for Gym 4-tuple to keep semantics consistent
+            # Gym (4-tuple) has no explicit truncated; force boundary to be explicit in `done`.
             if not done_b:
                 done = True
                 done_b = True
@@ -402,12 +480,21 @@ class NormalizeWrapper(BaseGymWrapper):
 
     def state_dict(self) -> Dict[str, Any]:
         """
-        Serialize wrapper state (stats + relevant configuration).
+        Serialize wrapper state (running statistics + relevant configuration).
+
+        Returns
+        -------
+        state : Dict[str, Any]
+            JSON-like Python dict that can be used for checkpointing. Contains:
+            - scalar hyperparameters (gamma, epsilon, clipping, etc.)
+            - episode-length counters and return accumulator
+            - action formatting options
+            - running statistics state for obs and returns when enabled
 
         Notes
         -----
-        - `obs_dtype` is stored as a NumPy dtype string (e.g., 'float32').
-        - `obs_shape` is stored for sanity/debug; load_state_dict does not override it.
+        - ``obs_dtype`` is stored as a NumPy dtype name (e.g., ``"float32"``).
+        - ``obs_shape`` is stored for sanity/debug; load_state_dict does not override it.
         """
         state: Dict[str, Any] = {
             "obs_shape": self.obs_shape,
@@ -438,18 +525,23 @@ class NormalizeWrapper(BaseGymWrapper):
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         """
-        Restore wrapper state.
+        Restore wrapper state from a checkpoint payload.
 
-        Policy
-        ------
-        - Does not override obs_shape.
-        - Restores scalar hyperparameters and normalization stats when enabled.
-        - Restores obs_dtype from a NumPy dtype name when possible.
+        Parameters
+        ----------
+        state : Dict[str, Any]
+            State dict produced by :meth:`state_dict`.
+
+        Notes
+        -----
+        - Does not override ``obs_shape`` (the wrapper is assumed to be constructed correctly).
+        - Restores running stats only if the wrapper was constructed with normalization enabled.
+        - Restores ``obs_dtype`` from the stored NumPy dtype name when possible.
         """
         self._running_return = float(state.get("running_return", 0.0))
         self._ep_len = int(state.get("ep_len", 0))
 
-        # Restore scalar hyperparameters (best-effort; keep current if missing)
+        # Scalar hyperparameters (best-effort)
         if "clip_obs" in state:
             self.clip_obs = float(state["clip_obs"])
         if "clip_reward" in state:
@@ -461,14 +553,14 @@ class NormalizeWrapper(BaseGymWrapper):
         if "training" in state:
             self.training = bool(state["training"])
 
-        # Restore dtype
+        # dtype restore
         if "obs_dtype" in state:
             try:
                 self.obs_dtype = np.dtype(str(state["obs_dtype"])).type
             except Exception:
                 pass
 
-        # Restore added configs
+        # additional configs
         if "max_episode_steps" in state:
             v = state["max_episode_steps"]
             self.max_episode_steps = None if v is None else int(v)
@@ -482,7 +574,7 @@ class NormalizeWrapper(BaseGymWrapper):
         if "reset_return_on_trunc" in state:
             self.reset_return_on_trunc = bool(state["reset_return_on_trunc"])
 
-        # Restore running stats (only if the wrapper was constructed with them enabled)
+        # running statistics (only if enabled at construction time)
         if self.obs_rms is not None and "obs_rms" in state:
             self.obs_rms.load_state_dict(state["obs_rms"])
         if self.ret_rms is not None and "ret_rms" in state:

@@ -1,45 +1,75 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Deque, Sequence, List, Mapping
 from collections import deque
-import math
+from typing import Any, Deque, Dict, List, Mapping, Optional
 
 from .base_callback import BaseCallback
-from ..utils.log_utils import log
-from ..utils.callback_utils import infer_step
+from ..utils.callback_utils import _infer_step
+from ..utils.common_utils import _is_sequence, _mean, _std
 
 
 class EpisodeStatsCallback(BaseCallback):
     """
-    Episode-level statistics from step transitions (framework-agnostic).
+    Episode-level statistics reconstructed from per-step transitions (framework-agnostic).
 
-    This callback consumes per-step `transition` payloads (best-effort) and logs
+    This callback consumes per-step transition payloads (best-effort) and logs
     episode metrics such as return, length, and truncation rate.
 
-    Key capability
-    --------------
-    - Single-env (B=1): accurately reconstructs episodic return/length by accumulating
-      reward until `done=True`.
-    - Batched env (B>1): without per-env episode summaries (like per-env return/len),
-      accurate reconstruction is generally impossible. In that case, this callback
-      logs only conservative batch-level completion/truncation signals.
+    Key capabilities
+    ----------------
+    **Single environment (B=1):**
+        Accurately reconstructs episodic return and episode length by accumulating
+        reward until ``done=True`` is observed.
+
+    **Vectorized/batched environments (B>1):**
+        Without per-environment running accumulators (or explicit per-env episode
+        summaries), accurate episodic return/length reconstruction is generally
+        impossible because each environment has independent episode boundaries.
+        In that case, this callback logs only conservative, step-local signals.
+
+    Parameters
+    ----------
+    window:
+        Rolling window size (in episodes) for computing aggregate statistics.
+        If ``window <= 0``, rolling buffers become unbounded (not recommended for
+        long runs).
+    log_every_episodes:
+        Log aggregate statistics every N finished episodes. If ``<= 0``, aggregate
+        logging is disabled.
+    log_prefix:
+        Prefix passed to :meth:`BaseCallback.log` for all metrics emitted by this
+        callback (e.g., ``"rollout/"`` or ``"train/"``).
+    log_raw_episode:
+        If True, log per-episode raw values for each finished episode (can be noisy).
 
     Logged metrics
     --------------
-    Single-env (accurate):
-      - (optional raw) episode/return, episode/len, episode/truncated
-      - rolling window aggregates:
-          return_mean, return_std, len_mean, trunc_rate
+    Single-env path (accurate):
+        Optionally per episode:
+        - ``episode/return``
+        - ``episode/len``
+        - ``episode/truncated``
+        - ``episode/count``
 
-    Batched env limitation (conservative):
-      - episode/batched_done_count       : number of envs finishing at the step
-      - episode/batched_trunc_rate       : truncation rate among finished envs only
+        Aggregates over the rolling window:
+        - ``return_mean``, ``return_std``
+        - ``len_mean``
+        - ``trunc_rate``
+        - ``episodes_window``, ``episodes_total``
+
+    Batched path (conservative):
+        Step-local metrics only (emitted when at least one env finishes at the step):
+        - ``episode/batched_done_count``:
+            number of envs that finished at the step (count of ``done=True``)
+        - ``episode/batched_trunc_rate``:
+            truncation rate among those finished envs only
 
     Notes
     -----
-    - This callback intentionally avoids numpy dependency and implements small math
-      utilities in pure Python.
-    - Truncation is inferred best-effort from typical Gym/Gymnasium info keys.
+    - Truncation is inferred best-effort from common Gym/Gymnasium conventions:
+      ``info["TimeLimit.truncated"]`` or ``info["truncated"]``.
+    - The callback avoids hard dependency on numpy; it relies on simple utilities
+      (``mean``, ``std``) from your ``common_utils``.
     """
 
     # =========================================================================
@@ -49,22 +79,44 @@ class EpisodeStatsCallback(BaseCallback):
         """
         Normalized step transition representation.
 
-        The goal is to map heterogeneous trainer/env step payloads into one
-        consistent interface.
+        This class maps heterogeneous transition payload formats into a consistent
+        interface that downstream logic can consume without branching on trainer/env
+        conventions.
 
-        Fields
-        ------
-        rewards   : List[float]  (len=B)
-        dones     : List[bool]   (len=B)   (done = terminated OR truncated)
-        truncated : List[bool]   (len=B)   best-effort inference
-        infos     : List[Any]    (len=B)   raw info payloads (if provided)
-        is_batched: bool         indicates the original payload appeared batched
+        Parameters
+        ----------
+        rewards:
+            Rewards as a list of floats (length B).
+        dones:
+            Done flags as a list of bools (length B). Here, ``done`` corresponds to
+            episode end (terminated OR truncated).
+        truncated:
+            Truncation flags as a list of bools (length B), inferred best-effort.
+        infos:
+            Raw info payloads aligned to length B (may contain dict-like objects).
+        is_batched:
+            Whether the original payload appears batched (vectorized).
 
-        Single-env example:
-          rewards=[r], dones=[done], truncated=[trunc], infos=[info]
+        Attributes
+        ----------
+        rewards:
+            Reward list (length B).
+        dones:
+            Done list (length B).
+        truncated:
+            Truncated list (length B).
+        infos:
+            Info list (length B).
+        is_batched:
+            Boolean indicating batched origin.
 
-        Batched env example:
-          rewards=[r0, r1, ...], dones=[d0, d1, ...], truncated=[t0, t1, ...]
+        Examples
+        --------
+        Single-env:
+            ``rewards=[r]``, ``dones=[done]``, ``truncated=[trunc]``, ``infos=[info]``
+
+        Batched env:
+            ``rewards=[r0, r1, ...]``, ``dones=[d0, d1, ...]``, ``truncated=[t0, t1, ...]``
         """
 
         def __init__(
@@ -90,102 +142,48 @@ class EpisodeStatsCallback(BaseCallback):
         log_prefix: str = "rollout/",
         log_raw_episode: bool = False,
     ) -> None:
-        # Rolling window size used for mean/std aggregation.
         self.window = int(window)
-
-        # Aggregate metrics are logged every N episodes (0 disables aggregate logging).
         self.log_every_episodes = int(log_every_episodes)
-
-        # Prefix for all logged keys to keep namespaces clean.
         self.log_prefix = str(log_prefix)
-
-        # If True, log per-episode raw values for each finished episode.
-        # (Can be noisy but useful for debugging.)
         self.log_raw_episode = bool(log_raw_episode)
 
-        # ---------------------------------------------------------------------
-        # Single-env episodic accumulators (only valid/used in single-env path).
-        # ---------------------------------------------------------------------
+        # Single-env accumulators (used only in the single-env path).
         self._ep_return: float = 0.0
         self._ep_len: int = 0
         self._ep_count: int = 0
 
-        # Rolling buffers for aggregates. maxlen=None => unbounded (not recommended).
         maxlen = self.window if self.window > 0 else None
         self._returns: Deque[float] = deque(maxlen=maxlen)
         self._lengths: Deque[int] = deque(maxlen=maxlen)
         self._trunc_flags: Deque[int] = deque(maxlen=maxlen)  # 1 if truncated else 0
 
     # =========================================================================
-    # Small utility helpers (avoid numpy dependency)
-    # =========================================================================
-    @staticmethod
-    def _is_sequence(x: Any) -> bool:
-        """Return True if x looks like a list/tuple."""
-        return isinstance(x, (list, tuple))
-
-    @staticmethod
-    def _to_float(x: Any, default: float = 0.0) -> float:
-        """Best-effort float conversion with fallback."""
-        try:
-            return float(x)
-        except Exception:
-            return default
-
-    @staticmethod
-    def _to_bool(x: Any, default: bool = False) -> bool:
-        """Best-effort bool conversion with fallback."""
-        try:
-            return bool(x)
-        except Exception:
-            return default
-
-    @staticmethod
-    def _mean(xs: Sequence[float]) -> float:
-        """Safe mean for empty sequences."""
-        if not xs:
-            return 0.0
-        return float(sum(xs) / len(xs))
-
-    @staticmethod
-    def _std(xs: Sequence[float]) -> float:
-        """
-        Population standard deviation (ddof=0).
-
-        Notes
-        -----
-        - For small windows, population std is a stable choice.
-        - Returns 0.0 for n<=1 to avoid divide-by-zero.
-        """
-        n = len(xs)
-        if n <= 1:
-            return 0.0
-        m = sum(xs) / n
-        var = sum((x - m) * (x - m) for x in xs) / n
-        return float(math.sqrt(var))
-
-    # =========================================================================
-    # Truncation inference from info payload
+    # Truncation inference
     # =========================================================================
     def _infer_truncated_from_info(self, info: Any) -> bool:
         """
-        Best-effort truncation detection from info-like objects.
+        Infer truncation status from an ``info`` payload (best-effort).
 
-        Gym/Gymnasium conventions:
-        - Gym: may store "TimeLimit.truncated" in info.
-        - Some wrappers: may store "truncated" boolean.
+        Gym/Gymnasium conventions include:
+        - ``info["TimeLimit.truncated"]`` (Gym TimeLimit wrapper)
+        - ``info["truncated"]`` (some wrappers / custom envs)
 
-        If info is not dict-like or missing expected keys, returns False.
+        Parameters
+        ----------
+        info:
+            Info-like object (typically dict-like). If not dict-like or missing
+            expected keys, returns False.
+
+        Returns
+        -------
+        bool
+            True if truncation is inferred; otherwise False.
         """
         try:
             if info is None:
                 return False
-            d = dict(info)  # may raise if info isn't dict-like
-            if self._to_bool(d.get("TimeLimit.truncated", False)):
-                return True
-            if self._to_bool(d.get("truncated", False)):
-                return True
-            return False
+            d = dict(info)  # may raise if not dict-like
+            return bool(d.get("TimeLimit.truncated", False) or d.get("truncated", False))
         except Exception:
             return False
 
@@ -194,20 +192,32 @@ class EpisodeStatsCallback(BaseCallback):
     # =========================================================================
     def _ensure_list(self, x: Any, *, n: int, default: Any) -> List[Any]:
         """
-        Broadcast or coerce `x` into a list of length n.
+        Broadcast or coerce ``x`` into a list of length ``n``.
 
         Rules
         -----
-        - If x is a list/tuple:
-            * If len == n: return as list
-            * If len < n: pad with `default`
-            * If len > n: truncate to n
-        - Else:
-            * Broadcast scalar to length n (using default for None)
+        - If ``x`` is a sequence (list/tuple/etc. per ``is_sequence``):
+            - If ``len(x) == n``: return as list
+            - If ``len(x) < n``: pad with ``default``
+            - If ``len(x) > n``: truncate to ``n``
+        - Otherwise:
+            - Broadcast scalar to length ``n`` (if ``x is None`` use ``default``)
 
-        This lets us align fields (terminated/truncated/infos) to B = batch size.
+        Parameters
+        ----------
+        x:
+            Value to coerce or broadcast.
+        n:
+            Target length.
+        default:
+            Padding / broadcast value when missing.
+
+        Returns
+        -------
+        List[Any]
+            List of length ``n``.
         """
-        if self._is_sequence(x):
+        if _is_sequence(x):
             xs = list(x)
             if len(xs) == n:
                 return xs
@@ -218,97 +228,92 @@ class EpisodeStatsCallback(BaseCallback):
 
     def _normalize_transition(self, transition: Mapping[str, Any]) -> Optional[_NormalizedTransition]:
         """
-        Normalize heterogeneous trainer transition payloads.
+        Normalize a heterogeneous transition payload into a consistent representation.
 
         Supported input patterns
         ------------------------
         Single-env:
-          - {"reward": r, "done": done, "info": info}
-          - {"reward": r, "terminated": term, "truncated": trunc, "info": info}
+            - ``{"reward": r, "done": done, "info": info}``
+            - ``{"reward": r, "terminated": term, "truncated": trunc, "info": info}``
 
         Batched env:
-          - {"rewards": [...], "dones": [...], "infos": [...]}
-          - {"rewards": [...], "terminated": [...], "truncated": [...], "infos": [...]}
-          - Mixed cases with scalar reward but vector info/infos (best-effort)
+            - ``{"rewards": [...], "dones": [...], "infos": [...]}``
+            - ``{"rewards": [...], "terminated": [...], "truncated": [...], "infos": [...]}``
+            - Mixed cases are handled best-effort.
 
-        Output
-        ------
-        Returns a _NormalizedTransition with aligned lists of length B.
+        Output semantics
+        ----------------
+        - The output lists have length ``B`` (batch size), inferred primarily from
+          the reward vector length.
+        - ``done`` is interpreted as ``terminated OR truncated`` when both are present.
+        - ``truncated`` is refined using info keys such as ``TimeLimit.truncated``.
 
-        Returns None if transition is empty/unusable.
+        Parameters
+        ----------
+        transition:
+            Dict-like mapping containing step results.
+
+        Returns
+        -------
+        Optional[_NormalizedTransition]
+            Normalized transition, or None if the payload is empty/unusable.
         """
         if not transition:
             return None
 
-        # Common plural keys (vectorized envs)
         rewards = transition.get("rewards", None)
         dones = transition.get("dones", None)
         infos = transition.get("infos", None)
 
-        # Gymnasium style (terminated/truncated)
         terminated = transition.get("terminated", None)
         truncated = transition.get("truncated", None)
 
-        # Decide "batched" based on whether key fields are sequences.
         is_batched = (
-            self._is_sequence(rewards)
-            or self._is_sequence(dones)
-            or self._is_sequence(terminated)
-            or self._is_sequence(truncated)
+            _is_sequence(rewards)
+            or _is_sequence(dones)
+            or _is_sequence(terminated)
+            or _is_sequence(truncated)
         )
 
-        # --- rewards ---
-        # Prefer "rewards" list if present; else fall back to scalar "reward".
-        if self._is_sequence(rewards):
-            r_list = [self._to_float(x, 0.0) for x in rewards]
+        # ---- rewards (anchor for batch size B) ----
+        if _is_sequence(rewards):
+            r_list = [float(x) for x in rewards]
         else:
-            r_list = [self._to_float(transition.get("reward", 0.0), 0.0)]
+            r_list = [float(transition.get("reward", 0.0))]
 
-        # Batch size B is determined by rewards list length (primary anchor).
         B = len(r_list)
 
-        # --- dones + truncated ---
-        # Priority:
-        # 1) explicit dones list (already combined done flags)
-        # 2) terminated/truncated lists combined (done = terminated OR truncated)
-        # 3) scalar done or scalar terminated|truncated broadcast to B
-        if self._is_sequence(dones):
-            d_list = [self._to_bool(x) for x in dones]
-            # Start truncated flags as False; refine later using "truncated"/info.
+        # ---- dones + truncated flags ----
+        if _is_sequence(dones):
+            d_list = [bool(x) for x in dones]
             trunc_list = [False] * len(d_list)
         else:
-            if self._is_sequence(terminated) or self._is_sequence(truncated):
+            if _is_sequence(terminated) or _is_sequence(truncated):
                 term_list = self._ensure_list(terminated, n=B, default=False)
                 tru_list = self._ensure_list(truncated, n=B, default=False)
-                term_b = [self._to_bool(x) for x in term_list]
-                tru_b = [self._to_bool(x) for x in tru_list]
+                term_b = [bool(x) for x in term_list]
+                tru_b = [bool(x) for x in tru_list]
                 d_list = [t or tr for t, tr in zip(term_b, tru_b)]
                 trunc_list = list(tru_b)
             else:
-                # Scalar fallback: use "done" if available, else combine scalar terminated/truncated.
                 done_single = transition.get("done", None)
                 if done_single is None and (terminated is not None or truncated is not None):
-                    done_single = self._to_bool(terminated) or self._to_bool(truncated)
+                    done_single = bool(terminated) or bool(truncated)
 
-                d_list = [self._to_bool(done_single, default=False)] * B
-                trunc_list = (
-                    [self._to_bool(truncated, default=False)] * B
-                    if truncated is not None
-                    else [False] * B
-                )
+                d_list = [bool(done_single)] * B
+                trunc_list = [bool(truncated)] * B if truncated is not None else [False] * B
 
-        # --- infos ---
-        # Prefer plural infos; else fall back to scalar info, broadcast to B.
+        # ---- infos ----
         if infos is None:
             info_alt = transition.get("info", None)
-            if self._is_sequence(info_alt):
+            if _is_sequence(info_alt):
                 infos_list = list(info_alt)
             else:
                 infos_list = [info_alt] * B
         else:
             infos_list = self._ensure_list(infos, n=B, default=None)
 
-        # Refine truncation flags using info fields (TimeLimit.truncated, etc.).
+        # Refine truncation using info (TimeLimit.truncated, etc.).
         trunc_from_info = [self._infer_truncated_from_info(infos_list[i]) for i in range(B)]
         trunc_list = [bool(trunc_list[i]) or bool(trunc_from_info[i]) for i in range(B)]
 
@@ -325,21 +330,36 @@ class EpisodeStatsCallback(BaseCallback):
     # =========================================================================
     def _record_episode(self, trainer: Any, ep_return: float, ep_len: int, truncated: bool) -> None:
         """
-        Commit a finished episode into rolling buffers and emit logs (raw + aggregates).
+        Commit a finished episode into rolling buffers and emit logs.
 
-        This is called only when we can accurately reconstruct episode boundaries,
-        i.e., the single-env path where we accumulate reward/len until done.
+        This method is used only in the single-env path where we can accurately
+        reconstruct episode boundaries by accumulating reward and length until
+        ``done=True``.
+
+        Parameters
+        ----------
+        trainer:
+            Trainer object (duck-typed), used only for logging.
+        ep_return:
+            Episode return (sum of rewards over the episode).
+        ep_len:
+            Episode length (number of environment steps in the episode).
+        truncated:
+            Whether the episode ended via truncation (best-effort).
+
+        Notes
+        -----
+        - Rolling buffers are bounded by ``window`` (unless ``window <= 0``).
+        - Aggregate statistics are emitted every ``log_every_episodes`` episodes.
         """
         self._ep_count += 1
 
-        # Store into rolling buffers (bounded by `window`).
         self._returns.append(float(ep_return))
         self._lengths.append(int(ep_len))
         self._trunc_flags.append(1 if truncated else 0)
 
-        # Optional: log raw per-episode sample (can be high-frequency).
         if self.log_raw_episode:
-            log(
+            self.log(
                 trainer,
                 {
                     "episode/return": float(ep_return),
@@ -347,14 +367,10 @@ class EpisodeStatsCallback(BaseCallback):
                     "episode/truncated": 1.0 if truncated else 0.0,
                     "episode/count": float(self._ep_count),
                 },
-                step=infer_step(trainer),
+                step=_infer_step(trainer),
                 prefix=self.log_prefix,
             )
 
-        # Periodic aggregates over rolling window:
-        # - return_mean/std over recent episodes
-        # - len_mean over recent episodes
-        # - trunc_rate as fraction of truncated episodes in window
         if (
             self.log_every_episodes > 0
             and (self._ep_count % self.log_every_episodes) == 0
@@ -364,17 +380,17 @@ class EpisodeStatsCallback(BaseCallback):
             lens = [float(x) for x in self._lengths]
             tr = [float(x) for x in self._trunc_flags]
 
-            log(
+            self.log(
                 trainer,
                 {
-                    "return_mean": self._mean(rets),
-                    "return_std": self._std(rets),
-                    "len_mean": self._mean(lens),
-                    "trunc_rate": self._mean(tr),
+                    "return_mean": _mean(rets),
+                    "return_std": _std(rets),
+                    "len_mean": _mean(lens),
+                    "trunc_rate": _mean(tr),
                     "episodes_window": int(len(self._returns)),
                     "episodes_total": float(self._ep_count),
                 },
-                step=infer_step(trainer),
+                step=_infer_step(trainer),
                 prefix=self.log_prefix,
             )
 
@@ -385,9 +401,28 @@ class EpisodeStatsCallback(BaseCallback):
         """
         Consume one environment step transition.
 
-        - Normalizes the transition into unified representation
-        - If batched: logs conservative batch-level done/trunc stats only
-        - If single-env: accumulates reward/len until done, then records episode
+        Parameters
+        ----------
+        trainer:
+            Trainer object (duck-typed), used for logging.
+        transition:
+            Step transition payload produced by the training loop (best-effort).
+            Expected to contain some combination of reward/done/info fields
+            (single-env or batched).
+
+        Returns
+        -------
+        bool
+            Always True (this callback never requests early stop).
+
+        Notes
+        -----
+        Processing:
+        - Normalizes the transition into a unified representation.
+        - If batched (B>1): logs conservative batch-level completion/truncation
+          signals only.
+        - If single-env (B==1): accumulates episode return/length until done,
+          then records the finished episode and resets accumulators.
         """
         if not transition:
             return True
@@ -398,41 +433,24 @@ class EpisodeStatsCallback(BaseCallback):
 
         # ---------------------------------------------------------------------
         # Batched path (conservative):
-        #
-        # In vectorized envs, `transition` often contains per-env rewards/dones.
-        # However, without per-env accumulators (or explicit per-env episode return/len),
-        # we cannot reconstruct episodic return/len correctly because each env has its
-        # own episode boundaries and partial sums.
-        #
-        # Therefore:
-        # - Count how many envs finished at this step
-        # - Compute truncation rate among the finished envs only
         # ---------------------------------------------------------------------
         if nt.is_batched and len(nt.rewards) > 1:
             finished = [i for i, d in enumerate(nt.dones) if d]
             if finished:
                 truncs = [1.0 if nt.truncated[i] else 0.0 for i in finished]
-                log(
+                self.log(
                     trainer,
                     {
                         "episode/batched_done_count": float(len(finished)),
-                        "episode/batched_trunc_rate": self._mean(truncs) if truncs else 0.0,
+                        "episode/batched_trunc_rate": _mean(truncs) if truncs else 0.0,
                     },
-                    step=infer_step(trainer),
+                    step=_infer_step(trainer),
                     prefix=self.log_prefix,
                 )
             return True
 
         # ---------------------------------------------------------------------
         # Single-env path (accurate):
-        #
-        # Maintain running sums:
-        #   ep_return += reward
-        #   ep_len    += 1
-        #
-        # When done=True:
-        #   - commit episode stats
-        #   - reset accumulators for next episode
         # ---------------------------------------------------------------------
         r = float(nt.rewards[0]) if nt.rewards else 0.0
         done = bool(nt.dones[0]) if nt.dones else False
@@ -446,7 +464,7 @@ class EpisodeStatsCallback(BaseCallback):
 
         self._record_episode(trainer, self._ep_return, self._ep_len, trunc)
 
-        # Reset for next episode
+        # Reset accumulators for the next episode.
         self._ep_return = 0.0
         self._ep_len = 0
         return True

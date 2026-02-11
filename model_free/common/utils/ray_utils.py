@@ -6,29 +6,32 @@ import importlib
 
 try:
     import ray  # type: ignore
-except Exception:  # pragma: no cover
-    # Ray is an optional dependency. This module must remain importable without it.
-    ray = None
+except Exception:
+    ray = None  # type: ignore
 
 import torch.nn as nn
 
-from .common_utils import to_cpu_state_dict
+from .common_utils import _to_cpu_state_dict
 
 
 # =============================================================================
 # Entrypoint-based policy factory
 # =============================================================================
-
 @dataclass(frozen=True)
 class PolicyFactorySpec:
     """
     Pure-Python description of how to build a worker-side policy.
 
+    This is designed for distributed execution (e.g., Ray workers) where you
+    cannot ship live Python function objects or nn.Modules reliably, but you can
+    ship a string entrypoint + simple kwargs and re-create the object in the worker
+    process.
+
     Parameters
     ----------
     entrypoint : str
-        Factory entrypoint in the form "package.module:function_name".
-        The target must be importable on Ray workers and must be a top-level
+        Factory entrypoint in the form ``"package.module:function_name"``.
+        The target must be importable on remote workers and must be a top-level
         function (not a nested function or lambda).
     kwargs : Dict[str, Any]
         Keyword arguments passed to the factory.
@@ -39,33 +42,39 @@ class PolicyFactorySpec:
         Do NOT include:
           - torch.Tensor
           - nn.Module
-          - th.device
+          - torch.device
           - CUDA storages / non-serializable handles
     """
     entrypoint: str
     kwargs: Dict[str, Any]
 
 
-def make_entrypoint(fn: Callable[..., Any]) -> str:
+def _make_entrypoint(fn: Callable[..., Any]) -> str:
     """
-    Convert a top-level function to an entrypoint string "module:function".
+    Convert a top-level function into an entrypoint string.
 
     Parameters
     ----------
     fn : Callable[..., Any]
-        Top-level function.
+        A *top-level* function object.
 
     Returns
     -------
     entrypoint : str
-        Entrypoint string.
+        Entrypoint string in the form ``"module:function"``.
 
     Raises
     ------
     TypeError
         If `fn` is not callable.
     ValueError
-        If `fn` is not a top-level function or module/name cannot be inferred.
+        If module/name cannot be inferred, or if `fn` is not a top-level function.
+
+    Notes
+    -----
+    Ray workers must be able to import the factory by name. Nested functions have
+    qualnames containing ``"<locals>"`` and cannot be imported by module attribute
+    access. This function rejects nested functions accordingly.
     """
     if not callable(fn):
         raise TypeError("fn must be callable")
@@ -77,7 +86,6 @@ def make_entrypoint(fn: Callable[..., Any]) -> str:
     if not mod or not qual or not name:
         raise ValueError("Cannot infer module/qualname/name for entrypoint.")
 
-    # Ray workers must import it; nested functions cannot be imported by name.
     if "<locals>" in qual:
         raise ValueError(
             "Entrypoint must be a top-level function (not nested). "
@@ -87,33 +95,40 @@ def make_entrypoint(fn: Callable[..., Any]) -> str:
     return f"{mod}:{name}"
 
 
-def resolve_entrypoint(entrypoint: str) -> Callable[..., Any]:
+def _resolve_entrypoint(entrypoint: str) -> Callable[..., Any]:
     """
-    Resolve "package.module:function_name" to a callable.
+    Resolve an entrypoint string ``"package.module:function_name"`` to a callable.
 
     Parameters
     ----------
     entrypoint : str
-        Entrypoint string.
+        Entrypoint string of the form ``"module:function"``.
 
     Returns
     -------
     fn : Callable[..., Any]
-        Resolved callable.
+        Resolved callable object.
 
     Raises
     ------
     ValueError
-        If format is invalid.
+        If `entrypoint` format is invalid (missing/empty module or function token).
     ImportError
         If the module cannot be imported.
     AttributeError
-        If the function is missing in the module.
+        If the function name does not exist in the module.
     TypeError
         If the resolved object is not callable.
+
+    Notes
+    -----
+    This function does not validate the callable signature; it only resolves and
+    checks `callable(obj)`.
     """
     if ":" not in entrypoint:
-        raise ValueError(f"Invalid entrypoint format: {entrypoint!r} (expected 'module:function')")
+        raise ValueError(
+            f"Invalid entrypoint format: {entrypoint!r} (expected 'module:function')"
+        )
 
     mod_name, fn_name = entrypoint.split(":", 1)
     if not mod_name or not fn_name:
@@ -128,26 +143,34 @@ def resolve_entrypoint(entrypoint: str) -> Callable[..., Any]:
     return obj
 
 
-def build_policy_from_spec(spec: PolicyFactorySpec) -> nn.Module:
+def _build_policy_from_spec(spec: PolicyFactorySpec) -> nn.Module:
     """
     Build a policy module from a PolicyFactorySpec.
 
     Parameters
     ----------
     spec : PolicyFactorySpec
-        Factory spec.
+        Factory spec describing how to build the policy.
 
     Returns
     -------
     policy : nn.Module
-        Instantiated policy, moved to CPU and set to eval mode.
+        Instantiated policy module moved to CPU and set to eval() mode.
 
     Raises
     ------
     TypeError
-        If the factory does not return an nn.Module.
+        If the factory does not return an `nn.Module`.
+    ImportError, AttributeError, ValueError
+        Propagated from `_resolve_entrypoint` if the entrypoint cannot be resolved.
+
+    Notes
+    -----
+    CPU+eval is a conservative default for worker-side usage:
+      - avoids accidental GPU allocation on remote workers
+      - avoids training-mode stochasticity (dropout, batchnorm updates) by default
     """
-    fn = resolve_entrypoint(spec.entrypoint)
+    fn = _resolve_entrypoint(spec.entrypoint)
     policy = fn(**dict(spec.kwargs))
 
     if not isinstance(policy, nn.Module):
@@ -156,7 +179,6 @@ def build_policy_from_spec(spec: PolicyFactorySpec) -> nn.Module:
             f"Got: {type(policy)} from entrypoint={spec.entrypoint!r}"
         )
 
-    # Worker-safe default: CPU + eval
     policy = policy.to("cpu")
     policy.eval()
     return policy
@@ -165,8 +187,33 @@ def build_policy_from_spec(spec: PolicyFactorySpec) -> nn.Module:
 # =============================================================================
 # Activation function resolver
 # =============================================================================
-
 def _normalize_activation_name(name: str) -> str:
+    """
+    Normalize an activation name token into a registry key.
+
+    Parameters
+    ----------
+    name : str
+        Input activation name string. Examples:
+        - "torch.nn.ReLU"
+        - "nn.LeakyReLU"
+        - "Leaky ReLU"
+        - "gaussian-action" (generally for config parsing, though not an activation)
+
+    Returns
+    -------
+    key : str
+        Normalized key, lowercased with separators unified.
+
+    Notes
+    -----
+    Normalization rules:
+      - Strip known prefixes: "torch.nn.", "nn."
+      - Lowercase
+      - Convert "-" and "." to underscores where relevant
+      - Remove spaces
+      - Keep underscores to support common aliases
+    """
     n = name.strip()
     if n.startswith("torch.nn."):
         n = n[len("torch.nn.") :]
@@ -178,30 +225,49 @@ def _normalize_activation_name(name: str) -> str:
     return key
 
 
-def resolve_activation_fn(act: Any, *, default: Type[nn.Module] = nn.ReLU) -> Type[nn.Module]:
+def _resolve_activation_fn(act: Any, *, default: Type[nn.Module] = nn.ReLU) -> Type[nn.Module]:
     """
-    Resolve activation spec to an nn.Module class (not instance).
+    Resolve an activation specification to an `nn.Module` **class** (not an instance).
 
     Parameters
     ----------
     act : Any
-        One of:
-        - None: returns `default`
-        - nn.Module subclass: returned as-is
-        - nn.Module instance: returns its class
-        - str: class name or alias (e.g., "relu", "torch.nn.ReLU", "LeakyReLU")
+        Activation specification. Supported inputs:
+        - None:
+            Return `default`.
+        - nn.Module subclass:
+            Return as-is.
+        - nn.Module instance:
+            Return `instance.__class__`.
+        - str:
+            A class name or alias (e.g., "relu", "torch.nn.ReLU", "LeakyReLU",
+            "Leaky ReLU", "swish").
     default : Type[nn.Module], default=nn.ReLU
-        Default activation if act is None.
+        Default activation if `act` is None.
 
     Returns
     -------
     cls : Type[nn.Module]
-        Activation module class.
+        Activation module class (e.g., `nn.ReLU`, `nn.SiLU`, ...).
 
     Raises
     ------
     ValueError
-        If `act` cannot be resolved to an nn.Module subclass.
+        If `act` cannot be resolved to an `nn.Module` subclass.
+    TypeError
+        If the resolved object is not an `nn.Module` subclass.
+
+    Notes
+    -----
+    Returning a class (not an instance) is convenient for MLP builders that want to
+    create fresh activations per layer:
+
+        act_cls = _resolve_activation_fn("silu")
+        layers.append(act_cls())
+
+    The resolver tries:
+      1) a canonical alias registry
+      2) attribute lookup on `torch.nn` using the raw name token
     """
     if act is None:
         return default
@@ -264,10 +330,9 @@ def resolve_activation_fn(act: Any, *, default: Type[nn.Module] = nn.ReLU) -> Ty
 
         cls = registry.get(canonical, None)
 
-        # Fallback: try attribute on torch.nn with the *original* tokenized name
+        # Fallback: try attribute on torch.nn with the raw final token
         if cls is None:
-            # attempt with "ReLU", "LeakyReLU", etc.
-            raw = act.strip().split(".")[-1]
+            raw = act.strip().split(".")[-1]  # e.g., "ReLU", "LeakyReLU"
             cls = getattr(nn, raw, None)
 
         if cls is None:
@@ -275,7 +340,7 @@ def resolve_activation_fn(act: Any, *, default: Type[nn.Module] = nn.ReLU) -> Ty
             raise ValueError(f"Unknown activation_fn string: {act!r}. Supported: {supported}")
 
         if not isinstance(cls, type) or not issubclass(cls, nn.Module):
-            raise ValueError(f"Resolved activation is not an nn.Module class: {act!r} -> {cls!r}")
+            raise TypeError(f"Resolved activation is not an nn.Module class: {act!r} -> {cls!r}")
 
         return cls
 
@@ -288,15 +353,20 @@ def resolve_activation_fn(act: Any, *, default: Type[nn.Module] = nn.ReLU) -> Ty
 # =============================================================================
 # Ray gating
 # =============================================================================
-
-def require_ray() -> None:
+def _require_ray() -> None:
     """
-    Raise a clear error when Ray features are requested without Ray installed.
+    Raise a clear error if Ray features are requested but Ray is not installed.
 
     Raises
     ------
     RuntimeError
-        If Ray is not installed.
+        If Ray is not importable in the current environment.
+
+    Notes
+    -----
+    This is meant to be called at the boundary where Ray-only code paths are entered
+    (e.g., RayRunner construction). It avoids late, confusing NameError/ImportError
+    failures inside worker setup code.
     """
     if ray is None:
         raise RuntimeError(
@@ -308,20 +378,35 @@ def require_ray() -> None:
 # =============================================================================
 # Policy weight export helpers
 # =============================================================================
-
 def _locate_head_module(algo: Any) -> nn.Module:
     """
-    Locate the policy head module from an algorithm object.
+    Locate a policy head module from an algorithm object.
 
     Supported patterns
     ------------------
-    - algo.policy.head
-    - algo.head
+    - `algo.policy.head`
+    - `algo.head`
+
+    Parameters
+    ----------
+    algo : Any
+        Algorithm-like object.
+
+    Returns
+    -------
+    head : nn.Module
+        Located head module.
 
     Raises
     ------
     ValueError
-        If no nn.Module head is found.
+        If no head module can be found or the found object is not an `nn.Module`.
+
+    Notes
+    -----
+    This is intentionally permissive to support different algorithm wrappers
+    (custom trainers, SB3-style, internal frameworks). If you have a stable
+    interface, prefer a direct attribute access.
     """
     head = getattr(getattr(algo, "policy", None), "head", None)
     if head is None:
@@ -333,9 +418,9 @@ def _locate_head_module(algo: Any) -> nn.Module:
     return head
 
 
-def get_policy_state_dict_cpu(algo: Any) -> Dict[str, Any]:
+def _get_policy_state_dict_cpu(algo: Any) -> Dict[str, Any]:
     """
-    Export policy/head weights as a CPU-only state_dict.
+    Export policy/head weights as a CPU-only state dict.
 
     Parameters
     ----------
@@ -345,7 +430,13 @@ def get_policy_state_dict_cpu(algo: Any) -> Dict[str, Any]:
     Returns
     -------
     state_dict : Dict[str, Any]
-        CPU / detached weights.
+        CPU / detached weights as a plain Python dict.
+
+    Notes
+    -----
+    - This is useful when sending weights across process boundaries
+      (e.g., Ray workers) or storing checkpoints in a device-agnostic manner.
+    - `_to_cpu_state_dict` should detach tensors and move them to CPU recursively.
     """
     head = _locate_head_module(algo)
-    return to_cpu_state_dict(head.state_dict())
+    return _to_cpu_state_dict(head.state_dict())
